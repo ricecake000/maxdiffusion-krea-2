@@ -29,7 +29,7 @@ from jax.experimental import multihost_utils
 from jax.sharding import NamedSharding, PartitionSpec as P
 from PIL import Image
 
-from maxdiffusion import max_logging
+from maxdiffusion import aot_cache, max_logging
 from maxdiffusion.max_utils import device_put_replicated
 
 from ...models.krea2.transformer_krea2_flax import Krea2Transformer2DModel
@@ -51,6 +51,7 @@ from ...models.wan.autoencoder_kl_wan import AutoencoderKLWan, AutoencoderKLWanC
 from ...schedulers.scheduling_flow_match_flax import FlaxFlowMatchScheduler
 
 
+@aot_cache.cached_jit
 def vae_decode_pass(graphdef, state, rest_of_state, latents):
   """Decodes single-frame latents `(B, z_dim, 1, H/8, W/8)` to pixels in [-1, 1]."""
   wan_vae = nnx.merge(graphdef, state, rest_of_state)
@@ -103,7 +104,7 @@ class FlaxKrea2Pipeline:
     select_layers = tuple(KREA2_TEXT_ENCODER_SELECT_LAYERS)
     start_idx = KREA2_PROMPT_TEMPLATE_START_IDX
 
-    @jax.jit
+    @aot_cache.cached_jit
     def qwen3_forward(q_params, ids, mask, position_ids):
       _, all_hidden_states = self.text_encoder.apply(
           {"params": q_params}, input_ids=ids, attention_mask=mask, position_ids=position_ids
@@ -113,7 +114,7 @@ class FlaxKrea2Pipeline:
       # Drop the system-prefix tokens.
       return hidden[:, start_idx:]
 
-    @jax.jit
+    @aot_cache.cached_jit
     def transformer_step(t_params, latents, prompt_embeds, text_mask, img_ids, txt_ids, t_vec):
       return self.transformer.apply(
           {"params": t_params},
@@ -127,7 +128,7 @@ class FlaxKrea2Pipeline:
 
     self._jitted_qwen3_forward = qwen3_forward
     self._jitted_transformer_step = transformer_step
-    self._jitted_vae_decode = jax.jit(vae_decode_pass)
+    self._jitted_vae_decode = vae_decode_pass
 
   def encode_prompt(self, prompts: List[str], qwen3_params):
     """Tokenizes prompts with the Qwen-Image fixed-length template
@@ -193,6 +194,7 @@ class FlaxKrea2Pipeline:
       latents: Optional[Any] = None,
       output_dir: str = "output/",
       output_name: str = "krea2_generated_image.png",
+      save_outputs: bool = True,
   ):
     self._setup_jit_functions()
 
@@ -370,6 +372,12 @@ class FlaxKrea2Pipeline:
 
     trace["vae_decode"] = time.perf_counter() - t0
     max_logging.log(f" -> [TIMING] VAE Decoding: {trace['vae_decode']:.4f} seconds")
+
+    # AOT warmup compiles against faithful shapes but substitutes zero-valued
+    # device outputs. Skip host transfer, image conversion, and disk writes for
+    # that deliberately-discarded pass.
+    if not save_outputs:
+      return [], trace
 
     # -----------------------------------------------------------------
     # POST-PROCESS: format and save

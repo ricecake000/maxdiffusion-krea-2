@@ -175,6 +175,14 @@ dataset_save_location: '/tmp/pokemon-gpt4-captions_xl'
 train_data_dir: ''
 dataset_config_name: ''
 jax_cache_dir: ''
+# Serialize per-shape TPU executables so later processes can skip tracing and
+# lowering. Keep this on persistent storage for serving.
+aot_cache_dir: ''
+# Overlap the independent Transformer/Qwen host reads with VAE loading.
+parallel_component_loading: True
+# Keep flash attention for distinct prompts only when the caller has made
+# their token padding masks identical. The pipeline verifies this at runtime.
+allow_uniform_mixed_prompt_flash: False
 hf_data_dir: ''
 hf_train_files: ''
 hf_access_token: ''
@@ -225,6 +233,9 @@ profiler: ""
 
 # Generation parameters
 prompt: "a fox in the snow"
+# Optional UTF-8 file with one prompt per non-empty line. When set, this
+# replaces `prompt` and must resolve to the configured batch size.
+prompt_file: ""
 prompt_2: ""
 negative_prompt: ""
 do_classifier_free_guidance: True
@@ -314,4 +325,3 @@ vae_logical_axis_rules: [
 # element 0. generate_krea2.py automatically falls back to attention: 'dot_product'
 # when the batch mixes different prompts, and the pipeline rejects non-uniform
 # masks as a backstop.
-

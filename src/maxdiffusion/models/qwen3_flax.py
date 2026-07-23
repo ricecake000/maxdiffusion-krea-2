@@ -23,6 +23,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from maxdiffusion import max_logging
+from maxdiffusion.safetensors_utils import SafetensorsShardReader
 
 # -----------------------------------------------------------------------------
 # Qwen3 Configuration
@@ -661,23 +662,20 @@ def load_and_convert_qwen3_weights(
           "language_model."; vision-tower weights are ignored. If the given prefix
           is not found, common alternatives are auto-detected.
   """
-  import glob
-  import os
-  from safetensors.numpy import load_file
+  reader = SafetensorsShardReader(safetensors_path)
+  max_logging.log(
+      f"Streaming Qwen3 weights from {safetensors_path} "
+      f"({len(reader.files)} safetensors file{'s' if len(reader.files) != 1 else ''}); "
+      "unused vision-tower tensors will not be read."
+  )
+  with reader:
+    return _convert_qwen3_weights(reader, jax_params, config, key_prefix)
 
-  torch_weights: dict = {}
-  if os.path.isdir(safetensors_path):
-    # Find all safetensors shards
-    shards = glob.glob(os.path.join(safetensors_path, "*.safetensors"))
-    max_logging.log(f"Loading sharded Qwen3 weights from directory: {safetensors_path} (Found {len(shards)} shards)...")
-    for shard in sorted(shards):
-      max_logging.log(f"Loading shard: {shard}...")
-      torch_weights.update(load_file(shard))
-  else:
-    # Single file path
-    max_logging.log(f"Loading Qwen3 weights from file: {safetensors_path}...")
-    torch_weights = load_file(safetensors_path)
-  max_logging.log("Safetensors weights loaded successfully. Starting JAX parameter mapping...")
+
+def _convert_qwen3_weights(torch_weights, jax_params: dict, config: FlaxQwen3Config, key_prefix: str) -> dict:
+  """Maps only the Qwen language-tower tensors requested by the Flax tree."""
+  del config
+  max_logging.log("Starting lazy Qwen3 JAX parameter mapping...")
 
   # Auto-detect the decoder key prefix if the requested one is absent.
   if f"{key_prefix}embed_tokens.weight" not in torch_weights:
@@ -689,10 +687,9 @@ def load_and_convert_qwen3_weights(
 
   # Helper to transpose and cast weight
   def get_w(name: str, transpose: bool = True) -> np.ndarray:
-    nonlocal torch_weights
     if name not in torch_weights:
       raise KeyError(f"Weight '{name}' not found in safetensors!")
-    t = torch_weights[name]
+    t = torch_weights.get_tensor(name)
     if len(t.shape) == 2 and transpose:
       t = t.T
     return t
@@ -756,5 +753,5 @@ def load_and_convert_qwen3_weights(
 
   res = flax.traverse_util.unflatten_dict(converted_flat)
   return jax.tree_util.tree_map(
-      lambda leaf: jnp.zeros(leaf.shape, dtype=leaf.dtype) if isinstance(leaf, jax.ShapeDtypeStruct) else leaf, res
+      lambda leaf: np.zeros(leaf.shape, dtype=leaf.dtype) if isinstance(leaf, jax.ShapeDtypeStruct) else leaf, res
   )
