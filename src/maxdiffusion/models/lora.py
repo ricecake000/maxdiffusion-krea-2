@@ -43,9 +43,6 @@ class LoRALinearLayer(nn.Module, BaseLoRALayer):
 
   @nn.compact
   def __call__(self, h, hidden_states):
-    if self.rank > self.out_features:
-      raise ValueError(f"LoRA rank {self.rank} must be less or equal to {min(self.in_features, self.out_features)}")
-
     down_hidden_states = nn.Dense(
         features=self.rank,
         use_bias=False,

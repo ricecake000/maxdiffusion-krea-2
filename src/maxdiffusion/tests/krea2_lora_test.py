@@ -267,12 +267,25 @@ class ConverterTest(unittest.TestCase):
       self.assertIn(path, flat_base, path)
       self.assertEqual(tuple(np.asarray(delta).shape), tuple(flat_base[path].shape), path)
 
-  def test_rank_larger_than_out_features_is_skipped(self):
+  def test_rank_larger_than_out_features_is_supported(self):
     rng = np.random.RandomState(0)
     state_dict = {
-        # projector maps 3 -> 1; rank 2 > out_features 1 must be skipped.
+        # The real Krea 2 text-fusion projector maps 12 -> 1 and can be
+        # targeted by full-coverage adapters whose rank is greater than 1.
         "lora_unet_text_fusion_projector.lora_down.weight": _rand(rng, 2, 3),
         "lora_unet_text_fusion_projector.lora_up.weight": _rand(rng, 1, 2),
+    }
+    flat_lora, ranks, _, _ = convert_krea2_lora_to_flax(state_dict, "test")
+    path = ("text_fusion", "projector")
+    self.assertEqual(ranks[path], 2)
+    self.assertEqual(flat_lora[(*path, "lora-test", "down", "kernel")].shape, (3, 2))
+    self.assertEqual(flat_lora[(*path, "lora-test", "up", "kernel")].shape, (2, 1))
+
+  def test_mismatched_rank_dimensions_are_skipped(self):
+    rng = np.random.RandomState(0)
+    state_dict = {
+        "lora_unet_text_fusion_projector.lora_down.weight": _rand(rng, 2, 3),
+        "lora_unet_text_fusion_projector.lora_up.weight": _rand(rng, 1, 4),
     }
     flat_lora, ranks, _, _ = convert_krea2_lora_to_flax(state_dict, "test")
     self.assertEqual(flat_lora, {})
@@ -639,6 +652,22 @@ class _DenseHost(nn.Module):
 
 
 class InterceptorTest(unittest.TestCase):
+
+  def test_interceptor_allows_rank_wider_than_output(self):
+    host = _DenseHost(features=1)
+    x = jnp.array(np.random.RandomState(0).randn(3, 3), dtype=jnp.float32)
+    interceptor = Krea2LoraLoaderMixin.make_lora_interceptor(
+        {("proj",): 2}, {("proj",): 2.0}, "wide", scale=1.0
+    )
+
+    with nn.intercept_methods(interceptor):
+      params = flax.core.unfreeze(host.init(jax.random.PRNGKey(0), x)["params"])
+      output = host.apply({"params": params}, x)
+
+    flat = flatten_dict(params)
+    self.assertEqual(flat[("proj", "lora-wide", "down", "kernel")].shape, (3, 2))
+    self.assertEqual(flat[("proj", "lora-wide", "up", "kernel")].shape, (2, 1))
+    self.assertEqual(output.shape, (3, 1))
 
   def test_interceptor_matches_manual_lora_math(self):
     rank, alpha, scale = 2, 4.0, 0.7

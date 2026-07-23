@@ -368,18 +368,21 @@ def convert_krea2_lora_to_flax(state_dict, adapter_name, weights_dtype=jnp.bfloa
     elif down is not None:
       if kind != "dense":
         max_logging.log(f"WARNING: LoRA down/up weights target non-linear module '{torch_path}'; skipping.")
+      elif down.ndim != 2 or up.ndim != 2 or up.shape[1] != down.shape[0]:
+        max_logging.log(
+            f"WARNING: LoRA module '{torch_path}' has incompatible down/up shapes "
+            f"{down.shape}/{up.shape}; expected 2-D tensors with a shared rank dimension; skipping."
+        )
       else:
-        rank, out_features = int(down.shape[0]), int(up.shape[0])
-        if rank > out_features:
-          max_logging.log(
-              f"WARNING: LoRA rank {rank} exceeds output width {out_features} of '{torch_path}'; skipping."
-          )
-        else:
-          # PyTorch (out, in) -> Flax kernel (in, out): down (r, in) -> (in, r), up (out, r) -> (r, out).
-          flat_lora_params[(*flax_path, lora_name, "down", "kernel")] = jnp.asarray(down.T, dtype=weights_dtype)
-          flat_lora_params[(*flax_path, lora_name, "up", "kernel")] = jnp.asarray(up.T, dtype=weights_dtype)
-          ranks_by_path[flax_path] = rank
-          network_alphas_by_path[flax_path] = _resolve_network_alpha(torch_path, rank, entry.get("alpha"), lora_meta)
+        rank = int(down.shape[0])
+        # A rank wider than the input or output is unusual but valid. Krea 2's
+        # text-fusion projector is a real example: it maps 12 -> 1 while a
+        # full-coverage adapter can use rank 32.
+        # PyTorch (out, in) -> Flax kernel (in, out): down (r, in) -> (in, r), up (out, r) -> (r, out).
+        flat_lora_params[(*flax_path, lora_name, "down", "kernel")] = jnp.asarray(down.T, dtype=weights_dtype)
+        flat_lora_params[(*flax_path, lora_name, "up", "kernel")] = jnp.asarray(up.T, dtype=weights_dtype)
+        ranks_by_path[flax_path] = rank
+        network_alphas_by_path[flax_path] = _resolve_network_alpha(torch_path, rank, entry.get("alpha"), lora_meta)
 
     diff = entry.get("diff")
     if diff is not None:
