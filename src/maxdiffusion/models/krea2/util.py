@@ -18,14 +18,13 @@ limitations under the License.
 # timestep-shift computation and rotary position-id helpers.
 
 import gc
-import glob
-import os
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
 from maxdiffusion import max_logging
+from maxdiffusion.safetensors_utils import SafetensorsShardReader
 from ..flux.util import validate_flax_state_dict
 
 # Default hidden-state taps into the Qwen3-VL-4B text encoder (0 is the
@@ -106,35 +105,41 @@ def load_and_convert_krea2_weights(safetensors_path: str, params: dict, num_laye
   Norm weights (zero-centered) and scale_shift_tables are loaded verbatim in
   float32; 2-D matmul weights are transposed to Flax kernel layout.
   """
-  from safetensors.numpy import load_file
+  reader = SafetensorsShardReader(safetensors_path)
+  max_logging.log(
+      f"Streaming Krea 2 weights from {safetensors_path} "
+      f"({len(reader.files)} safetensors file{'s' if len(reader.files) != 1 else ''})..."
+  )
+  with reader:
+    return _convert_krea2_weights(reader, params, num_layers)
 
-  pt_state_dict = {}
-  if os.path.isdir(safetensors_path):
-    shards = glob.glob(os.path.join(safetensors_path, "*.safetensors"))
-    max_logging.log(f"Loading sharded Krea 2 weights from directory: {safetensors_path} (found {len(shards)} shards)...")
-    for shard in sorted(shards):
-      max_logging.log(f"Loading shard: {shard}...")
-      pt_state_dict.update(load_file(shard))
-  else:
-    max_logging.log(f"Loading Krea 2 weights from file: {safetensors_path}")
-    pt_state_dict = load_file(safetensors_path)
+
+def _convert_krea2_weights(pt_state_dict, params: dict, num_layers: int) -> dict:
+  """Maps lazily-read Diffusers tensors into the Flax parameter tree."""
 
   max_logging.log("Mapping Krea 2 weights to JAX parameters...")
   expected_pytree = jax.tree_util.tree_map(lambda leaf: leaf, params)
 
   # Matmul weights follow the model's weights dtype; norms and modulation tables
   # are explicitly kept in float32 below.
-  target_dtype = params["img_in"]["kernel"].dtype
+  target_dtype = np.dtype(params["img_in"]["kernel"].dtype)
+
+  def as_dtype(tensor, dtype):
+    array = np.asarray(tensor)
+    dtype = np.dtype(dtype)
+    if array.dtype == dtype:
+      return array
+    return array.astype(dtype, copy=False)
 
   def as_kernel(tensor):
     # PyTorch Linear weight (out, in) -> Flax kernel (in, out).
-    return jnp.array(np.asarray(tensor).T, dtype=target_dtype)
+    return as_dtype(np.asarray(tensor).T, target_dtype)
 
   def as_is(tensor, dtype=None):
-    return jnp.array(np.asarray(tensor), dtype=dtype or target_dtype)
+    return as_dtype(tensor, dtype or target_dtype)
 
   def as_fp32(tensor):
-    return jnp.array(np.asarray(tensor), dtype=jnp.float32)
+    return as_dtype(tensor, np.float32)
 
   def convert_attention(jax_attn, pt_prefix):
     jax_attn["to_q"]["kernel"] = as_kernel(_pop_weight(pt_state_dict, pt_prefix + "to_q.weight"))
@@ -212,7 +217,7 @@ def load_and_convert_krea2_weights(safetensors_path: str, params: dict, num_laye
     max_logging.log(f"WARNING: {len(pt_state_dict)} unconsumed Krea 2 checkpoint keys: {sorted(pt_state_dict.keys())[:20]}")
 
   params = jax.tree_util.tree_map(
-      lambda leaf: jnp.zeros(leaf.shape, dtype=leaf.dtype) if isinstance(leaf, jax.ShapeDtypeStruct) else leaf, params
+      lambda leaf: np.zeros(leaf.shape, dtype=leaf.dtype) if isinstance(leaf, jax.ShapeDtypeStruct) else leaf, params
   )
   del pt_state_dict
   gc.collect()

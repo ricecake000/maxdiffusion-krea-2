@@ -389,6 +389,7 @@ def cast_dict_to_bfloat16_inplace(d, device=None, exclude_keywords=None, parent_
   """
   import gc
   import jax.numpy as jnp
+  import numpy as np
 
   for k, v in list(d.items()):
     current_key = f"{parent_key}.{k}" if parent_key else str(k)
@@ -398,6 +399,11 @@ def cast_dict_to_bfloat16_inplace(d, device=None, exclude_keywords=None, parent_
       is_excluded = exclude_keywords and any(kw.lower() in current_key.lower() for kw in exclude_keywords)
       target_dtype = jnp.float32 if is_excluded else jnp.bfloat16
 
+      # NumPy/JAX `astype` copies by default even when the source already has
+      # the requested dtype. Inference checkpoints such as Krea 2 are already
+      # predominantly BF16, so avoid a full-model no-op copy on every start.
+      if np.dtype(v.dtype) == np.dtype(target_dtype):
+        continue
       d[k] = v.astype(target_dtype)
       if hasattr(d[k], "block_until_ready"):
         d[k].block_until_ready()

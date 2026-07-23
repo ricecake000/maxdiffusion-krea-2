@@ -23,6 +23,7 @@ limitations under the License.
 #     run_name=krea2_turbo output_dir=output/ prompt="a fox in the snow"
 
 import gc
+from concurrent.futures import ThreadPoolExecutor
 import json
 import math
 import os
@@ -40,9 +41,7 @@ from flax import nnx
 from flax.linen import partitioning as nn_partitioning
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from maxdiffusion import pyconfig
-from maxdiffusion import max_logging
-from maxdiffusion import max_utils
+from maxdiffusion import aot_cache, max_logging, max_utils, pyconfig
 from maxdiffusion.max_utils import create_device_mesh
 
 
@@ -70,6 +69,31 @@ def partition_prompts(prompt_str: str, batch_size: int) -> List[str]:
     return raw_prompts[:batch_size]
 
 
+def resolve_prompts(prompt_str: str, batch_size: int, prompt_file: str = "") -> List[str]:
+  """Returns one prompt per batch element, optionally from a line-oriented file."""
+  if not prompt_file:
+    return partition_prompts(prompt_str, batch_size)
+
+  with open(prompt_file, "r", encoding="utf-8") as f:
+    prompts = [line.strip() for line in f if line.strip()]
+  if len(prompts) != batch_size:
+    raise ValueError(
+        f"prompt_file must contain exactly batch_size={batch_size} non-empty lines; "
+        f"found {len(prompts)} in {prompt_file}."
+    )
+  return prompts
+
+
+def should_fallback_mixed_prompts(attention: str, prompts: List[str], allow_uniform_mixed_flash: bool) -> bool:
+  """Whether a mixed-prompt batch must avoid the shared-mask flash path."""
+  return (
+      attention != "dot_product"
+      and len(prompts) > 1
+      and len(set(prompts)) > 1
+      and not allow_uniform_mixed_flash
+  )
+
+
 def load_qwen_image_vae(snapshot_dir, config, vae_mesh, rngs):
   """Loads the Qwen-Image VAE (Wan 2.1 architecture) from the Krea 2 snapshot."""
   from maxdiffusion.models.wan.autoencoder_kl_wan import AutoencoderKLWan, AutoencoderKLWanCache
@@ -94,7 +118,11 @@ def load_qwen_image_vae(snapshot_dir, config, vae_mesh, rngs):
   state = dict(nnx.to_flat_state(state))
 
   params = load_wan_vae(snapshot_dir, params, "cpu")
-  params = jax.tree_util.tree_map(lambda x: x.astype(config.weights_dtype), params)
+  target_dtype = np.dtype(config.weights_dtype)
+  params = jax.tree_util.tree_map(
+      lambda x: x if np.dtype(x.dtype) == target_dtype else x.astype(config.weights_dtype),
+      params,
+  )
   # The VAE is small; replicate it across the VAE mesh.
   replicated_sharding = NamedSharding(vae_mesh, P())
   for path, val in flax.traverse_util.flatten_dict(params).items():
@@ -151,19 +179,31 @@ def main(argv):
   os.makedirs(config.output_dir, exist_ok=True)
 
   # Resolve prompts early: the attention kernel choice below depends on whether
-  # the batch mixes different prompts.
-  active_prompts = partition_prompts(config.prompt, config.batch_size)
+  # the batch mixes different prompts. A line-oriented file avoids shell
+  # quoting limits for heterogeneous production batches.
+  prompt_file = getattr(config, "prompt_file", "")
+  active_prompts = resolve_prompts(config.prompt, config.batch_size, prompt_file)
+  if prompt_file:
+    max_logging.log(f"Loaded {len(active_prompts)} prompt(s) from {prompt_file}.")
 
   # The repo's flash-attention kernels share the text padding mask of batch
   # element 0 across the whole batch. With mixed prompts in one batch that would
   # silently miscompute every other element, so fall back to dot_product.
-  if config.attention != "dot_product" and config.batch_size > 1 and len(set(active_prompts)) > 1:
+  mixed_prompt_flash = getattr(config, "allow_uniform_mixed_prompt_flash", False)
+  mixed_prompts = config.batch_size > 1 and len(set(active_prompts)) > 1
+  if should_fallback_mixed_prompts(config.attention, active_prompts, mixed_prompt_flash):
     max_logging.log(
         f"Warning: attention='{config.attention}' cannot honor per-batch text padding masks and the batch "
         "mixes different prompts. Falling back to attention='dot_product'. Use identical prompts per batch "
-        "or batch_size=1 to keep flash attention."
+        "or batch_size=1 to keep flash attention. Advanced callers may set "
+        "allow_uniform_mixed_prompt_flash=true after equalizing token lengths."
     )
     pyconfig._config.keys["attention"] = "dot_product"
+  elif config.attention != "dot_product" and mixed_prompts:
+    max_logging.log(
+        f"Keeping attention='{config.attention}' for a mixed-prompt batch; "
+        "the pipeline will verify that all token padding masks are identical before denoising."
+    )
 
   # 2. Setup device meshes
   # The ICI parallelism product must equal the number of devices PER SLICE
@@ -346,58 +386,114 @@ def main(argv):
   transformer_shardings = flax.core.freeze(transformer_mesh_shardings["params"])
   qwen3_shardings = flax.core.freeze(qwen3_mesh_shardings["params"])
 
-  # 7. Load weights on host CPU, then place on devices
-  max_logging.log("Loading parameters on host CPU...")
+  # 7. Stream weights on host CPU, overlap the independent components, then
+  # place the final trees directly into their target TPU shardings.
+  max_logging.log("Streaming parameters from safetensors...")
   t_load_start = time.time()
-  cpu_device = jax.local_devices(backend="cpu")[0]
-  with jax.default_device(cpu_device):
-    with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
-      import flax.linen.spmd as flax_spmd
-
-      def unbox_fn(x):
-        return x.unbox() if isinstance(x, flax_spmd.LogicallyPartitioned) else x
-
-      params = jax.tree_util.tree_map(
-          unbox_fn, abstract_transformer_vars["params"], is_leaf=lambda k: isinstance(k, flax_spmd.LogicallyPartitioned)
-      )
-      params = flax.core.unfreeze(params)
-
-      qwen3_params = jax.tree_util.tree_map(
-          unbox_fn, abstract_qwen3_vars["params"], is_leaf=lambda k: isinstance(k, flax_spmd.LogicallyPartitioned)
-      )
-      qwen3_params = flax.core.unfreeze(qwen3_params)
-
-      params = load_and_convert_krea2_weights(transformer_path, params, num_layers)
-      # load_and_convert_krea2_weights zero-fills the lora-* leaves it doesn't
-      # recognize, so the real LoRA tensors must be written after it returns.
-      params = insert_lora_params(params, lora_flat_params)
-      params = apply_diff_updates(params, lora_diff_updates)
-      qwen3_params = load_and_convert_qwen3_weights(
-          text_encoder_path, qwen3_params, qwen3_config, key_prefix="model.language_model."
-      )
-
-      if config.weights_dtype == jnp.bfloat16:
-        max_logging.log("Casting Qwen3 parameters to bfloat16 (keeping norms in float32)...")
-        cast_dict_to_bfloat16_inplace(qwen3_params, exclude_keywords=("norm",))
-
-      params = flax.core.freeze(params)
-      qwen3_params = flax.core.freeze(qwen3_params)
-
-      max_logging.log("Placing parameters on device HBM...")
-      with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
-        params = jax.tree_util.tree_map(max_utils.device_put_replicated, params, transformer_shardings)
-        qwen3_params = jax.tree_util.tree_map(max_utils.device_put_replicated, qwen3_params, qwen3_shardings)
-      max_logging.log("All parameters placed on device HBM successfully!")
-      gc.collect()
-      jax.effects_barrier()
-
-  # 8. VAE (Qwen-Image / Wan 2.1 architecture, NNX)
-  max_logging.log("Loading Qwen-Image VAE...")
+  load_trace = {}
+  parallel_loading = getattr(config, "parallel_component_loading", True)
   rngs = nnx.Rngs(jax.random.key(config.seed if config.seed is not None else 0))
-  vae, vae_cache = load_qwen_image_vae(snapshot_dir, config, vae_mesh, rngs)
+
+  def load_vae_timed():
+    t0 = time.perf_counter()
+    result = load_qwen_image_vae(snapshot_dir, config, vae_mesh, rngs)
+    return result, time.perf_counter() - t0
+
+  # VAE is small and independent. Hide it behind the much larger Transformer
+  # and Qwen host reads, but wait before the main device transfer so PCIe/ICI
+  # traffic does not contend.
+  common_executor = ThreadPoolExecutor(max_workers=1) if parallel_loading else None
+  vae_future = common_executor.submit(load_vae_timed) if common_executor is not None else None
+
+  try:
+    cpu_device = jax.local_devices(backend="cpu")[0]
+    with jax.default_device(cpu_device):
+      with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
+        import flax.linen.spmd as flax_spmd
+
+        def unbox_fn(x):
+          return x.unbox() if isinstance(x, flax_spmd.LogicallyPartitioned) else x
+
+        params = jax.tree_util.tree_map(
+            unbox_fn,
+            abstract_transformer_vars["params"],
+            is_leaf=lambda k: isinstance(k, flax_spmd.LogicallyPartitioned),
+        )
+        params = flax.core.unfreeze(params)
+
+        qwen3_params = jax.tree_util.tree_map(
+            unbox_fn,
+            abstract_qwen3_vars["params"],
+            is_leaf=lambda k: isinstance(k, flax_spmd.LogicallyPartitioned),
+        )
+        qwen3_params = flax.core.unfreeze(qwen3_params)
+
+        def load_transformer_timed():
+          t0 = time.perf_counter()
+          result = load_and_convert_krea2_weights(transformer_path, params, num_layers)
+          return result, time.perf_counter() - t0
+
+        def load_qwen_timed():
+          t0 = time.perf_counter()
+          result = load_and_convert_qwen3_weights(
+              text_encoder_path, qwen3_params, qwen3_config, key_prefix="model.language_model."
+          )
+          if config.weights_dtype == jnp.bfloat16:
+            max_logging.log("Normalizing Qwen3 dtypes (BF16 weights, FP32 norms; matching dtypes are reused)...")
+            cast_dict_to_bfloat16_inplace(result, exclude_keywords=("norm",))
+          return result, time.perf_counter() - t0
+
+        if parallel_loading:
+          with ThreadPoolExecutor(max_workers=2) as weight_executor:
+            transformer_future = weight_executor.submit(load_transformer_timed)
+            qwen_future = weight_executor.submit(load_qwen_timed)
+            params, load_trace["transformer_host"] = transformer_future.result()
+            qwen3_params, load_trace["qwen_host"] = qwen_future.result()
+        else:
+          params, load_trace["transformer_host"] = load_transformer_timed()
+          qwen3_params, load_trace["qwen_host"] = load_qwen_timed()
+
+        # load_and_convert_krea2_weights zero-fills the lora-* leaves it
+        # doesn't recognize, so write the real adapter tensors afterwards.
+        t0 = time.perf_counter()
+        params = insert_lora_params(params, lora_flat_params)
+        params = apply_diff_updates(params, lora_diff_updates)
+        load_trace["lora_apply"] = time.perf_counter() - t0
+
+        params = flax.core.freeze(params)
+        qwen3_params = flax.core.freeze(qwen3_params)
+
+        if vae_future is not None:
+          (vae, vae_cache), load_trace["vae"] = vae_future.result()
+
+        max_logging.log("Placing parameters into final TPU shardings...")
+        t0 = time.perf_counter()
+        with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
+          # Keep the established callback path: it supplies process-local
+          # slices directly and was faster than staging a batched device_put
+          # on the single-host v5e reference run.
+          params = jax.tree_util.tree_map(max_utils.device_put_replicated, params, transformer_shardings)
+          qwen3_params = jax.tree_util.tree_map(max_utils.device_put_replicated, qwen3_params, qwen3_shardings)
+        load_trace["device_placement"] = time.perf_counter() - t0
+        max_logging.log("All parameters placed on device HBM successfully!")
+        gc.collect()
+        jax.effects_barrier()
+  finally:
+    if common_executor is not None:
+      common_executor.shutdown(wait=True)
+
+  # 8. VAE (Qwen-Image / Wan 2.1 architecture, NNX). In sequential mode,
+  # preserve the historical order and load it after the main parameter trees.
+  if vae_future is None:
+    max_logging.log("Loading Qwen-Image VAE...")
+    (vae, vae_cache), load_trace["vae"] = load_vae_timed()
 
   load_time = time.time() - t_load_start
   max_logging.log(f" -> [TIMING] Total Model Loading & Device Placement: {load_time:.2f} seconds")
+  max_logging.log(
+      " -> [TIMING] Load breakdown: "
+      + ", ".join(f"{stage}={seconds:.2f}s" for stage, seconds in load_trace.items())
+  )
 
   # 9. Tokenizer
   from transformers import AutoTokenizer
@@ -434,6 +530,25 @@ def main(argv):
       vae_mesh=vae_mesh,
       vae_logical_axis_rules=vae_logical_axis_rules,
   )
+  # Register the Krea-specific jitted entry points before installing the
+  # process-global AOT cache so existing per-shape executables can load.
+  pipeline._setup_jit_functions()
+  aot_cache.install(
+      getattr(config, "aot_cache_dir", ""),
+      meta={
+          "model": config.pretrained_model_name_or_path,
+          "attention": config.attention,
+          "flash_block_sizes": str(config.flash_block_sizes),
+          "mesh_shape": str(mesh.shape),
+          "vae_mesh_shape": str(vae_mesh.shape),
+          "weights_dtype": str(config.weights_dtype),
+          "activations_dtype": str(config.activations_dtype),
+          "max_sequence_length": str(config.max_sequence_length),
+          "jax": jax.__version__,
+      },
+      mesh=mesh,
+  )
+  aot_cache.wait_for_loads()
 
   latents_to_use = None
   if getattr(config, "latents_path", ""):
@@ -460,8 +575,17 @@ def main(argv):
     for interceptor in lora_interceptors:
       stack.enter_context(nn.intercept_methods(interceptor))
 
-    max_logging.log("Running warmup pass (XLA compilation)...")
-    _, warmup_trace = pipeline(prompt=active_prompts, output_name="krea2_warmup.png", **call_kwargs)
+    max_logging.log("Running compile warmup (zero-execution when AOT cache is enabled)...")
+    with aot_cache.warmup_mode():
+      _, warmup_trace = pipeline(
+          prompt=active_prompts,
+          output_name="krea2_warmup.png",
+          save_outputs=False,
+          **call_kwargs,
+      )
+    # Persist newly-seen shape signatures synchronously. Saving in the
+    # background competes with the first real request for CPU and disk I/O.
+    aot_cache.save_pending()
     warmup_time = sum(warmup_trace.get(k, 0.0) for k in ("prompt_encoding", "denoise_loop", "vae_decode"))
 
     max_logging.log("Running timed pass at full device speed...")

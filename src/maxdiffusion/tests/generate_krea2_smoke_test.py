@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import os
+import tempfile
 import unittest
 import pytest
 
@@ -120,6 +121,32 @@ class GenerateKrea2SmokeTest(unittest.TestCase):
         ref_name="ref_krea2_turbo.png",
         extra_args=("output_name=krea2_turbo_lora_generated_image.png", lora_config),
     )
+
+
+class PromptResolutionTest(unittest.TestCase):
+
+  def test_prompt_file_preserves_one_prompt_per_nonempty_line(self):
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8") as prompt_file:
+      prompt_file.write("first prompt\n\n second prompt \n")
+      prompt_file.flush()
+
+      prompts = generate_krea2.resolve_prompts("ignored", 2, prompt_file.name)
+
+    self.assertEqual(prompts, ["first prompt", "second prompt"])
+
+  def test_prompt_file_requires_exact_batch_size(self):
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8") as prompt_file:
+      prompt_file.write("only one\n")
+      prompt_file.flush()
+
+      with self.assertRaisesRegex(ValueError, "exactly batch_size=2"):
+        generate_krea2.resolve_prompts("ignored", 2, prompt_file.name)
+
+  def test_mixed_prompt_flash_fallback_is_opt_in(self):
+    prompts = ["first", "second"]
+    self.assertTrue(generate_krea2.should_fallback_mixed_prompts("flash", prompts, False))
+    self.assertFalse(generate_krea2.should_fallback_mixed_prompts("flash", prompts, True))
+    self.assertFalse(generate_krea2.should_fallback_mixed_prompts("dot_product", prompts, False))
 
 
 if __name__ == "__main__":
