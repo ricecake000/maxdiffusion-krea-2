@@ -142,12 +142,6 @@ class PromptResolutionTest(unittest.TestCase):
       with self.assertRaisesRegex(ValueError, "exactly batch_size=2"):
         generate_krea2.resolve_prompts("ignored", 2, prompt_file.name)
 
-  def test_mixed_prompt_flash_fallback_is_opt_in(self):
-    prompts = ["first", "second"]
-    self.assertTrue(generate_krea2.should_fallback_mixed_prompts("flash", prompts, False))
-    self.assertFalse(generate_krea2.should_fallback_mixed_prompts("flash", prompts, True))
-    self.assertFalse(generate_krea2.should_fallback_mixed_prompts("dot_product", prompts, False))
-
 
 if __name__ == "__main__":
   unittest.main()

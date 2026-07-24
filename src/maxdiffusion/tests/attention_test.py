@@ -235,6 +235,118 @@ class AttentionTest(unittest.TestCase):
     self.assertIsNone(cross_attention_block_sizes.block_kv_dq)
     self.assertTrue(cross_attention_block_sizes.use_fused_bwd_kernel)
 
+  def test_padding_segment_ids_preserve_each_image_attention_mask(self):
+    """Every batch item should retain its own prompt padding pattern."""
+    attention_mask = jnp.array(
+        [
+            [1, 1, 0, 0, 0],
+            [1, 1, 1, 1, 0],
+        ],
+        dtype=jnp.int32,
+    )
+
+    segment_ids = attention_flax._build_padding_segment_ids(
+        query_seq_len=3,
+        q_padded_len=4,
+        key_seq_len=5,
+        kv_padded_len=8,
+        attention_mask=attention_mask,
+        batch_size=2,
+    )
+
+    np.testing.assert_array_equal(
+        segment_ids.q,
+        np.array(
+            [
+                [1, 1, 1, 0],
+                [1, 1, 1, 0],
+            ],
+            dtype=np.int32,
+        ),
+    )
+    np.testing.assert_array_equal(
+        segment_ids.kv,
+        np.array(
+            [
+                [1, 1, 0, 0, 0, 0, 0, 0],
+                [1, 1, 1, 1, 0, 0, 0, 0],
+            ],
+            dtype=np.int32,
+        ),
+    )
+
+    shared_segment_ids = attention_flax._build_padding_segment_ids(
+        query_seq_len=3,
+        q_padded_len=4,
+        key_seq_len=5,
+        kv_padded_len=8,
+        attention_mask=attention_mask[:1],
+        batch_size=2,
+    )
+    np.testing.assert_array_equal(shared_segment_ids.kv[0], shared_segment_ids.kv[1])
+
+  def test_flash_attention_uses_each_image_attention_mask(self):
+    """The Splash vmap should pass one attention-mask row to each image."""
+    batch = 2
+    length = 6
+    heads = 4
+    head_depth = 3
+    query = jnp.zeros((batch, length, heads * head_depth), dtype=jnp.float32)
+    key = query + 100.0
+    value = query + 200.0
+    attention_mask = jnp.array(
+        [
+            [1, 1, 0, 0, 0, 0],
+            [1, 1, 1, 1, 0, 0],
+        ],
+        dtype=jnp.int32,
+    )
+    mesh = self._ulysses_mesh()
+
+    def fake_make_splash_mha(**unused_kwargs):
+      def fake_kernel(q, k, v, segment_ids):
+        del k, v
+        return q + jnp.sum(segment_ids.kv).astype(q.dtype)
+
+      return fake_kernel
+
+    with (
+        mesh,
+        nn_partitioning.axis_rules(self._flash_axis_rules()),
+        mock.patch.object(
+            attention_flax.splash_attention_kernel,
+            "make_splash_mha",
+            side_effect=fake_make_splash_mha,
+        ),
+    ):
+      output = attention_flax._tpu_flash_attention(
+          query,
+          key,
+          value,
+          heads=heads,
+          mesh=mesh,
+          axis_names_q=(
+              attention_flax.BATCH,
+              attention_flax.SELF_ATTN_HEAD,
+              attention_flax.SELF_ATTN_Q_LENGTH,
+              attention_flax.D_KV,
+          ),
+          axis_names_kv=(
+              attention_flax.BATCH,
+              attention_flax.SELF_ATTN_HEAD,
+              attention_flax.SELF_ATTN_KV_LENGTH,
+              attention_flax.D_KV,
+          ),
+          flash_block_sizes=self._ulysses_block_sizes(),
+          dtype=jnp.float32,
+          attention_kernel="flash",
+          attention_mask=attention_mask,
+      )
+
+    expected = jnp.broadcast_to(jnp.array([2.0, 4.0])[:, None, None], query.shape)
+    self.assertEqual(output.shape, query.shape)
+    self.assertTrue(jnp.array_equal(output, expected))
+
   def test_ulysses_head_chunk_ranges_preserve_head_layout_with_remainder(self):
     ranges = attention_flax._ulysses_head_chunk_ranges(num_heads=40, ulysses_shards=8, num_chunks=2)
 
@@ -486,7 +598,13 @@ class AttentionTest(unittest.TestCase):
     query = jnp.arange(batch * length * heads * head_depth, dtype=jnp.float32).reshape(batch, length, heads * head_depth)
     key = query + 100.0
     value = query + 200.0
-    attention_mask = jnp.array([[1, 0, 1, 0, 1]], dtype=jnp.int32)
+    attention_mask = jnp.array(
+        [
+            [1, 0, 1, 0, 1],
+            [1, 1, 0, 1, 0],
+        ],
+        dtype=jnp.int32,
+    )
     mesh = self._ulysses_mesh()
 
     def fake_make_splash_mha(**unused_kwargs):

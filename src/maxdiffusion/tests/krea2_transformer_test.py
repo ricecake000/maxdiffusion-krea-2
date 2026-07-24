@@ -35,7 +35,6 @@ from maxdiffusion.models.krea2.transformer_krea2_flax import (
 from maxdiffusion.models.krea2.util import (
     calculate_krea2_shift,
     load_and_convert_krea2_weights,
-    mask_is_batch_uniform,
     prepare_krea2_image_ids,
     prepare_krea2_text_ids,
     round_up_to_multiple,
@@ -348,16 +347,6 @@ class Krea2ShiftTest(unittest.TestCase):
     self.assertEqual(round_up_to_multiple(1039, 16), 1040)
     self.assertEqual(round_up_to_multiple(16, 16), 16)
     self.assertEqual(round_up_to_multiple(1, 16), 16)
-
-  def test_mask_is_batch_uniform(self):
-    uniform = np.array([[1, 1, 0, 0], [1, 1, 0, 0]])
-    non_uniform = np.array([[1, 1, 0, 0], [1, 1, 1, 0]])
-    single = np.array([[1, 0, 0, 0]])
-    self.assertTrue(mask_is_batch_uniform(uniform))
-    self.assertFalse(mask_is_batch_uniform(non_uniform))
-    self.assertTrue(mask_is_batch_uniform(single))
-    self.assertTrue(mask_is_batch_uniform(jnp.array(uniform, dtype=jnp.bool_)))
-    self.assertFalse(mask_is_batch_uniform(jnp.array(non_uniform, dtype=jnp.bool_)))
 
   def test_position_id_helpers(self):
     txt_ids = prepare_krea2_text_ids(2, 5)

@@ -84,16 +84,6 @@ def resolve_prompts(prompt_str: str, batch_size: int, prompt_file: str = "") -> 
   return prompts
 
 
-def should_fallback_mixed_prompts(attention: str, prompts: List[str], allow_uniform_mixed_flash: bool) -> bool:
-  """Whether a mixed-prompt batch must avoid the shared-mask flash path."""
-  return (
-      attention != "dot_product"
-      and len(prompts) > 1
-      and len(set(prompts)) > 1
-      and not allow_uniform_mixed_flash
-  )
-
-
 def load_qwen_image_vae(snapshot_dir, config, vae_mesh, rngs):
   """Loads the Qwen-Image VAE (Wan 2.1 architecture) from the Krea 2 snapshot."""
   from maxdiffusion.models.wan.autoencoder_kl_wan import AutoencoderKLWan, AutoencoderKLWanCache
@@ -178,32 +168,12 @@ def main(argv):
   config = pyconfig.config
   os.makedirs(config.output_dir, exist_ok=True)
 
-  # Resolve prompts early: the attention kernel choice below depends on whether
-  # the batch mixes different prompts. A line-oriented file avoids shell
-  # quoting limits for heterogeneous production batches.
+  # A line-oriented file avoids shell quoting limits for heterogeneous
+  # production batches.
   prompt_file = getattr(config, "prompt_file", "")
   active_prompts = resolve_prompts(config.prompt, config.batch_size, prompt_file)
   if prompt_file:
     max_logging.log(f"Loaded {len(active_prompts)} prompt(s) from {prompt_file}.")
-
-  # The repo's flash-attention kernels share the text padding mask of batch
-  # element 0 across the whole batch. With mixed prompts in one batch that would
-  # silently miscompute every other element, so fall back to dot_product.
-  mixed_prompt_flash = getattr(config, "allow_uniform_mixed_prompt_flash", False)
-  mixed_prompts = config.batch_size > 1 and len(set(active_prompts)) > 1
-  if should_fallback_mixed_prompts(config.attention, active_prompts, mixed_prompt_flash):
-    max_logging.log(
-        f"Warning: attention='{config.attention}' cannot honor per-batch text padding masks and the batch "
-        "mixes different prompts. Falling back to attention='dot_product'. Use identical prompts per batch "
-        "or batch_size=1 to keep flash attention. Advanced callers may set "
-        "allow_uniform_mixed_prompt_flash=true after equalizing token lengths."
-    )
-    pyconfig._config.keys["attention"] = "dot_product"
-  elif config.attention != "dot_product" and mixed_prompts:
-    max_logging.log(
-        f"Keeping attention='{config.attention}' for a mixed-prompt batch; "
-        "the pipeline will verify that all token padding masks are identical before denoising."
-    )
 
   # 2. Setup device meshes
   # The ICI parallelism product must equal the number of devices PER SLICE
