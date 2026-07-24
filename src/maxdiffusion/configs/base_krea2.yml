@@ -180,9 +180,6 @@ jax_cache_dir: ''
 aot_cache_dir: ''
 # Overlap the independent Transformer/Qwen host reads with VAE loading.
 parallel_component_loading: True
-# Keep flash attention for distinct prompts only when the caller has made
-# their token padding masks identical. The pipeline verifies this at runtime.
-allow_uniform_mixed_prompt_flash: False
 hf_data_dir: ''
 hf_train_files: ''
 hf_access_token: ''
@@ -323,7 +320,7 @@ vae_logical_axis_rules: [
 
 # Note: Architecture dimensions are automatically read from
 # pretrained_model_name_or_path (transformer/config.json, text_encoder/config.json).
-# NOTE: with attention: 'flash', per-batch text padding masks are shared from batch
-# element 0. generate_krea2.py automatically falls back to attention: 'dot_product'
-# when the batch mixes different prompts, and the pipeline rejects non-uniform
-# masks as a backstop.
+# NOTE: the splash-based kernels (flash, ulysses, ulysses_ring, tokamax_flash,
+# tokamax_ring) build per-batch segment ids from the text padding mask, so one
+# batch may mix prompts of different token lengths. The *_custom kernels reject
+# an attention_mask outright.

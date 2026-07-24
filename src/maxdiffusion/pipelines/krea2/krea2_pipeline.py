@@ -40,7 +40,6 @@ from ...models.krea2.util import (
     KREA2_PROMPT_TEMPLATE_SUFFIX,
     KREA2_TEXT_ENCODER_SELECT_LAYERS,
     calculate_krea2_shift,
-    mask_is_batch_uniform,
     prepare_krea2_image_ids,
     prepare_krea2_text_ids,
     round_up_to_multiple,
@@ -273,21 +272,6 @@ class FlaxKrea2Pipeline:
       if do_classifier_free_guidance:
         negative_prompt_embeds, negative_prompt_embeds_mask = self.encode_prompt(negative_prompts, qwen3_params)
       prompt_embeds.block_until_ready()
-
-      # The repo's flash-attention kernels share the key-padding mask of batch
-      # element 0 across the whole batch (_build_padding_segment_ids). Refuse to
-      # continue if that would silently miscompute the other batch elements.
-      attention_kernel = getattr(self.transformer, "attention_kernel", "dot_product")
-      if attention_kernel != "dot_product" and batch_size > 1:
-        masks_uniform = mask_is_batch_uniform(prompt_embeds_mask)
-        if do_classifier_free_guidance:
-          masks_uniform = masks_uniform and mask_is_batch_uniform(negative_prompt_embeds_mask)
-        if not masks_uniform:
-          raise ValueError(
-              f"attention='{attention_kernel}' shares the text padding mask of batch element 0 across the "
-              "whole batch, but the prompts in this batch tokenize to different padding masks. "
-              "Use identical prompts per batch, batch_size=1, or attention='dot_product'."
-          )
 
       trace["prompt_encoding"] = time.perf_counter() - t0
       max_logging.log(f" -> [TIMING] Prompt Encoding (Qwen3-VL): {trace['prompt_encoding']:.4f} seconds")
