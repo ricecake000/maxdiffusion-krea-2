@@ -18,6 +18,7 @@ limitations under the License.
 
 import math
 import unittest
+from unittest import mock
 
 import flax
 import flax.linen.spmd as flax_spmd
@@ -25,12 +26,14 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from maxdiffusion.models.attention_flax import AttentionOp
 from maxdiffusion.models.krea2.transformer_krea2_flax import (
     Krea2Attention,
     Krea2RMSNorm,
     Krea2TextFusion,
     Krea2TimestepEmbedding,
     Krea2Transformer2DModel,
+    Krea2TransformerBlock,
 )
 from maxdiffusion.models.krea2.util import (
     calculate_krea2_shift,
@@ -39,6 +42,7 @@ from maxdiffusion.models.krea2.util import (
     prepare_krea2_text_ids,
     round_up_to_multiple,
 )
+from maxdiffusion.pipelines.krea2.krea2_pipeline import is_classifier_free_guidance_enabled
 
 
 def _unbox(params):
@@ -155,6 +159,43 @@ class Krea2AttentionTest(unittest.TestCase):
     out2 = attn.apply({"params": params}, jnp.array(x2), mask)
     np.testing.assert_allclose(np.asarray(out1[:, :4]), np.asarray(out2[:, :4]), rtol=1e-5, atol=1e-5)
 
+  def test_mask_padding_tokens_reaches_shared_attention_op(self):
+    seen_values = []
+
+    def fake_apply_attention(module, query, key, value, attention_mask=None):
+      del key, value, attention_mask
+      seen_values.append(module.mask_padding_tokens)
+      return query
+
+    attn = Krea2Attention(
+        dim=8,
+        num_heads=2,
+        num_kv_heads=2,
+        head_dim=4,
+        use_rope=False,
+        attention_kernel="flash",
+        mask_padding_tokens=False,
+    )
+    x = jnp.ones((1, 4, 8), dtype=jnp.float32)
+    with mock.patch.object(AttentionOp, "apply_attention", fake_apply_attention):
+      params = attn.init(jax.random.PRNGKey(0), x)["params"]
+      attn.apply({"params": params}, x)
+
+    self.assertTrue(seen_values)
+    self.assertTrue(all(value is False for value in seen_values))
+
+
+class Krea2GuidanceTest(unittest.TestCase):
+
+  def test_explicit_switch_controls_guidance(self):
+    self.assertTrue(is_classifier_free_guidance_enabled(3.5, True))
+    self.assertFalse(is_classifier_free_guidance_enabled(3.5, False))
+    self.assertFalse(is_classifier_free_guidance_enabled(0.0, True))
+
+  def test_direct_pipeline_calls_keep_scale_based_default(self):
+    self.assertTrue(is_classifier_free_guidance_enabled(3.5))
+    self.assertFalse(is_classifier_free_guidance_enabled(0.0))
+
 
 class Krea2TextFusionTest(unittest.TestCase):
 
@@ -211,6 +252,54 @@ class Krea2TransformerModelTest(unittest.TestCase):
     out1 = model.apply({"params": params}, hs, ehs, jnp.full((B,), 1.0), img_ids, txt_ids, mask).sample
     out2 = model.apply({"params": params}, hs, ehs, jnp.full((B,), 0.1), img_ids, txt_ids, mask).sample
     self.assertTrue(np.any(np.abs(np.asarray(out1) - np.asarray(out2)) > 1e-6))
+
+  def test_staged_components_match_monolithic_forward(self):
+    model = _tiny_model()
+    B, S_img, S_txt = 1, 4, 3
+    hs = jnp.array(np.random.RandomState(2).randn(B, S_img, 16), dtype=jnp.float32)
+    ehs = jnp.array(np.random.RandomState(3).randn(B, S_txt, 3, 24), dtype=jnp.float32)
+    timestep = jnp.full((B,), 0.5)
+    img_ids = prepare_krea2_image_ids(B, 2, 2)
+    txt_ids = prepare_krea2_text_ids(B, S_txt)
+    mask = jnp.ones((B, S_txt), dtype=jnp.bool_)
+    params = model.init(jax.random.PRNGKey(0), hs, ehs, timestep, img_ids, txt_ids, mask)["params"]
+
+    expected = model.apply({"params": params}, hs, ehs, timestep, img_ids, txt_ids, mask).sample
+    prelude_keys = ("img_in", "time_embed", "time_mod_proj", "text_fusion", "txt_in")
+    prelude_params = {key: params[key] for key in prelude_keys}
+    hidden, temb, temb_mod, rotary_emb, attention_mask = model.apply(
+        {"params": prelude_params},
+        hs,
+        ehs,
+        timestep,
+        img_ids,
+        txt_ids,
+        mask,
+        method=model.prepare_inputs,
+    )
+
+    block = Krea2TransformerBlock(
+        hidden_size=32,
+        intermediate_size=64,
+        num_heads=4,
+        num_kv_heads=2,
+    )
+    for block_idx in range(model.num_layers):
+      hidden = block.apply(
+          {"params": params[f"blocks_{block_idx}"]},
+          hidden,
+          temb_mod=temb_mod,
+          image_rotary_emb=rotary_emb,
+          attention_mask=attention_mask,
+      )
+    actual = model.apply(
+        {"params": {"final_layer": params["final_layer"]}},
+        hidden,
+        temb,
+        S_txt,
+        method=model.finalize_output,
+    )
+    np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), rtol=1e-5, atol=1e-5)
 
 
 class Krea2WeightConversionTest(unittest.TestCase):

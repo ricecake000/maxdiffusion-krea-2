@@ -82,7 +82,7 @@ class GenerateKrea2SmokeTest(unittest.TestCase):
 
   @pytest.mark.skipif(IN_GITHUB_ACTIONS, reason="Don't run smoke tests on Github Actions (requires TPU HBM)")
   def test_krea2_raw_smoke(self):
-    """End-to-end smoke test for Krea-2-Raw (28 steps, CFG 4.5) at 512x512."""
+    """End-to-end smoke test for Krea-2-Raw (52 steps, CFG 3.5) at 512x512."""
     self._run(
         config_name="base_krea2.yml",
         run_name="krea2_raw_smoke",

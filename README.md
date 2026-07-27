@@ -810,7 +810,7 @@ The optimal attention tile sizes (`block_q` / `block_kv`) depend on the sequence
   python src/maxdiffusion/generate_krea2.py src/maxdiffusion/configs/base_krea2_turbo.yml jax_cache_dir=/tmp/cache_dir run_name=krea2_turbo output_dir=output/ prompt="a fox in the snow"
   ```
 
-  The bf16 transformer weighs ~26GB, so single-chip runs are not possible; the default config shards the model with FSDP across all devices (and falls back to tensor parallelism within a slice for `batch_size=1`). Note: with `attention: 'flash'`, per-batch text padding masks are shared from batch element 0, so `generate_krea2.py` automatically falls back to `attention: 'dot_product'` when a batch mixes different prompts (and the pipeline rejects non-uniform masks as a backstop). Heights/widths that are not multiples of 16 are rounded up with a warning.
+  The bf16 transformer weighs ~26GB, so single-chip runs are not possible; the default config shards the model with FSDP across all devices (and falls back to tensor parallelism within a slice for `batch_size=1`). Splash-based attention kernels retain a separate text-padding mask for every batch element, so one batch may mix prompts of different token lengths. Heights/widths that are not multiples of 16 are rounded up with a warning.
 
   ### Krea 2 LoRA
 

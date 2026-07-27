@@ -2135,6 +2135,7 @@ class AttentionOp(nn.Module):
   use_experimental_scheduler: bool = False
   ulysses_shards: int = -1
   ulysses_attention_chunks: int = 1
+  mask_padding_tokens: bool = True
 
   def setup(self):
     self.dpa_layer = None
@@ -2179,6 +2180,7 @@ class AttentionOp(nn.Module):
         axis_names_kv=self.axis_names_kv,
         flash_block_sizes=self.flash_block_sizes,
         dpa_layer=self.dpa_layer,
+        mask_padding_tokens=self.mask_padding_tokens,
         attention_mask=attention_mask,
         use_base2_exp=self.use_base2_exp,
         use_experimental_scheduler=self.use_experimental_scheduler,

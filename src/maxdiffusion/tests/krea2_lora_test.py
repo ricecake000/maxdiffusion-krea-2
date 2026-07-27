@@ -18,6 +18,7 @@ limitations under the License.
 
 import os
 import unittest
+from contextlib import ExitStack
 
 import flax
 import flax.linen as nn
@@ -32,6 +33,8 @@ from maxdiffusion.loaders.krea2_lora_pipeline import (
     Krea2LoraLoaderMixin,
     apply_diff_updates,
     insert_lora_params,
+    make_lora_compile_spec,
+    maybe_load_krea2_lora,
 )
 from maxdiffusion.models.krea2.lora_util import (
     DIFFUSERS_LORA_METADATA_KEY,
@@ -40,8 +43,12 @@ from maxdiffusion.models.krea2.lora_util import (
     normalize_krea2_lora_state_dict,
     parse_lora_metadata,
 )
-from maxdiffusion.models.krea2.transformer_krea2_flax import Krea2Transformer2DModel
+from maxdiffusion.models.krea2.transformer_krea2_flax import Krea2Transformer2DModel, Krea2TransformerBlock
 from maxdiffusion.models.krea2.util import prepare_krea2_image_ids, prepare_krea2_text_ids
+from maxdiffusion.pipelines.krea2.krea2_pipeline import (
+    build_staged_block_lora_params,
+    index_staged_block_lora_specs,
+)
 
 
 def _unbox(params):
@@ -393,6 +400,32 @@ class MetadataAlphaConverterTest(unittest.TestCase):
     self.assertEqual(alphas[("blocks_0", "attn", "to_q")], 4.0)
 
 
+class LoraCompileSpecTest(unittest.TestCase):
+
+  def test_compile_constants_change_the_spec(self):
+    path = ("blocks_0", "attn", "to_q")
+    ranks = {path: 8}
+    diffs = {("blocks_0", "norm1", "weight"): np.zeros((32,), np.float32)}
+
+    base = make_lora_compile_spec("style", 1.0, ranks, {path: 16.0}, diffs)
+    self.assertNotEqual(base, make_lora_compile_spec("style", 0.5, ranks, {path: 16.0}, diffs))
+    self.assertNotEqual(base, make_lora_compile_spec("style", 1.0, ranks, {path: 32.0}, diffs))
+    self.assertNotEqual(base, make_lora_compile_spec("style", 1.0, {path: 4}, {path: 16.0}, diffs))
+
+  def test_tensor_values_do_not_participate_in_the_spec(self):
+    path = ("blocks_0", "attn", "to_q")
+    spec = make_lora_compile_spec("style", 1.0, {path: 8}, {path: None}, {})
+    self.assertEqual(spec, ("style", 1.0, (("blocks_0.attn.to_q", 8, None),), ()))
+
+  def test_no_adapter_keeps_the_existing_return_contract(self):
+    class FakeConfig:
+      lora_config = {"lora_model_name_or_path": []}
+
+    self.assertEqual(len(maybe_load_krea2_lora(FakeConfig(), jnp.float32)), 3)
+    *_, compile_spec = maybe_load_krea2_lora(FakeConfig(), jnp.float32, return_compile_spec=True)
+    self.assertEqual(compile_spec, ())
+
+
 class LoraStateDictLoadingTest(unittest.TestCase):
   """File resolution and metadata round-trips through lora_state_dict."""
 
@@ -622,8 +655,6 @@ class LoraStateDictLoadingTest(unittest.TestCase):
     import torch
     from safetensors.torch import save_file
 
-    from maxdiffusion.loaders.krea2_lora_pipeline import maybe_load_krea2_lora
-
     with tempfile.TemporaryDirectory() as tmpdir:
       path = os.path.join(tmpdir, "te_only.safetensors")
       save_file({"lora_te_text_model_encoder_layers_0_mlp_fc1.lora_down.weight": torch.randn(2, 8)}, path)
@@ -692,8 +723,10 @@ class InterceptorTest(unittest.TestCase):
     with nn.intercept_methods(interceptor):
       out = host.apply({"params": params}, x)
 
-    kernel = np.asarray(flat[("proj", "kernel")])
-    expected = np.asarray(x) @ kernel + scale * (alpha / rank) * ((np.asarray(x) @ down) @ up)
+    kernel = flat[("proj", "kernel")]
+    expected = jnp.matmul(x, kernel) + scale * (alpha / rank) * (
+        jnp.matmul(jnp.matmul(x, jnp.asarray(down)), jnp.asarray(up))
+    )
     np.testing.assert_allclose(np.asarray(out), expected, rtol=1e-5, atol=1e-5)
 
   def test_zero_scale_is_inert(self):
@@ -759,6 +792,94 @@ class EndToEndTinyModelTest(unittest.TestCase):
       self.assertIn(path, flat_abstract, path)
       self.assertEqual(tuple(flat_abstract[path].shape), tuple(value.shape), path)
 
+  def test_staged_matches_multiple_adapters_with_nonuniform_ranks(self):
+    model = _tiny_model()
+    inputs = _tiny_inputs()
+    rng = np.random.RandomState(7)
+    style_state = {
+        "lora_unet_transformer_blocks_0_attn_to_q.lora_down.weight": _rand(rng, 2, 32),
+        "lora_unet_transformer_blocks_0_attn_to_q.lora_up.weight": _rand(rng, 32, 2),
+        "lora_unet_transformer_blocks_0_attn_to_q.alpha": np.float32(4.0),
+        "lora_unet_transformer_blocks_1_ff_down.lora_down.weight": _rand(rng, 3, 64),
+        "lora_unet_transformer_blocks_1_ff_down.lora_up.weight": _rand(rng, 32, 3),
+    }
+    detail_state = {
+        "lora_unet_transformer_blocks_0_attn_to_q.lora_down.weight": _rand(rng, 1, 32),
+        "lora_unet_transformer_blocks_0_attn_to_q.lora_up.weight": _rand(rng, 32, 1),
+        "lora_unet_transformer_blocks_1_attn_to_out.lora_down.weight": _rand(rng, 2, 32),
+        "lora_unet_transformer_blocks_1_attn_to_out.lora_up.weight": _rand(rng, 32, 2),
+        "lora_unet_transformer_blocks_1_attn_to_out.alpha": np.float32(2.0),
+    }
+    adapters = []
+    for name, scale, state_dict in (
+        ("style", 0.7, style_state),
+        ("detail", 0.25, detail_state),
+    ):
+      flat_lora, ranks, alphas, diffs = convert_krea2_lora_to_flax(
+          state_dict, name, weights_dtype=jnp.float32
+      )
+      adapters.append(
+          (
+              flat_lora,
+              Krea2LoraLoaderMixin.make_lora_interceptor(ranks, alphas, name, scale),
+              make_lora_compile_spec(name, scale, ranks, alphas, diffs),
+          )
+      )
+
+    with ExitStack() as stack:
+      for _, interceptor, _ in adapters:
+        stack.enter_context(nn.intercept_methods(interceptor))
+      params = flax.core.unfreeze(_unbox(model.init(jax.random.PRNGKey(0), *inputs)["params"]))
+    for flat_lora, _, _ in adapters:
+      params = insert_lora_params(params, flat_lora)
+
+    with ExitStack() as stack:
+      for _, interceptor, _ in adapters:
+        stack.enter_context(nn.intercept_methods(interceptor))
+      expected = model.apply({"params": params}, *inputs).sample
+
+    hs, ehs, timestep, img_ids, txt_ids, mask = inputs
+    prelude_keys = ("img_in", "time_embed", "time_mod_proj", "text_fusion", "txt_in")
+    hidden, temb, temb_mod, rotary_emb, attention_mask = model.apply(
+        {"params": {key: params[key] for key in prelude_keys}},
+        hs,
+        ehs,
+        timestep,
+        img_ids,
+        txt_ids,
+        mask,
+        method=model.prepare_inputs,
+    )
+    block_specs = index_staged_block_lora_specs(tuple(item[2] for item in adapters), model.num_layers)
+    block = Krea2TransformerBlock(
+        hidden_size=32,
+        intermediate_size=64,
+        num_heads=4,
+        num_kv_heads=2,
+    )
+    for block_idx in range(model.num_layers):
+      block_params = params[f"blocks_{block_idx}"]
+      explicit_lora = build_staged_block_lora_params(block_params, block_specs[block_idx])
+      hidden = block.apply(
+          {"params": block_params},
+          hidden,
+          temb_mod=temb_mod,
+          image_rotary_emb=rotary_emb,
+          attention_mask=attention_mask,
+          lora_params=explicit_lora,
+      )
+    actual = model.apply(
+        {"params": {"final_layer": params["final_layer"]}},
+        hidden,
+        temb,
+        mask.shape[1],
+        method=model.finalize_output,
+    )
+
+    block_0_lora = build_staged_block_lora_params(params["blocks_0"], block_specs[0])
+    self.assertEqual(len(block_0_lora["attn"]["to_q"]), 2)
+    np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), rtol=1e-5, atol=1e-5)
+
   def test_insert_lora_params_rejects_unknown_or_mismatched(self):
     model = _tiny_model()
     inputs = _tiny_inputs()
@@ -804,6 +925,12 @@ class DiffMergeTest(unittest.TestCase):
     params = {"final_layer": {"linear": {"kernel": jnp.zeros((2, 2), jnp.float32)}}}
     diffs = {("blocks_999", "attn", "to_q", "kernel"): jnp.zeros((2, 2), jnp.float32)}
     with self.assertRaisesRegex(ValueError, "None of the LoRA diff targets exist"):
+      apply_diff_updates(params, diffs)
+
+  def test_same_size_wrong_shape_diff_is_rejected(self):
+    params = {"final_layer": {"linear": {"kernel": jnp.zeros((2, 3), jnp.float32)}}}
+    diffs = {("final_layer", "linear", "kernel"): jnp.zeros((3, 2), jnp.float32)}
+    with self.assertRaisesRegex(ValueError, r"has shape \(3, 2\).*expects \(2, 3\)"):
       apply_diff_updates(params, diffs)
 
 

@@ -60,6 +60,22 @@ class Krea2RMSNorm(nn.Module):
     return (normed * (1.0 + weight)).astype(x.dtype)
 
 
+def apply_explicit_lora(output, inputs, adapters=(), dtype=jnp.float32, precision=None):
+  """Adds explicitly supplied LoRA updates to a linear projection.
+
+  Each adapter is a ``(down_kernel, up_kernel, multiplier)`` tuple. Keeping
+  these tensors as ordinary call arguments lets the staged transformer reuse a
+  standalone block executable without relying on its shortened Flax module
+  path to match a model-level LoRA interceptor.
+  """
+  for down_kernel, up_kernel, multiplier in adapters:
+    lora_input = inputs.astype(dtype)
+    down = jnp.matmul(lora_input, down_kernel.astype(dtype), precision=precision)
+    update = jnp.matmul(down, up_kernel.astype(dtype), precision=precision)
+    output = output + update * jnp.asarray(multiplier, dtype=dtype)
+  return output
+
+
 class Krea2SwiGLU(nn.Module):
   """SwiGLU feed-forward with separate gate/up/down projections (no bias)."""
 
@@ -95,8 +111,20 @@ class Krea2SwiGLU(nn.Module):
         precision=self.precision,
     )
 
-  def __call__(self, x):
-    return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+  def __call__(self, x, lora_params=None):
+    lora_params = lora_params or {}
+    gate = apply_explicit_lora(
+        self.gate_proj(x), x, lora_params.get("gate_proj", ()), self.dtype, self.precision
+    )
+    up = apply_explicit_lora(self.up_proj(x), x, lora_params.get("up_proj", ()), self.dtype, self.precision)
+    down_input = nn.silu(gate) * up
+    return apply_explicit_lora(
+        self.down_proj(down_input),
+        down_input,
+        lora_params.get("down_proj", ()),
+        self.dtype,
+        self.precision,
+    )
 
 
 class Krea2Attention(nn.Module):
@@ -117,6 +145,7 @@ class Krea2Attention(nn.Module):
   dtype: jnp.dtype = jnp.float32
   weights_dtype: jnp.dtype = jnp.float32
   precision: Optional[jax.lax.Precision] = None
+  mask_padding_tokens: bool = True
 
   def setup(self):
     dense_kwargs = dict(
@@ -162,6 +191,7 @@ class Krea2Attention(nn.Module):
           dim_head=self.head_dim,
           flash_min_seq_length=self.flash_min_seq_length,
           flash_block_sizes=self.flash_block_sizes,
+          mask_padding_tokens=self.mask_padding_tokens,
           dtype=self.dtype,
       )
 
@@ -178,13 +208,22 @@ class Krea2Attention(nn.Module):
     out = jnp.einsum("bhqk,bhkd->bhqd", probs, value.astype(jnp.float32))
     return out.astype(self.dtype)
 
-  def __call__(self, hidden_states, attention_mask=None, image_rotary_emb=None):
+  def __call__(self, hidden_states, attention_mask=None, image_rotary_emb=None, lora_params=None):
     batch_size, seq_len, _ = hidden_states.shape
+    lora_params = lora_params or {}
 
-    query = self.to_q(hidden_states).reshape(batch_size, seq_len, self.num_heads, self.head_dim)
-    key = self.to_k(hidden_states).reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim)
-    value = self.to_v(hidden_states).reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim)
-    gate = self.to_gate(hidden_states)
+    query = apply_explicit_lora(
+        self.to_q(hidden_states), hidden_states, lora_params.get("to_q", ()), self.dtype, self.precision
+    ).reshape(batch_size, seq_len, self.num_heads, self.head_dim)
+    key = apply_explicit_lora(
+        self.to_k(hidden_states), hidden_states, lora_params.get("to_k", ()), self.dtype, self.precision
+    ).reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim)
+    value = apply_explicit_lora(
+        self.to_v(hidden_states), hidden_states, lora_params.get("to_v", ()), self.dtype, self.precision
+    ).reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim)
+    gate = apply_explicit_lora(
+        self.to_gate(hidden_states), hidden_states, lora_params.get("to_gate", ()), self.dtype, self.precision
+    )
 
     query = self.norm_q(query)
     key = self.norm_k(key)
@@ -216,7 +255,9 @@ class Krea2Attention(nn.Module):
       attn_output = self.attention_op.apply_attention(q_flat, k_flat, v_flat, attention_mask=mask)
 
     attn_output = attn_output * jax.nn.sigmoid(gate)
-    return self.to_out(attn_output)
+    return apply_explicit_lora(
+        self.to_out(attn_output), attn_output, lora_params.get("to_out", ()), self.dtype, self.precision
+    )
 
 
 class Krea2TextFusionBlock(nn.Module):
@@ -405,6 +446,7 @@ class Krea2TransformerBlock(nn.Module):
   dtype: jnp.dtype = jnp.float32
   weights_dtype: jnp.dtype = jnp.float32
   precision: Optional[jax.lax.Precision] = None
+  mask_padding_tokens: bool = True
 
   def setup(self):
     self.scale_shift_table = self.param("scale_shift_table", nn.initializers.zeros, (6, self.hidden_size), jnp.float32)
@@ -420,6 +462,7 @@ class Krea2TransformerBlock(nn.Module):
         attention_kernel=self.attention_kernel,
         flash_min_seq_length=self.flash_min_seq_length,
         flash_block_sizes=self.flash_block_sizes,
+        mask_padding_tokens=self.mask_padding_tokens,
         mesh=self.mesh,
         dtype=self.dtype,
         weights_dtype=self.weights_dtype,
@@ -433,7 +476,7 @@ class Krea2TransformerBlock(nn.Module):
         precision=self.precision,
     )
 
-  def __call__(self, hidden_states, temb_mod, image_rotary_emb=None, attention_mask=None):
+  def __call__(self, hidden_states, temb_mod, image_rotary_emb=None, attention_mask=None, lora_params=None):
     # temb_mod: (B, 1, 6 * hidden_size), shared across all blocks; each block only
     # learns an additive table. Modulation arithmetic runs in float32.
     batch_size = hidden_states.shape[0]
@@ -444,11 +487,17 @@ class Krea2TransformerBlock(nn.Module):
     ]
 
     attn_input = (1.0 + prescale) * self.norm1(hidden_states) + preshift
-    attn_output = self.attn(attn_input, attention_mask=attention_mask, image_rotary_emb=image_rotary_emb)
+    lora_params = lora_params or {}
+    attn_output = self.attn(
+        attn_input,
+        attention_mask=attention_mask,
+        image_rotary_emb=image_rotary_emb,
+        lora_params=lora_params.get("attn"),
+    )
     hidden_states = hidden_states + pregate * attn_output
 
     ff_input = (1.0 + postscale) * self.norm2(hidden_states) + postshift
-    ff_output = self.ff(ff_input)
+    ff_output = self.ff(ff_input, lora_params=lora_params.get("ff"))
     hidden_states = hidden_states + postgate * ff_output
     return hidden_states
 
@@ -519,6 +568,7 @@ class Krea2Transformer2DModel(nn.Module, FlaxModelMixin, ConfigMixin):
   dtype: jnp.dtype = jnp.float32
   weights_dtype: jnp.dtype = jnp.float32
   precision: Optional[jax.lax.Precision] = None
+  mask_padding_tokens: bool = True
 
   def setup(self):
     if sum(self.axes_dims_rope) != self.attention_head_dim:
@@ -582,6 +632,7 @@ class Krea2Transformer2DModel(nn.Module, FlaxModelMixin, ConfigMixin):
             attention_kernel=self.attention_kernel,
             flash_min_seq_length=self.flash_min_seq_length,
             flash_block_sizes=self.flash_block_sizes,
+            mask_padding_tokens=self.mask_padding_tokens,
             mesh=self.mesh,
             dtype=self.dtype,
             weights_dtype=self.weights_dtype,
@@ -619,8 +670,41 @@ class Krea2Transformer2DModel(nn.Module, FlaxModelMixin, ConfigMixin):
       txt_ids: `(text_seq_len, 3)` or `(batch, text_seq_len, 3)` all-zero rotary coords.
       encoder_attention_mask: optional `(batch, text_seq_len)` boolean mask, True = valid.
     """
-    batch_size, image_seq_len, _ = hidden_states.shape
+    hidden_states, temb, temb_mod, concat_rotary_emb, attention_mask = self.prepare_inputs(
+        hidden_states,
+        encoder_hidden_states,
+        timestep,
+        img_ids,
+        txt_ids,
+        encoder_attention_mask,
+    )
     text_seq_len = encoder_hidden_states.shape[1]
+
+    for block in self.blocks:
+      hidden_states = block(
+          hidden_states,
+          temb_mod=temb_mod,
+          image_rotary_emb=concat_rotary_emb,
+          attention_mask=attention_mask,
+      )
+
+    output = self.finalize_output(hidden_states, temb, text_seq_len)
+
+    if not return_dict:
+      return (output,)
+    return Krea2Transformer2DModelOutput(sample=output)
+
+  def prepare_inputs(
+      self,
+      hidden_states,
+      encoder_hidden_states,
+      timestep,
+      img_ids,
+      txt_ids,
+      encoder_attention_mask=None,
+  ):
+    """Projects and combines text/image inputs before the repeated DiT blocks."""
+    batch_size, image_seq_len, _ = hidden_states.shape
 
     temb = self.time_embed(timestep)
     temb_mod = self.time_mod_proj(jax.nn.gelu(temb, approximate=True))
@@ -648,18 +732,9 @@ class Krea2Transformer2DModel(nn.Module, FlaxModelMixin, ConfigMixin):
         jnp.concatenate([text_rotary_emb[0], image_rotary_emb[0]], axis=0),
         jnp.concatenate([text_rotary_emb[1], image_rotary_emb[1]], axis=0),
     )
+    return hidden_states, temb, temb_mod, concat_rotary_emb, attention_mask
 
-    for block in self.blocks:
-      hidden_states = block(
-          hidden_states,
-          temb_mod=temb_mod,
-          image_rotary_emb=concat_rotary_emb,
-          attention_mask=attention_mask,
-      )
-
+  def finalize_output(self, hidden_states, temb, text_seq_len: int):
+    """Removes text tokens and applies the final adaptive projection."""
     hidden_states = hidden_states[:, text_seq_len:]
-    output = self.final_layer(hidden_states, temb)
-
-    if not return_dict:
-      return (output,)
-    return Krea2Transformer2DModelOutput(sample=output)
+    return self.final_layer(hidden_states, temb)

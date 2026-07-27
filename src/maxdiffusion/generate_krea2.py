@@ -276,6 +276,7 @@ def main(argv):
       norm_eps=transformer_cfg.get("norm_eps", 1e-5),
       attention_kernel=config.attention,
       flash_block_sizes=max_utils.get_flash_block_sizes(config),
+      mask_padding_tokens=config.mask_padding_tokens,
       mesh=mesh,
       dtype=config.activations_dtype,
       weights_dtype=config.weights_dtype,
@@ -285,7 +286,9 @@ def main(argv):
   # The interceptors must be live around shape evaluation AND every pipeline
   # call so the abstract param tree (and the jit traces) include the lora-*
   # subtrees; with no adapters configured this is a single no-op interceptor.
-  lora_flat_params, lora_interceptors, lora_diff_updates = maybe_load_krea2_lora(config, config.weights_dtype)
+  lora_flat_params, lora_interceptors, lora_diff_updates, lora_compile_spec = maybe_load_krea2_lora(
+      config, config.weights_dtype, return_compile_spec=True
+  )
 
   # 6. Evaluate shapes & extract mesh shardings
   max_logging.log("Evaluating model shapes and shardings...")
@@ -499,6 +502,7 @@ def main(argv):
       mesh=mesh,
       vae_mesh=vae_mesh,
       vae_logical_axis_rules=vae_logical_axis_rules,
+      lora_compile_spec=lora_compile_spec,
   )
   # Register the Krea-specific jitted entry points before installing the
   # process-global AOT cache so existing per-shape executables can load.
@@ -514,6 +518,8 @@ def main(argv):
           "weights_dtype": str(config.weights_dtype),
           "activations_dtype": str(config.activations_dtype),
           "max_sequence_length": str(config.max_sequence_length),
+          "krea2_staged_transformer": str(config.krea2_staged_transformer),
+          "lora_compile_spec": lora_compile_spec,
           "jax": jax.__version__,
       },
       mesh=mesh,
@@ -533,6 +539,7 @@ def main(argv):
       width=width,
       num_inference_steps=config.num_inference_steps,
       guidance_scale=config.guidance_scale,
+      do_classifier_free_guidance=config.do_classifier_free_guidance,
       negative_prompt=config.negative_prompt,
       batch_size=config.batch_size,
       latents=latents_to_use,
@@ -559,8 +566,30 @@ def main(argv):
     warmup_time = sum(warmup_trace.get(k, 0.0) for k in ("prompt_encoding", "denoise_loop", "vae_decode"))
 
     max_logging.log("Running timed pass at full device speed...")
-    _, main_trace = pipeline(prompt=active_prompts, output_name=config.output_name, **call_kwargs)
+    with max_utils.Profiler(config, session_name="krea2_timed"):
+      with jax.profiler.StepTraceAnnotation("krea2_generate", step_num=0):
+        _, main_trace = pipeline(prompt=active_prompts, output_name=config.output_name, **call_kwargs)
     main_time = sum(main_trace.get(k, 0.0) for k in ("prompt_encoding", "denoise_loop", "vae_decode"))
+
+  if getattr(config, "enable_profiler", False) and jax.process_index() == 0:
+    profile_dir = os.path.join(config.tensorboard_dir, "krea2_timed")
+    os.makedirs(profile_dir, exist_ok=True)
+    memory_profile_path = os.path.join(profile_dir, "device_memory_profile.pprof")
+    try:
+      jax.profiler.save_device_memory_profile(memory_profile_path)
+      max_logging.log(f"Saved device memory profile: {memory_profile_path}")
+    except (OSError, RuntimeError, ValueError) as exc:
+      max_logging.log(f"Warning: unable to save device memory profile: {exc}")
+    for device in jax.local_devices():
+      memory_stats = device.memory_stats()
+      if memory_stats:
+        gib = 1024**3
+        max_logging.log(
+            f"[HBM] device={device.id} "
+            f"in_use={memory_stats.get('bytes_in_use', 0) / gib:.2f} GiB "
+            f"peak={memory_stats.get('peak_bytes_in_use', 0) / gib:.2f} GiB "
+            f"limit={memory_stats.get('bytes_limit', 0) / gib:.2f} GiB"
+        )
 
   max_logging.log("=" * 80)
   max_logging.log("KREA 2 LATENCY & TIMING BREAKDOWN")

@@ -266,7 +266,12 @@ def apply_diff_updates(params, diff_updates, scale=1.0):
       max_logging.log(f"WARNING: LoRA diff target {'.'.join(path)} not found in Krea 2 params; skipping.")
       continue
     leaf = flat[path]
-    delta = jnp.asarray(delta).reshape(leaf.shape)
+    delta = jnp.asarray(delta)
+    if tuple(delta.shape) != tuple(leaf.shape):
+      raise ValueError(
+          f"LoRA diff {'.'.join(path)} has shape {tuple(delta.shape)} but the model "
+          f"expects {tuple(leaf.shape)}; this LoRA was likely trained for a different model."
+      )
     flat[path] = (leaf + (delta * scale).astype(leaf.dtype)).astype(leaf.dtype)
     applied_updates += 1
   if applied_updates == 0:
@@ -277,11 +282,33 @@ def apply_diff_updates(params, diff_updates, scale=1.0):
   return unflatten_dict(flat)
 
 
-def maybe_load_krea2_lora(config, weights_dtype=jnp.bfloat16):
+def make_lora_compile_spec(adapter_name, scale, ranks, alphas, diffs):
+  """Returns the immutable LoRA metadata that can change a compiled graph.
+
+  Adapter tensor values remain runtime parameters and intentionally do not
+  participate in this spec. Interceptor scale, rank and resolved alpha are
+  captured while tracing, so the AOT executable fingerprint must include them.
+  """
+  modules = tuple(
+      sorted(
+          (
+              ".".join(path),
+              int(rank),
+              None if alphas.get(path) is None else float(alphas[path]),
+          )
+          for path, rank in ranks.items()
+      )
+  )
+  diff_targets = tuple(sorted(".".join(path) for path in diffs))
+  return (str(adapter_name), float(scale), modules, diff_targets)
+
+
+def maybe_load_krea2_lora(config, weights_dtype=jnp.bfloat16, return_compile_spec=False):
   """Loads every adapter listed in `config.lora_config`.
 
-  Returns `(flat_lora_params, interceptors, diff_updates)`. With no adapters
-  configured, `flat_lora_params`/`diff_updates` are empty and `interceptors`
+  Returns `(flat_lora_params, interceptors, diff_updates)`, plus `compile_spec`
+  when `return_compile_spec=True`. With no adapters configured, the
+  parameter/update dicts and compile spec are empty, while `interceptors`
   holds a single no-op so callers can wrap unconditionally (Flux convention).
   """
 
@@ -291,7 +318,8 @@ def maybe_load_krea2_lora(config, weights_dtype=jnp.bfloat16):
   lora_config = config.lora_config
   model_paths = lora_config["lora_model_name_or_path"]
   if len(model_paths) == 0:
-    return {}, [_noop_interceptor], {}
+    result = ({}, [_noop_interceptor], {})
+    return (*result, ()) if return_compile_spec else result
 
   def _entry(key, i, default=None):
     values = lora_config.get(key, [])
@@ -303,6 +331,7 @@ def maybe_load_krea2_lora(config, weights_dtype=jnp.bfloat16):
   flat_lora_params = {}
   interceptors = []
   diff_updates = {}
+  compile_spec = []
   for i, model_path in enumerate(model_paths):
     adapter_name = adapter_names[i]
     scale = float(_entry("scale", i, 1.0))
@@ -324,7 +353,9 @@ def maybe_load_krea2_lora(config, weights_dtype=jnp.bfloat16):
       scaled = jnp.asarray(delta) * scale
       diff_updates[path] = diff_updates[path] + scaled if path in diff_updates else scaled
     interceptors.append(Krea2LoraLoaderMixin.make_lora_interceptor(ranks, alphas, adapter_name, scale))
+    compile_spec.append(make_lora_compile_spec(adapter_name, scale, ranks, alphas, diffs))
     max_logging.log(
         f"Krea 2 LoRA '{adapter_name}': {len(ranks)} LoRA module(s), {len(diffs)} diff update(s) loaded."
     )
-  return flat_lora_params, interceptors, diff_updates
+  result = (flat_lora_params, interceptors, diff_updates)
+  return (*result, tuple(compile_spec)) if return_compile_spec else result
