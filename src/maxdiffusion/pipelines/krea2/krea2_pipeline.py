@@ -32,7 +32,7 @@ from PIL import Image
 from maxdiffusion import aot_cache, max_logging
 from maxdiffusion.max_utils import device_put_replicated
 
-from ...models.krea2.transformer_krea2_flax import Krea2Transformer2DModel
+from ...models.krea2.transformer_krea2_flax import Krea2Transformer2DModel, Krea2TransformerBlock
 from ...models.krea2.util import (
     KREA2_PROMPT_TEMPLATE_NUM_SUFFIX_TOKENS,
     KREA2_PROMPT_TEMPLATE_PREFIX,
@@ -57,15 +57,80 @@ def vae_decode_pass(graphdef, state, rest_of_state, latents):
   return wan_vae.decode(latents, AutoencoderKLWanCache(wan_vae), return_dict=False)[0]
 
 
+def is_classifier_free_guidance_enabled(guidance_scale: float, enabled: Optional[bool] = None) -> bool:
+  """Resolves the explicit CFG switch while preserving direct-call defaults."""
+  if enabled is None:
+    return guidance_scale > 0.0
+  return bool(enabled) and guidance_scale > 0.0
+
+
+_STAGED_BLOCK_LORA_TARGETS = {
+    "attn": frozenset(("to_q", "to_k", "to_v", "to_gate", "to_out")),
+    "ff": frozenset(("gate_proj", "up_proj", "down_proj")),
+}
+
+
+def index_staged_block_lora_specs(lora_compile_spec, num_layers):
+  """Indexes immutable adapter metadata by repeated transformer block."""
+  block_specs = [[] for _ in range(num_layers)]
+  for adapter_name, scale, modules, _ in lora_compile_spec:
+    for dotted_path, rank, alpha in modules:
+      path = tuple(dotted_path.split("."))
+      if not path or not path[0].startswith("blocks_"):
+        continue
+      try:
+        block_idx = int(path[0].removeprefix("blocks_"))
+      except ValueError as exc:
+        raise ValueError(f"Invalid staged LoRA block path: {dotted_path}") from exc
+      if block_idx < 0 or block_idx >= num_layers:
+        raise ValueError(f"Staged LoRA path targets missing transformer block: {dotted_path}")
+      if len(path) != 3 or path[1] not in _STAGED_BLOCK_LORA_TARGETS:
+        raise ValueError(f"Staged LoRA path is not a supported block projection: {dotted_path}")
+      group, projection = path[1:]
+      if projection not in _STAGED_BLOCK_LORA_TARGETS[group]:
+        raise ValueError(f"Staged LoRA path is not a supported block projection: {dotted_path}")
+      multiplier = float(scale)
+      if alpha:
+        multiplier *= float(alpha) / int(rank)
+      block_specs[block_idx].append((group, projection, str(adapter_name), int(rank), multiplier))
+  return tuple(tuple(spec) for spec in block_specs)
+
+
+def build_staged_block_lora_params(block_params, block_spec):
+  """Materializes explicit block-local LoRA inputs from the transformer params."""
+  result = {}
+  for group, projection, adapter_name, rank, multiplier in block_spec:
+    try:
+      adapter_params = block_params[group][projection][f"lora-{adapter_name}"]
+      down = adapter_params["down"]["kernel"]
+      up = adapter_params["up"]["kernel"]
+    except KeyError as exc:
+      raise ValueError(
+          f"LoRA parameters for {group}.{projection} adapter '{adapter_name}' "
+          "are missing from the staged transformer parameter tree."
+      ) from exc
+    if down.shape[-1] != rank or up.shape[0] != rank:
+      raise ValueError(
+          f"LoRA rank mismatch for {group}.{projection} adapter '{adapter_name}': "
+          f"metadata rank={rank}, down={down.shape}, up={up.shape}."
+      )
+    result.setdefault(group, {}).setdefault(projection, []).append(
+        (down, up, jnp.asarray(multiplier, dtype=jnp.float32))
+    )
+  return {
+      group: {projection: tuple(adapters) for projection, adapters in projections.items()}
+      for group, projections in result.items()
+  }
+
+
 class FlaxKrea2Pipeline:
   """
   Unified end-to-end inference pipeline for Krea 2 (Raw and Turbo) on JAX.
 
   Phase A encodes prompts with the Qwen3-VL text tower (Qwen-Image chat template
   with mid-sequence padding and cumulative-valid-token positions), Phase B runs
-  the flow-matching denoise loop (with Krea-convention CFG when
-  `guidance_scale > 0`), and Phase C decodes latents with the Qwen-Image (Wan
-  architecture) VAE.
+  the flow-matching denoise loop (with optional Krea-convention CFG), and Phase
+  C decodes latents with the Qwen-Image (Wan architecture) VAE.
   """
 
   def __init__(
@@ -80,6 +145,7 @@ class FlaxKrea2Pipeline:
       mesh,
       vae_mesh=None,
       vae_logical_axis_rules=None,
+      lora_compile_spec=(),
   ):
     self.transformer = transformer
     self.vae = vae
@@ -90,7 +156,14 @@ class FlaxKrea2Pipeline:
     self._config = config
     self.mesh = mesh
     self.vae_mesh = vae_mesh if vae_mesh is not None else mesh
-    self.vae_logical_axis_rules = vae_logical_axis_rules if vae_logical_axis_rules is not None else config.logical_axis_rules
+    self.vae_logical_axis_rules = (
+        vae_logical_axis_rules if vae_logical_axis_rules is not None else config.logical_axis_rules
+    )
+    self._staged_block_lora_specs = (
+        index_staged_block_lora_specs(lora_compile_spec, transformer.num_layers)
+        if getattr(config, "krea2_staged_transformer", False)
+        else tuple(() for _ in range(transformer.num_layers))
+    )
 
     self._jitted_qwen3_forward = None
     self._jitted_transformer_step = None
@@ -113,17 +186,91 @@ class FlaxKrea2Pipeline:
       # Drop the system-prefix tokens.
       return hidden[:, start_idx:]
 
-    @aot_cache.cached_jit
-    def transformer_step(t_params, latents, prompt_embeds, text_mask, img_ids, txt_ids, t_vec):
-      return self.transformer.apply(
-          {"params": t_params},
-          hidden_states=latents,
-          encoder_hidden_states=prompt_embeds,
-          timestep=t_vec,
-          img_ids=img_ids,
-          txt_ids=txt_ids,
-          encoder_attention_mask=text_mask,
-      ).sample
+    if getattr(self._config, "krea2_staged_transformer", False):
+      staged_block = Krea2TransformerBlock(
+          hidden_size=self.transformer.attention_head_dim * self.transformer.num_attention_heads,
+          intermediate_size=self.transformer.intermediate_size,
+          num_heads=self.transformer.num_attention_heads,
+          num_kv_heads=self.transformer.num_key_value_heads,
+          norm_eps=self.transformer.norm_eps,
+          attention_kernel=self.transformer.attention_kernel,
+          flash_min_seq_length=self.transformer.flash_min_seq_length,
+          flash_block_sizes=self.transformer.flash_block_sizes,
+          mask_padding_tokens=self.transformer.mask_padding_tokens,
+          mesh=self.transformer.mesh,
+          dtype=self.transformer.dtype,
+          weights_dtype=self.transformer.weights_dtype,
+          precision=self.transformer.precision,
+      )
+      prelude_keys = ("img_in", "time_embed", "time_mod_proj", "text_fusion", "txt_in")
+
+      @aot_cache.cached_jit
+      def transformer_prelude(prelude_params, latents, prompt_embeds, text_mask, img_ids, txt_ids, t_vec):
+        return self.transformer.apply(
+            {"params": prelude_params},
+            latents,
+            prompt_embeds,
+            t_vec,
+            img_ids,
+            txt_ids,
+            text_mask,
+            method=self.transformer.prepare_inputs,
+        )
+
+      @aot_cache.cached_jit
+      def transformer_block(block_params, lora_params, hidden_states, temb_mod, rotary_emb, attention_mask):
+        return staged_block.apply(
+            {"params": block_params},
+            hidden_states,
+            temb_mod=temb_mod,
+            image_rotary_emb=rotary_emb,
+            attention_mask=attention_mask,
+            lora_params=lora_params,
+        )
+
+      @aot_cache.cached_jit
+      def transformer_final(final_params, hidden_states, temb, text_mask):
+        return self.transformer.apply(
+            {"params": {"final_layer": final_params}},
+            hidden_states,
+            temb,
+            text_mask.shape[1],
+            method=self.transformer.finalize_output,
+        )
+
+      def transformer_step(t_params, latents, prompt_embeds, text_mask, img_ids, txt_ids, t_vec):
+        prelude_params = {key: t_params[key] for key in prelude_keys}
+        hidden_states, temb, temb_mod, rotary_emb, attention_mask = transformer_prelude(
+            prelude_params, latents, prompt_embeds, text_mask, img_ids, txt_ids, t_vec
+        )
+        for block_idx in range(self.transformer.num_layers):
+          block_params = t_params[f"blocks_{block_idx}"]
+          block_lora_params = build_staged_block_lora_params(
+              block_params, self._staged_block_lora_specs[block_idx]
+          )
+          hidden_states = transformer_block(
+              block_params,
+              block_lora_params,
+              hidden_states,
+              temb_mod,
+              rotary_emb,
+              attention_mask,
+          )
+        return transformer_final(t_params["final_layer"], hidden_states, temb, text_mask)
+
+    else:
+
+      @aot_cache.cached_jit
+      def transformer_step(t_params, latents, prompt_embeds, text_mask, img_ids, txt_ids, t_vec):
+        return self.transformer.apply(
+            {"params": t_params},
+            hidden_states=latents,
+            encoder_hidden_states=prompt_embeds,
+            timestep=t_vec,
+            img_ids=img_ids,
+            txt_ids=txt_ids,
+            encoder_attention_mask=text_mask,
+        ).sample
 
     self._jitted_qwen3_forward = qwen3_forward
     self._jitted_transformer_step = transformer_step
@@ -194,6 +341,7 @@ class FlaxKrea2Pipeline:
       output_dir: str = "output/",
       output_name: str = "krea2_generated_image.png",
       save_outputs: bool = True,
+      do_classifier_free_guidance: Optional[bool] = None,
   ):
     self._setup_jit_functions()
 
@@ -202,7 +350,9 @@ class FlaxKrea2Pipeline:
     else:
       prompts = prompt
 
-    do_classifier_free_guidance = guidance_scale > 0.0
+    do_classifier_free_guidance = is_classifier_free_guidance_enabled(
+        guidance_scale, do_classifier_free_guidance
+    )
     if negative_prompt is None:
       negative_prompt = ""
     if isinstance(negative_prompt, str):
@@ -268,10 +418,11 @@ class FlaxKrea2Pipeline:
       max_logging.log(f"[PHASE A] Encoding {len(prompts)} prompt(s) with the Qwen3-VL text encoder...")
       t0 = time.perf_counter()
 
-      prompt_embeds, prompt_embeds_mask = self.encode_prompt(prompts, qwen3_params)
-      if do_classifier_free_guidance:
-        negative_prompt_embeds, negative_prompt_embeds_mask = self.encode_prompt(negative_prompts, qwen3_params)
-      prompt_embeds.block_until_ready()
+      with jax.profiler.TraceAnnotation("krea2_prompt_encoding"):
+        prompt_embeds, prompt_embeds_mask = self.encode_prompt(prompts, qwen3_params)
+        if do_classifier_free_guidance:
+          negative_prompt_embeds, negative_prompt_embeds_mask = self.encode_prompt(negative_prompts, qwen3_params)
+        prompt_embeds.block_until_ready()
 
       trace["prompt_encoding"] = time.perf_counter() - t0
       max_logging.log(f" -> [TIMING] Prompt Encoding (Qwen3-VL): {trace['prompt_encoding']:.4f} seconds")
@@ -307,28 +458,29 @@ class FlaxKrea2Pipeline:
       t0 = time.perf_counter()
 
       for step_idx in range(num_inference_steps):
-        timestep = scheduler_state.timesteps[step_idx]
-        t_vec = jnp.full((batch_size,), timestep / 1000.0, dtype=latents_jax.dtype)
+        with jax.profiler.StepTraceAnnotation("krea2_denoise", step_num=step_idx):
+          timestep = scheduler_state.timesteps[step_idx]
+          t_vec = jnp.full((batch_size,), timestep / 1000.0, dtype=latents_jax.dtype)
 
-        noise_pred = self._jitted_transformer_step(
-            params, latents_jax, prompt_embeds, prompt_embeds_mask, img_ids_val, txt_ids_val, t_vec
-        )
-        if do_classifier_free_guidance:
-          neg_noise_pred = self._jitted_transformer_step(
-              params, latents_jax, negative_prompt_embeds, negative_prompt_embeds_mask, img_ids_val, txt_ids_val, t_vec
+          noise_pred = self._jitted_transformer_step(
+              params, latents_jax, prompt_embeds, prompt_embeds_mask, img_ids_val, txt_ids_val, t_vec
           )
-          # Krea 2 guidance convention: cond + g * (cond - uncond); equals standard
-          # CFG with scale (1 + g).
-          noise_pred = noise_pred + guidance_scale * (noise_pred - neg_noise_pred)
+          if do_classifier_free_guidance:
+            neg_noise_pred = self._jitted_transformer_step(
+                params, latents_jax, negative_prompt_embeds, negative_prompt_embeds_mask, img_ids_val, txt_ids_val, t_vec
+            )
+            # Krea 2 guidance convention: cond + g * (cond - uncond); equals standard
+            # CFG with scale (1 + g).
+            noise_pred = noise_pred + guidance_scale * (noise_pred - neg_noise_pred)
 
-        prev_sample, _ = self.scheduler.step(
-            state=scheduler_state,
-            model_output=noise_pred.astype(latents_jax.dtype),
-            timestep=timestep,
-            sample=latents_jax,
-            return_dict=False,
-        )
-        latents_jax = prev_sample
+          prev_sample, _ = self.scheduler.step(
+              state=scheduler_state,
+              model_output=noise_pred.astype(latents_jax.dtype),
+              timestep=timestep,
+              sample=latents_jax,
+              return_dict=False,
+          )
+          latents_jax = prev_sample
 
       latents_jax.block_until_ready()
       multihost_utils.sync_global_devices("krea2_phase_b_complete")
@@ -349,10 +501,11 @@ class FlaxKrea2Pipeline:
     # Add a singleton frame dimension: (B, z_dim, 1, H/8, W/8)
     latents_5d = jnp.array(latents_unpacked[:, :, None, :, :], dtype=self._config.activations_dtype)
 
-    with self.vae_mesh, nn_partitioning.axis_rules(self.vae_logical_axis_rules):
-      graphdef, state, rest_of_state = nnx.split(self.vae, nnx.Param, ...)
-      images = self._jitted_vae_decode(graphdef, state, rest_of_state, latents_5d)
-      images.block_until_ready()
+    with jax.profiler.TraceAnnotation("krea2_vae_decode"):
+      with self.vae_mesh, nn_partitioning.axis_rules(self.vae_logical_axis_rules):
+        graphdef, state, rest_of_state = nnx.split(self.vae, nnx.Param, ...)
+        images = self._jitted_vae_decode(graphdef, state, rest_of_state, latents_5d)
+        images.block_until_ready()
 
     trace["vae_decode"] = time.perf_counter() - t0
     max_logging.log(f" -> [TIMING] VAE Decoding: {trace['vae_decode']:.4f} seconds")
