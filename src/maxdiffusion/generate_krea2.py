@@ -124,6 +124,60 @@ def load_qwen_image_vae(snapshot_dir, config, vae_mesh, rngs):
   return wan_vae, vae_cache
 
 
+def build_qwen3_config(te_config, config):
+  """Builds the Qwen3 text-tower config from a Qwen3-VL `text_encoder/config.json` dict."""
+  from maxdiffusion.models.qwen3_flax import FlaxQwen3Config
+
+  text_config = te_config.get("text_config", te_config)
+  rope_parameters = text_config.get("rope_parameters", {})
+  rope_theta = rope_parameters.get("rope_theta", text_config.get("rope_theta", 5000000.0))
+
+  return FlaxQwen3Config(
+      vocab_size=text_config["vocab_size"],
+      hidden_size=text_config["hidden_size"],
+      intermediate_size=text_config["intermediate_size"],
+      num_hidden_layers=text_config["num_hidden_layers"],
+      num_attention_heads=text_config["num_attention_heads"],
+      num_key_value_heads=text_config["num_key_value_heads"],
+      head_dim=text_config.get("head_dim", 128),
+      max_position_embeddings=text_config.get("max_position_embeddings", 262144),
+      rms_norm_eps=text_config.get("rms_norm_eps", 1e-6),
+      rope_theta=rope_theta,
+      dtype=config.weights_dtype,
+  )
+
+
+def build_krea2_transformer(transformer_cfg, config, mesh):
+  """Builds the Krea 2 transformer module from a `transformer/config.json` dict (defaults if empty)."""
+  from maxdiffusion.models.krea2.transformer_krea2_flax import Krea2Transformer2DModel
+
+  return Krea2Transformer2DModel(
+      in_channels=transformer_cfg.get("in_channels", 64),
+      num_layers=transformer_cfg.get("num_layers", 28),
+      attention_head_dim=transformer_cfg.get("attention_head_dim", 128),
+      num_attention_heads=transformer_cfg.get("num_attention_heads", 48),
+      num_key_value_heads=transformer_cfg.get("num_key_value_heads", 12),
+      intermediate_size=transformer_cfg.get("intermediate_size", 16384),
+      timestep_embed_dim=transformer_cfg.get("timestep_embed_dim", 256),
+      text_hidden_dim=transformer_cfg.get("text_hidden_dim", 2560),
+      num_text_layers=transformer_cfg.get("num_text_layers", 12),
+      text_num_attention_heads=transformer_cfg.get("text_num_attention_heads", 20),
+      text_num_key_value_heads=transformer_cfg.get("text_num_key_value_heads", 20),
+      text_intermediate_size=transformer_cfg.get("text_intermediate_size", 6912),
+      num_layerwise_text_blocks=transformer_cfg.get("num_layerwise_text_blocks", 2),
+      num_refiner_text_blocks=transformer_cfg.get("num_refiner_text_blocks", 2),
+      axes_dims_rope=tuple(transformer_cfg.get("axes_dims_rope", (32, 48, 48))),
+      rope_theta=transformer_cfg.get("rope_theta", 1000.0),
+      norm_eps=transformer_cfg.get("norm_eps", 1e-5),
+      attention_kernel=config.attention,
+      flash_block_sizes=max_utils.get_flash_block_sizes(config),
+      mask_padding_tokens=config.mask_padding_tokens,
+      mesh=mesh,
+      dtype=config.activations_dtype,
+      weights_dtype=config.weights_dtype,
+  )
+
+
 def main(argv):
   jax.config.update("jax_use_shardy_partitioner", True)
 
@@ -149,13 +203,12 @@ def main(argv):
   pyconfig.initialize(default_args)
 
   # Import modules after jax.distributed.initialize() has run via pyconfig.initialize()
-  from maxdiffusion.models.krea2.transformer_krea2_flax import Krea2Transformer2DModel
   from maxdiffusion.models.krea2.util import (
       KREA2_PROMPT_TEMPLATE_START_IDX,
       load_and_convert_krea2_weights,
       round_up_to_multiple,
   )
-  from maxdiffusion.models.qwen3_flax import FlaxQwen3Config, FlaxQwen3Model, load_and_convert_qwen3_weights
+  from maxdiffusion.models.qwen3_flax import FlaxQwen3Model, load_and_convert_qwen3_weights
   from maxdiffusion.models.flux.util import cast_dict_to_bfloat16_inplace
   from maxdiffusion.schedulers.scheduling_flow_match_flax import FlaxFlowMatchScheduler
   from maxdiffusion.pipelines.krea2.krea2_pipeline import FlaxKrea2Pipeline
@@ -229,23 +282,7 @@ def main(argv):
   # 4. Text encoder config (Qwen3-VL: text tower lives under `text_config`)
   with open(os.path.join(text_encoder_path, "config.json"), "r") as f:
     te_config = json.load(f)
-  text_config = te_config.get("text_config", te_config)
-  rope_parameters = text_config.get("rope_parameters", {})
-  rope_theta = rope_parameters.get("rope_theta", text_config.get("rope_theta", 5000000.0))
-
-  qwen3_config = FlaxQwen3Config(
-      vocab_size=text_config["vocab_size"],
-      hidden_size=text_config["hidden_size"],
-      intermediate_size=text_config["intermediate_size"],
-      num_hidden_layers=text_config["num_hidden_layers"],
-      num_attention_heads=text_config["num_attention_heads"],
-      num_key_value_heads=text_config["num_key_value_heads"],
-      head_dim=text_config.get("head_dim", 128),
-      max_position_embeddings=text_config.get("max_position_embeddings", 262144),
-      rms_norm_eps=text_config.get("rms_norm_eps", 1e-6),
-      rope_theta=rope_theta,
-      dtype=config.weights_dtype,
-  )
+  qwen3_config = build_qwen3_config(te_config, config)
   qwen3_model = FlaxQwen3Model(qwen3_config)
 
   # 5. Transformer config
@@ -256,31 +293,7 @@ def main(argv):
       transformer_cfg = json.load(f)
 
   num_layers = transformer_cfg.get("num_layers", 28)
-  transformer = Krea2Transformer2DModel(
-      in_channels=transformer_cfg.get("in_channels", 64),
-      num_layers=num_layers,
-      attention_head_dim=transformer_cfg.get("attention_head_dim", 128),
-      num_attention_heads=transformer_cfg.get("num_attention_heads", 48),
-      num_key_value_heads=transformer_cfg.get("num_key_value_heads", 12),
-      intermediate_size=transformer_cfg.get("intermediate_size", 16384),
-      timestep_embed_dim=transformer_cfg.get("timestep_embed_dim", 256),
-      text_hidden_dim=transformer_cfg.get("text_hidden_dim", 2560),
-      num_text_layers=transformer_cfg.get("num_text_layers", 12),
-      text_num_attention_heads=transformer_cfg.get("text_num_attention_heads", 20),
-      text_num_key_value_heads=transformer_cfg.get("text_num_key_value_heads", 20),
-      text_intermediate_size=transformer_cfg.get("text_intermediate_size", 6912),
-      num_layerwise_text_blocks=transformer_cfg.get("num_layerwise_text_blocks", 2),
-      num_refiner_text_blocks=transformer_cfg.get("num_refiner_text_blocks", 2),
-      axes_dims_rope=tuple(transformer_cfg.get("axes_dims_rope", (32, 48, 48))),
-      rope_theta=transformer_cfg.get("rope_theta", 1000.0),
-      norm_eps=transformer_cfg.get("norm_eps", 1e-5),
-      attention_kernel=config.attention,
-      flash_block_sizes=max_utils.get_flash_block_sizes(config),
-      mask_padding_tokens=config.mask_padding_tokens,
-      mesh=mesh,
-      dtype=config.activations_dtype,
-      weights_dtype=config.weights_dtype,
-  )
+  transformer = build_krea2_transformer(transformer_cfg, config, mesh)
 
   # 5b. Optionally load LoRA adapters (kohya/ComfyUI/diffusers .safetensors).
   # The interceptors must be live around shape evaluation AND every pipeline
