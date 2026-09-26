@@ -837,6 +837,14 @@ The optimal attention tile sizes (`block_q` / `block_kv`) depend on the sequence
     krea2_staged_transformer=True 'krea2_offload_components=["text_encoder","transformer"]'
   ```
 
+  To check whether a setting fits before you provision a TPU, run the compile-only estimator on CPU. It prints the per-phase resident weights, activations and peak HBM for the target topology:
+
+  ```bash
+  JAX_PLATFORMS=cpu python src/maxdiffusion/compile_krea2.py src/maxdiffusion/configs/base_krea2_turbo.yml \
+    compile_topology=v6e-1 height=2048 width=2048 krea2_staged_transformer=True \
+    'krea2_offload_components=["text_encoder","transformer"]'
+  ```
+
   ## Wan LoRA
 
   Disclaimer: not all LoRA formats have been tested. Currently supports ComfyUI and AI Toolkit formats. If there is a specific LoRA that doesn't load, please let us know.
