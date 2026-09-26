@@ -38,6 +38,10 @@ minus the torch interop):
   * A deserialized ``Compiled`` does not auto-reshard inputs like jit
     does; inputs are aligned to ``compiled.input_shardings`` in Python
     before the call.
+  * ``donate_argnames`` args are flattened into their own leaf list that
+    the adapter donates (``donate_argnums=(0,)``), so the donation is baked
+    into the serialized executable. Fns without donation keep the original
+    single-list adapter, so their on-disk executables are unchanged.
 
 Usage::
 
@@ -99,12 +103,25 @@ def _dynamic_signature(args: tuple, kwargs: dict) -> str:
 class _AotEntry:
   """Executables for one wrapped fn, keyed by dynamic input signature."""
 
-  def __init__(self, name: str, fn: Callable, static_argnames: tuple):
+  def __init__(self, name: str, fn: Callable, static_argnames: tuple, donate_argnames: tuple = ()):
+    if isinstance(donate_argnames, str):
+      donate_argnames = (donate_argnames,)
     self.name = name
     self.fn = fn
     self.static_argnames = tuple(static_argnames)
+    self.donate_argnames = tuple(donate_argnames)
+    overlap = set(self.static_argnames) & set(self.donate_argnames)
+    if overlap:
+      raise ValueError(f"{name}: args cannot be both static and donated: {sorted(overlap)}")
     self.py_signature = inspect.signature(fn)
-    self.jitted = jax.jit(fn, static_argnames=static_argnames or None)
+    unknown = set(self.donate_argnames) - set(self.py_signature.parameters)
+    if unknown:
+      raise ValueError(f"{name}: donate_argnames not in signature: {sorted(unknown)}")
+    self.jitted = jax.jit(
+        fn,
+        static_argnames=static_argnames or None,
+        donate_argnames=self.donate_argnames or None,
+    )
     self._compiled: dict[str, Any] = {}
     self._out_specs: dict[str, Any] = {}
     self._pending: dict[str, tuple] = {}
@@ -131,7 +148,24 @@ class _AotEntry:
     ]
     return jax.tree_util.tree_unflatten(out_treedef, zeros)
 
-  def _adapter_for(self, signature: str, treedef: Any, static: dict):
+  def _flatten_dynamic(self, dynamic: dict) -> tuple[tuple, tuple]:
+    """Flattens dynamic kwargs into the adapter's positional leaf lists.
+
+    Without donation: ``([leaves], [treedef])`` -- the original single-list
+    layout, kept so existing on-disk executables stay valid. With
+    donation: ``([donated_leaves, leaves], [donated_treedef, treedef])``,
+    where the first list holds exactly the ``donate_argnames`` kwargs.
+    """
+    if not self.donate_argnames:
+      leaves, treedef = jax.tree_util.tree_flatten(dynamic)
+      return (leaves,), (treedef,)
+    donated = {k: v for k, v in dynamic.items() if k in self.donate_argnames}
+    rest = {k: v for k, v in dynamic.items() if k not in self.donate_argnames}
+    donated_leaves, donated_treedef = jax.tree_util.tree_flatten(donated)
+    leaves, treedef = jax.tree_util.tree_flatten(rest)
+    return (donated_leaves, leaves), (donated_treedef, treedef)
+
+  def _adapter_for(self, signature: str, treedefs: tuple, static: dict):
     """Returns the per-signature flat-leaf-list jit of fn.
 
     The input treedef (which may embed unpicklable statics, e.g. an nnx
@@ -139,15 +173,29 @@ class _AotEntry:
     closure and is never serialized -- the adapter's own in/out trees are
     plain lists/tuples of arrays. Warmup compiles this adapter, so
     ``save_pending``'s lower().compile() hits the in-memory pjit cache
-    instead of recompiling.
+    instead of recompiling. ``treedefs`` comes from ``_flatten_dynamic``;
+    with donation the adapter takes (donated_flat, flat) and donates arg 0.
     """
     adapter_jit = self._adapters.get(signature)
     if adapter_jit is None:
+      if len(treedefs) == 1:
+        (treedef,) = treedefs
 
-      def adapter(flat, _treedef=treedef, _static=static):
-        return self.fn(**jax.tree_util.tree_unflatten(_treedef, flat), **_static)
+        def adapter(flat, _treedef=treedef, _static=static):
+          return self.fn(**jax.tree_util.tree_unflatten(_treedef, flat), **_static)
 
-      adapter_jit = jax.jit(adapter)
+        adapter_jit = jax.jit(adapter)
+      else:
+        donated_treedef, treedef = treedefs
+
+        def donating_adapter(donated_flat, flat, _donated_treedef=donated_treedef, _treedef=treedef, _static=static):
+          return self.fn(
+              **jax.tree_util.tree_unflatten(_donated_treedef, donated_flat),
+              **jax.tree_util.tree_unflatten(_treedef, flat),
+              **_static,
+          )
+
+        adapter_jit = jax.jit(donating_adapter, donate_argnums=(0,))
       with self._lock:
         self._adapters.setdefault(signature, adapter_jit)
         adapter_jit = self._adapters[signature]
@@ -168,9 +216,9 @@ class _AotEntry:
       (static if name in self.static_argnames else dynamic)[name] = val
     return dynamic, static
 
-  def _compile_and_record(self, signature: str, leaves: list, treedef: Any, static: dict):
+  def _compile_and_record(self, signature: str, arg_lists: tuple, treedefs: tuple, static: dict):
     """Lower+compile one signature (no execution) and capture out specs."""
-    lowered = self._adapter_for(signature, treedef, static).lower(leaves)
+    lowered = self._adapter_for(signature, treedefs, static).lower(*arg_lists)
     compiled = lowered.compile()
     info_leaves, out_treedef = jax.tree_util.tree_flatten(lowered.out_info)
     shapes_dtypes = [(tuple(x.shape), jnp.dtype(x.dtype)) for x in info_leaves]
@@ -185,8 +233,8 @@ class _AotEntry:
     if not _STATE.enabled:
       return self.jitted(*args, **kwargs)
     dynamic, static = self._canonicalize(args, kwargs)
-    leaves, treedef = jax.tree_util.tree_flatten(dynamic)
-    if any(isinstance(leaf, jax.core.Tracer) for leaf in leaves):
+    arg_lists, treedefs = self._flatten_dynamic(dynamic)
+    if any(isinstance(leaf, jax.core.Tracer) for leaves in arg_lists for leaf in leaves):
       # Under an outer trace a deserialized executable cannot be applied
       # and tracers must not be recorded -- inline like a nested jit.
       return self.jitted(**dynamic, **static)
@@ -196,42 +244,50 @@ class _AotEntry:
       # real execution and hand back correctly-shaped/sharded zeros so
       # downstream executables still warm against faithful inputs.
       if signature not in self._compiled:
-        self._compile_and_record(signature, leaves, treedef, static)
+        self._compile_and_record(signature, arg_lists, treedefs, static)
         with self._lock:
           if signature not in self._on_disk:
-            self._pending[signature] = (leaves, treedef, static)
+            self._pending[signature] = (arg_lists, treedefs, static)
       zeros = self._zeros_output(signature)
       if zeros is not None:
         return zeros
     compiled = self._compiled.get(signature)
     if compiled is not None:
-      flat = self._align_inputs(compiled, leaves)
-      if flat is not None:
-        return compiled(flat)
+      aligned = self._align_inputs(compiled, arg_lists)
+      if aligned is not None:
+        return compiled(*aligned)
       # Fewer expected shardings than leaves: XLA pruned unused inputs
       # (e.g. encoder params in a decode-only executable). Compiled keeps
       # the full in_tree and prunes internally, so hand it the raw leaves;
       # sharding/structure problems surface as catchable Python errors.
       try:
-        return compiled(leaves)
+        return compiled(*arg_lists)
       except Exception as e:  # noqa: BLE001 - any failure means "use jit"
+        if self.donate_argnames:
+          # The failed call may already have consumed the donated buffers;
+          # retrying through jit would read deleted arrays, so surface it.
+          max_logging.log(f"[aot] {self.name}: compiled call failed ({e}); donated inputs, not retrying via jit")
+          raise
         max_logging.log(f"[aot] {self.name}: compiled call failed ({e}); using jit")
     with self._lock:
       if signature not in self._pending and signature not in self._compiled:
-        self._pending[signature] = (leaves, treedef, static)
-    return self._adapter_for(signature, treedef, static)(leaves)
+        self._pending[signature] = (arg_lists, treedefs, static)
+    return self._adapter_for(signature, treedefs, static)(*arg_lists)
 
-  def _align_inputs(self, compiled: Any, leaves: list):
-    """Reshards the flat input leaves onto the executable's shardings.
+  def _align_inputs(self, compiled: Any, arg_lists: tuple):
+    """Reshards the flat input leaf lists onto the executable's shardings.
 
     jit auto-commits mismatched inputs; a deserialized Compiled does not --
     a placement mismatch aborts inside PjRt (uncatchable C++). Weights
     already carry final shardings; in practice this only moves small
-    fresh-off-host activations. Returns the aligned leaf list, or None on
-    structural mismatch (caller falls back to jit).
+    fresh-off-host activations. ``compiled.input_shardings`` flattens to
+    the concatenation of ``arg_lists`` (one list, or donated + rest).
+    Returns the aligned lists as a tuple, or None on structural mismatch
+    (caller falls back to jit).
     """
     try:
       flat_expected = jax.tree_util.tree_leaves(compiled.input_shardings)
+      leaves = [leaf for leaf_list in arg_lists for leaf in leaf_list]
       if len(flat_expected) != len(leaves):
         # Fewer expected shardings than leaves = XLA pruned unused inputs;
         # the caller retries via Compiled's own pruning path. Not an error.
@@ -245,7 +301,11 @@ class _AotEntry:
           aligned.append(leaf)
         else:
           aligned.append(jax.device_put(leaf, expected))
-      return aligned
+      out, start = [], 0
+      for leaf_list in arg_lists:
+        out.append(aligned[start : start + len(leaf_list)])
+        start += len(leaf_list)
+      return tuple(out)
     except Exception as e:  # noqa: BLE001 - any failure means "use jit"
       max_logging.log(f"[aot] {self.name}: cannot align inputs ({e}); using jit")
       return None
@@ -292,7 +352,7 @@ class _AotEntry:
     saved = 0
     with self._lock:
       pending, self._pending = self._pending, {}
-    for signature, (leaves, treedef, static) in pending.items():
+    for signature, (arg_lists, treedefs, static) in pending.items():
       if signature in self._on_disk:
         # Background deserialization landed after this shape was recorded.
         continue
@@ -304,7 +364,7 @@ class _AotEntry:
           # the model need the mesh context that warmup provided.
           mesh_ctx = _STATE.mesh if _STATE.mesh is not None else contextlib.nullcontext()
           with mesh_ctx:
-            compiled = self._compile_and_record(signature, leaves, treedef, static)
+            compiled = self._compile_and_record(signature, arg_lists, treedefs, static)
         payload, in_tree, out_tree = serialize_executable.serialize(compiled)
         blob = {
             "format_version": _FORMAT_VERSION,
@@ -347,16 +407,24 @@ _REGISTRY: list[_AotEntry] = []
 _LOAD_THREADS: list[threading.Thread] = []
 
 
-def cached_jit(fn: Callable, static_argnames: tuple = ()) -> Callable:
+def cached_jit(fn: Callable, static_argnames: tuple = (), donate_argnames: tuple = ()) -> Callable:
   """Drop-in replacement for ``jax.jit`` with an optional AOT layer.
 
-  Behaves exactly like ``jax.jit(fn, static_argnames=...)`` until
-  ``install()`` enables the executable cache.
+  Behaves exactly like ``jax.jit(fn, static_argnames=...,
+  donate_argnames=...)`` until ``install()`` enables the executable cache.
+
+  ``donate_argnames`` names (whole pytree) args whose buffers XLA may reuse
+  for the outputs; the donation is preserved on the jit fallback, the
+  compiled/deserialized path and in serialized executables. Contract: the
+  caller must never touch a donated arg after the call (its arrays are
+  deleted once the call runs) -- rebind it to the output instead. The one
+  exception is ``warmup_mode()``, which only compiles and leaves inputs
+  intact. Donated args cannot also be static.
   """
   # Qualify by module: same-named fns (e.g. the VACE and base
   # transformer_forward_pass) must not glob each other's files.
   name = f"{fn.__module__.rsplit('.', 1)[-1]}.{fn.__name__}"
-  entry = _AotEntry(name, fn, static_argnames)
+  entry = _AotEntry(name, fn, static_argnames, donate_argnames)
   _REGISTRY.append(entry)
   return entry
 
