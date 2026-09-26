@@ -18,6 +18,7 @@ limitations under the License.
 # timestep-shift computation and rotary position-id helpers.
 
 import gc
+import traceback
 
 import jax
 import jax.numpy as jnp
@@ -42,6 +43,57 @@ KREA2_PROMPT_TEMPLATE_PREFIX = (
 KREA2_PROMPT_TEMPLATE_SUFFIX = "<|im_end|>\n<|im_start|>assistant\n"
 KREA2_PROMPT_TEMPLATE_START_IDX = 34
 KREA2_PROMPT_TEMPLATE_NUM_SUFFIX_TOKENS = 5
+
+
+def _is_extra_special_tokens_error(err: BaseException) -> bool:
+  """True only for the known transformers 4.x incompatibility with the Krea 2
+  tokenizer_config.json: its `extra_special_tokens` is a list, which
+  `_set_model_specific_special_tokens` treats as a dict and fails with
+  `AttributeError: 'list' object has no attribute 'keys'`.
+
+  Requires both the AttributeError message and a traceback frame whose name
+  contains `special_tokens`, so genuine special-token validation errors (e.g.
+  transformers' "Special token ... has to be either str or AddedToken"
+  TypeError) are not mistaken for it and still propagate.
+  """
+  if not isinstance(err, AttributeError) or "'list' object has no attribute" not in str(err):
+    return False
+  return any("special_tokens" in frame.name for frame in traceback.extract_tb(err.__traceback__))
+
+
+def load_krea2_tokenizer(tokenizer_path: str, snapshot_dir: str = None):
+  """Loads the Krea 2 (Qwen) tokenizer from `tokenizer_path`, falling back to
+  `snapshot_dir`'s `tokenizer` subfolder.
+
+  transformers < 5 expects a dict for `extra_special_tokens`; the Krea 2
+  tokenizer_config.json stores a list, which fails with
+  `AttributeError: 'list' object has no attribute 'keys'` inside
+  `_set_model_specific_special_tokens`. Those tokens are already special added
+  tokens in tokenizer.json, so on exactly that error the load is retried once
+  with `extra_special_tokens={}`, which does not change tokenization. Any other
+  error propagates (after the `snapshot_dir` subfolder fallback, if given).
+  """
+  from transformers import AutoTokenizer
+
+  def load(**kwargs):
+    try:
+      return AutoTokenizer.from_pretrained(tokenizer_path, local_files_only=True, **kwargs)
+    except Exception as err:  # pylint: disable=broad-except
+      if snapshot_dir is None or _is_extra_special_tokens_error(err):
+        raise
+      return AutoTokenizer.from_pretrained(snapshot_dir, subfolder="tokenizer", local_files_only=True, **kwargs)
+
+  try:
+    return load()
+  except AttributeError as err:
+    if not _is_extra_special_tokens_error(err):
+      raise
+    max_logging.log(
+        "Warning: this transformers version expects a dict for the tokenizer's `extra_special_tokens` but "
+        f"tokenizer_config.json has a list ({err}); retrying with extra_special_tokens={{}} "
+        "(those tokens are already special tokens in tokenizer.json, so tokenization is unchanged)."
+    )
+    return load(extra_special_tokens={})
 
 
 def round_up_to_multiple(value: int, multiple: int) -> int:
@@ -76,6 +128,93 @@ def prepare_krea2_image_ids(batch_size: int, grid_height: int, grid_width: int):
   grid = grid.at[..., 2].set(jnp.arange(grid_width)[None, :])
   image_ids = grid.reshape(-1, 3)
   return jnp.tile(image_ids[None, ...], (batch_size, 1, 1))
+
+
+def rotate_half_permutation(head_dim: int) -> np.ndarray:
+  """Per-head index map `new = old[perm]` from interleaved to rotate-half order:
+  `new[i] = old[2i]` and `new[i + head_dim/2] = old[2i + 1]` for i in [0, head_dim/2)."""
+  if head_dim % 2:
+    raise ValueError(f"head_dim must be even for RoPE, got {head_dim}.")
+  return np.concatenate([np.arange(0, head_dim, 2), np.arange(1, head_dim, 2)])
+
+
+def permute_rope_weights_to_rotate_half(params, num_heads: int, num_kv_heads: int, head_dim: int):
+  """Reorders q/k head dimensions so rotate-half RoPE reproduces interleaved RoPE.
+
+  For every `blocks_*/attn` (the only attention with RoPE; text-fusion
+  attention is left alone) this returns a new tree in which, within every head,
+  `new[i] = old[2i]` and `new[i + D/2] = old[2i + 1]` is applied to:
+
+  - the output columns of `to_q/kernel` `(in, H*D)` and `to_k/kernel` `(in, Hkv*D)`,
+  - `norm_q/weight` and `norm_k/weight` `(D,)`,
+  - the output columns of every LoRA up kernel `to_q/lora-*/up/kernel` and
+    `to_k/lora-*/up/kernel` `(rank, H*D)` (so LoRA updates, like the base
+    projection, come out permuted). LoRA `down` kernels, `to_v`, `to_gate`,
+    `to_out`, biases and all other leaves are shared with the input tree.
+
+  Why this is exact:
+
+  - Interleaved RoPE rotates the pair `(x[2i], x[2i+1])` by angle `theta_i`.
+    With `y = P(x)` (i.e. `y[i] = x[2i]`, `y[i + D/2] = x[2i+1]`), rotate-half
+    RoPE with the un-repeated `theta_i` table maps `y[i]` to
+    `y[i] cos - y[i+D/2] sin = x[2i] cos - x[2i+1] sin` and `y[i + D/2]` to
+    `x[2i+1] cos + x[2i] sin`: exactly `P` applied to the interleaved result.
+  - The per-head RMSNorm over head_dim is permutation-invariant (its mean of
+    squares does not depend on order) once its weight is permuted alongside.
+  - q and k receive the same permutation, so every dot product `q . k` (and
+    therefore the attention weights) is unchanged; v and the output projection
+    never see the permuted axis.
+
+  Works on host numpy or jax arrays; the input tree is not modified.
+  """
+  if params is None:
+    return params
+  perm = rotate_half_permutation(head_dim)
+
+  def head_index(heads):
+    return (np.arange(heads)[:, None] * head_dim + perm[None, :]).reshape(-1)
+
+  q_index = head_index(num_heads)
+  k_index = head_index(num_kv_heads)
+
+  def permute_projection(proj, index):
+    new_proj = dict(proj)
+    if "kernel" in proj:
+      kernel = proj["kernel"]
+      if kernel.shape[-1] != index.shape[0]:
+        raise ValueError(f"Projection kernel output width {kernel.shape[-1]} != heads*head_dim {index.shape[0]}.")
+      new_proj["kernel"] = kernel[..., index]
+    for name, sub in proj.items():
+      if isinstance(name, str) and name.startswith("lora-"):
+        new_sub = dict(sub)
+        if "up" in sub:
+          new_up = dict(sub["up"])
+          new_up["kernel"] = sub["up"]["kernel"][..., index]
+          new_sub["up"] = new_up
+        new_proj[name] = new_sub
+    return new_proj
+
+  def permute_norm(norm):
+    new_norm = dict(norm)
+    new_norm["weight"] = norm["weight"][..., perm]
+    return new_norm
+
+  new_params = dict(params)
+  num_blocks = 0
+  for name, block in params.items():
+    if not (isinstance(name, str) and name.startswith("blocks_")) or "attn" not in block:
+      continue
+    attn = dict(block["attn"])
+    attn["to_q"] = permute_projection(attn["to_q"], q_index)
+    attn["to_k"] = permute_projection(attn["to_k"], k_index)
+    attn["norm_q"] = permute_norm(attn["norm_q"])
+    attn["norm_k"] = permute_norm(attn["norm_k"])
+    new_block = dict(block)
+    new_block["attn"] = attn
+    new_params[name] = new_block
+    num_blocks += 1
+  max_logging.log(f"Permuted q/k head dims to rotate-half RoPE order in {num_blocks} Krea 2 blocks.")
+  return new_params
 
 
 def _pop_weight(pt_state_dict, *candidate_keys):

@@ -315,6 +315,25 @@ krea2_staged_donate_hidden_states: True
 # freed. Lowers peak HBM at the cost of a host->device transfer per generation.
 # Allowed entries: "text_encoder", "transformer".
 krea2_offload_components: []
+# RoPE layout of the DiT blocks: "interleaved" (checkpoint order, rotates
+# (2i, 2i+1) pairs) or "rotate_half" (q/k head dims are permuted at load time so
+# RoPE rotates the two 64-lane halves; identical outputs, cheaper on TPU).
+krea2_rope_layout: 'interleaved'
+# If > 0, valid prompt tokens are gathered to the front and the text sequence is
+# truncated to the next multiple of this value (e.g. 128) before denoising.
+# Exact (text positions are all zero); one step executable per bucket. 0 = off.
+krea2_text_compaction_multiple: 0
+# Text encoder (Qwen3-VL text tower) weight quantization: '' (off, weights_dtype)
+# or 'int8' (qwix weight-only PTQ of the q/k/v/o and gate/up/down projection
+# kernels; one scale per krea2_text_encoder_quant_tile_size input rows and output
+# column, stored in the compute dtype; norms and the embedding stay unquantized).
+# Roughly halves the text encoder's HBM (bf16 ~6.8 GiB -> int8 ~3.4 GiB, excluding the embedding).
+krea2_text_encoder_quantization: ''
+krea2_text_encoder_quant_tile_size: 128
+# Look up prompt token embeddings on the host and pass them to the text encoder
+# as inputs_embeds, so the 151936x2560 embedding table (0.72 GiB bf16) never
+# occupies HBM. Exact.
+krea2_text_embed_on_host: False
 
 # VAE (Qwen-Image / Wan 2.1 architecture) mesh + sharding.
 # vae_spatial = -1 shards VAE spatial activations across all devices.

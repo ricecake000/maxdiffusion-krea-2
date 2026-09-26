@@ -30,7 +30,60 @@ from ...configuration_utils import ConfigMixin, flax_register_to_config
 from ...utils import BaseOutput
 from ..modeling_flax_utils import FlaxModelMixin
 from ..attention_flax import AttentionOp, apply_rope
-from ..embeddings_flax import FluxPosEmbed
+
+ROPE_LAYOUTS = ("interleaved", "rotate_half")
+
+
+def _validate_rope_layout(layout):
+  if layout not in ROPE_LAYOUTS:
+    raise ValueError(f"rope_layout must be one of {ROPE_LAYOUTS}, got {layout!r}.")
+
+
+def krea2_rotary_tables(ids, axes_dim, theta, layout="interleaved"):
+  """Rotary cos/sin tables for per-token position ids.
+
+  Args:
+    ids: `(L, n_axes)` position ids (cast to float32).
+    axes_dim: per-axis rotary widths, summing to head_dim.
+    theta: rotary base.
+    layout: "interleaved" returns `(L, head_dim)` tables with every frequency
+      repeated twice (pairs `(2i, 2i+1)` share an angle), numerically identical
+      to `FluxPosEmbed(return_tuple=True)`. "rotate_half" returns `(L, head_dim // 2)`
+      tables with one entry per frequency, for `apply_rope_rotate_half`.
+
+  Returns:
+    `(cos, sin)` float32 tables.
+  """
+  _validate_rope_layout(layout)
+  pos = ids.astype(jnp.float32)
+  cos_out = []
+  sin_out = []
+  for i, dim in enumerate(axes_dim):
+    freqs = 1.0 / (theta ** (jnp.arange(0, dim, 2, dtype=jnp.float32) / dim))
+    freqs = jnp.outer(pos[..., i], freqs)
+    if layout == "interleaved":
+      freqs = jnp.repeat(freqs, 2, axis=-1)
+    cos_out.append(jnp.cos(freqs))
+    sin_out.append(jnp.sin(freqs))
+  return jnp.concatenate(cos_out, axis=-1), jnp.concatenate(sin_out, axis=-1)
+
+
+def apply_rope_rotate_half(x, cos, sin):
+  """Rotate-half RoPE on `x` of shape `(B, H, L, D)` with `(L, D/2)` cos/sin tables.
+
+  `out = concat([x1*cos - x2*sin, x2*cos + x1*sin])` for `x1, x2 = x[..., :D/2], x[..., D/2:]`,
+  computed in float32 and cast back to `x.dtype`. With q/k projection columns
+  permuted by `permute_rope_weights_to_rotate_half`, this equals interleaved
+  RoPE on the original layout (up to the same permutation).
+  """
+  half = x.shape[-1] // 2
+  x_f32 = x.astype(jnp.float32)
+  x1 = x_f32[..., :half]
+  x2 = x_f32[..., half:]
+  cos = cos.astype(jnp.float32)[None, None]
+  sin = sin.astype(jnp.float32)[None, None]
+  out = jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1)
+  return out.astype(x.dtype)
 
 
 @flax.struct.dataclass
@@ -146,8 +199,10 @@ class Krea2Attention(nn.Module):
   weights_dtype: jnp.dtype = jnp.float32
   precision: Optional[jax.lax.Precision] = None
   mask_padding_tokens: bool = True
+  rope_layout: str = "interleaved"
 
   def setup(self):
+    _validate_rope_layout(self.rope_layout)
     dense_kwargs = dict(
         use_bias=False,
         dtype=self.dtype,
@@ -234,14 +289,36 @@ class Krea2Attention(nn.Module):
     value = jnp.transpose(value, (0, 2, 1, 3))
 
     if self.use_rope and image_rotary_emb is not None:
-      query, key = apply_rope(query, key, image_rotary_emb)
+      if self.rope_layout == "rotate_half":
+        cos, sin = image_rotary_emb
+        query = apply_rope_rotate_half(query, cos, sin)
+        key = apply_rope_rotate_half(key, cos, sin)
+      else:
+        query, key = apply_rope(query, key, image_rotary_emb)
+
+    mask = None
+    if attention_mask is not None:
+      mask = attention_mask.astype(jnp.int32)
+
+    use_custom_kernel = self.attention_kernel == "flash_custom"
+    if use_custom_kernel and seq_len >= self.flash_min_seq_length:
+      # The Krea 2 kernel takes 4-D (B, H, L, D) queries and un-expanded GQA
+      # (B, H_kv, L, D) keys/values, unscaled; the mask must be a prefix
+      # key-validity mask ([image | text] with tail-padded, compacted text).
+      attn_output = self.attention_op.apply_attention(query, key, value, attention_mask=mask)
+      attn_output = attn_output * jax.nn.sigmoid(gate)
+      return apply_explicit_lora(
+          self.to_out(attn_output), attn_output, lora_params.get("to_out", ()), self.dtype, self.precision
+      )
 
     if self.num_kv_heads != self.num_heads:
       repeats = self.num_heads // self.num_kv_heads
       key = jnp.repeat(key, repeats, axis=1)
       value = jnp.repeat(value, repeats, axis=1)
 
-    if self.attention_kernel == "dot_product":
+    # Below flash_min_seq_length flash_custom uses this module's masked
+    # attention: the shared dispatcher's dot_product fallback ignores the mask.
+    if self.attention_kernel == "dot_product" or use_custom_kernel:
       attn_output = self._masked_dot_product_attention(query, key, value, attention_mask)
       attn_output = jnp.transpose(attn_output, (0, 2, 1, 3)).reshape(batch_size, seq_len, -1)
     else:
@@ -249,9 +326,6 @@ class Krea2Attention(nn.Module):
       q_flat = jnp.transpose(query, (0, 2, 1, 3)).reshape(batch_size, seq_len, -1)
       k_flat = jnp.transpose(key, (0, 2, 1, 3)).reshape(batch_size, seq_len, -1)
       v_flat = jnp.transpose(value, (0, 2, 1, 3)).reshape(batch_size, seq_len, -1)
-      mask = None
-      if attention_mask is not None:
-        mask = attention_mask.astype(jnp.int32)
       attn_output = self.attention_op.apply_attention(q_flat, k_flat, v_flat, attention_mask=mask)
 
     attn_output = attn_output * jax.nn.sigmoid(gate)
@@ -447,6 +521,7 @@ class Krea2TransformerBlock(nn.Module):
   weights_dtype: jnp.dtype = jnp.float32
   precision: Optional[jax.lax.Precision] = None
   mask_padding_tokens: bool = True
+  rope_layout: str = "interleaved"
 
   def setup(self):
     self.scale_shift_table = self.param("scale_shift_table", nn.initializers.zeros, (6, self.hidden_size), jnp.float32)
@@ -463,6 +538,7 @@ class Krea2TransformerBlock(nn.Module):
         flash_min_seq_length=self.flash_min_seq_length,
         flash_block_sizes=self.flash_block_sizes,
         mask_padding_tokens=self.mask_padding_tokens,
+        rope_layout=self.rope_layout,
         mesh=self.mesh,
         dtype=self.dtype,
         weights_dtype=self.weights_dtype,
@@ -540,8 +616,15 @@ class Krea2Transformer2DModel(nn.Module, FlaxModelMixin, ConfigMixin):
 
   Text conditioning enters as a stack of hidden states tapped from several layers
   of the Qwen3-VL text encoder. A small text-fusion transformer collapses the
-  layer axis and refines the token sequence; the result is concatenated with the
-  patchified image latents into a single `[text, image]` sequence.
+  layer axis and refines the token sequence; the result is appended to the
+  patchified image latents into a single `[image | text]` sequence. Attention is
+  permutation-equivariant given per-token rotary ids (text ids are all zero), so
+  this order matches the reference `[text, image]` order exactly while keeping
+  text padding at the tail of the key sequence (a prefix validity mask).
+
+  `rope_layout="rotate_half"` expects q/k projection weights permuted by
+  `util.permute_rope_weights_to_rotate_half`; outputs are then identical to the
+  default interleaved layout with the original weights.
   """
 
   in_channels: int = 64
@@ -569,8 +652,10 @@ class Krea2Transformer2DModel(nn.Module, FlaxModelMixin, ConfigMixin):
   weights_dtype: jnp.dtype = jnp.float32
   precision: Optional[jax.lax.Precision] = None
   mask_padding_tokens: bool = True
+  rope_layout: str = "interleaved"
 
   def setup(self):
+    _validate_rope_layout(self.rope_layout)
     if sum(self.axes_dims_rope) != self.attention_head_dim:
       raise ValueError(
           f"sum(axes_dims_rope)={sum(self.axes_dims_rope)} must equal attention_head_dim={self.attention_head_dim}"
@@ -620,8 +705,6 @@ class Krea2Transformer2DModel(nn.Module, FlaxModelMixin, ConfigMixin):
         weights_dtype=self.weights_dtype,
         precision=self.precision,
     )
-    self.pos_embed = FluxPosEmbed(theta=self.rope_theta, axes_dim=self.axes_dims_rope, return_tuple=True)
-
     self.blocks = [
         Krea2TransformerBlock(
             hidden_size=hidden_size,
@@ -633,6 +716,7 @@ class Krea2Transformer2DModel(nn.Module, FlaxModelMixin, ConfigMixin):
             flash_min_seq_length=self.flash_min_seq_length,
             flash_block_sizes=self.flash_block_sizes,
             mask_padding_tokens=self.mask_padding_tokens,
+            rope_layout=self.rope_layout,
             mesh=self.mesh,
             dtype=self.dtype,
             weights_dtype=self.weights_dtype,
@@ -670,15 +754,44 @@ class Krea2Transformer2DModel(nn.Module, FlaxModelMixin, ConfigMixin):
       txt_ids: `(text_seq_len, 3)` or `(batch, text_seq_len, 3)` all-zero rotary coords.
       encoder_attention_mask: optional `(batch, text_seq_len)` boolean mask, True = valid.
     """
+    text_hidden = self.encode_text_context(encoder_hidden_states, encoder_attention_mask)
+    output = self.forward_with_text_context(
+        hidden_states, text_hidden, timestep, img_ids, txt_ids, encoder_attention_mask
+    )
+
+    if not return_dict:
+      return (output,)
+    return Krea2Transformer2DModelOutput(sample=output)
+
+  def encode_text_context(self, encoder_hidden_states, encoder_attention_mask=None):
+    """Prompt-only text path: text fusion + projection into the transformer width.
+
+    Depends only on the prompt, so the pipeline runs it once per prompt rather
+    than once per denoise step. Returns `(batch, text_seq_len, hidden_size)`.
+    """
+    text_hidden = self.text_fusion(encoder_hidden_states, attention_mask=encoder_attention_mask)
+    return self.txt_in(text_hidden)
+
+  def forward_with_text_context(
+      self,
+      hidden_states,
+      text_hidden,
+      timestep,
+      img_ids,
+      txt_ids,
+      encoder_attention_mask=None,
+  ):
+    """One denoise-step forward from a precomputed `encode_text_context` output;
+    returns the `(batch, image_seq_len, in_channels)` velocity."""
+    image_seq_len = hidden_states.shape[1]
     hidden_states, temb, temb_mod, concat_rotary_emb, attention_mask = self.prepare_inputs(
         hidden_states,
-        encoder_hidden_states,
+        text_hidden,
         timestep,
         img_ids,
         txt_ids,
         encoder_attention_mask,
     )
-    text_seq_len = encoder_hidden_states.shape[1]
 
     for block in self.blocks:
       hidden_states = block(
@@ -688,53 +801,46 @@ class Krea2Transformer2DModel(nn.Module, FlaxModelMixin, ConfigMixin):
           attention_mask=attention_mask,
       )
 
-    output = self.finalize_output(hidden_states, temb, text_seq_len)
-
-    if not return_dict:
-      return (output,)
-    return Krea2Transformer2DModelOutput(sample=output)
+    return self.finalize_output(hidden_states, temb, image_seq_len)
 
   def prepare_inputs(
       self,
       hidden_states,
-      encoder_hidden_states,
+      text_hidden,
       timestep,
       img_ids,
       txt_ids,
       encoder_attention_mask=None,
   ):
-    """Projects and combines text/image inputs before the repeated DiT blocks."""
+    """Builds the `[image | text]` sequence, time modulation, rotary tables and
+    key-validity mask before the repeated DiT blocks.
+
+    `text_hidden` is the `encode_text_context` output. The mask is
+    `[ones(image), encoder_attention_mask]`, a prefix mask whenever the text
+    mask is (tail padding).
+    """
     batch_size, image_seq_len, _ = hidden_states.shape
 
     temb = self.time_embed(timestep)
     temb_mod = self.time_mod_proj(jax.nn.gelu(temb, approximate=True))
 
-    text_attention_mask = None
     attention_mask = None
     if encoder_attention_mask is not None:
-      text_attention_mask = encoder_attention_mask
       image_mask = jnp.ones((batch_size, image_seq_len), dtype=encoder_attention_mask.dtype)
-      attention_mask = jnp.concatenate([encoder_attention_mask, image_mask], axis=1)
-
-    encoder_hidden_states = self.text_fusion(encoder_hidden_states, attention_mask=text_attention_mask)
-    encoder_hidden_states = self.txt_in(encoder_hidden_states)
+      attention_mask = jnp.concatenate([image_mask, encoder_attention_mask], axis=1)
 
     hidden_states = self.img_in(hidden_states)
-    hidden_states = jnp.concatenate([encoder_hidden_states, hidden_states], axis=1)
+    hidden_states = jnp.concatenate([hidden_states, text_hidden.astype(hidden_states.dtype)], axis=1)
 
     if txt_ids.ndim == 3:
       txt_ids = txt_ids[0]
     if img_ids.ndim == 3:
       img_ids = img_ids[0]
-    text_rotary_emb = self.pos_embed(txt_ids)
-    image_rotary_emb = self.pos_embed(img_ids)
-    concat_rotary_emb = (
-        jnp.concatenate([text_rotary_emb[0], image_rotary_emb[0]], axis=0),
-        jnp.concatenate([text_rotary_emb[1], image_rotary_emb[1]], axis=0),
-    )
+    ids = jnp.concatenate([img_ids, txt_ids], axis=0)
+    concat_rotary_emb = krea2_rotary_tables(ids, self.axes_dims_rope, self.rope_theta, self.rope_layout)
     return hidden_states, temb, temb_mod, concat_rotary_emb, attention_mask
 
-  def finalize_output(self, hidden_states, temb, text_seq_len: int):
-    """Removes text tokens and applies the final adaptive projection."""
-    hidden_states = hidden_states[:, text_seq_len:]
+  def finalize_output(self, hidden_states, temb, image_seq_len: int):
+    """Keeps the leading image tokens and applies the final adaptive projection."""
+    hidden_states = hidden_states[:, :image_seq_len]
     return self.final_layer(hidden_states, temb)

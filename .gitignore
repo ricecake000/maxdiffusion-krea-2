@@ -185,3 +185,4 @@ gha-creds-*.json
 
 # JAX cache
 .jax_cache/
+.venv-latest/

@@ -124,6 +124,89 @@ def build_staged_block_lora_params(block_params, block_spec):
   }
 
 
+# Transformer param subtrees used by the prompt-only text-context executable and
+# by the staged per-step prelude.
+KREA2_TEXT_CONTEXT_KEYS = ("text_fusion", "txt_in")
+KREA2_PRELUDE_KEYS = ("img_in", "time_embed", "time_mod_proj")
+
+
+def compact_text_embeddings(prompt_embeds, mask, multiple):
+  """Moves valid text tokens to the front of each row and truncates to a bucket.
+
+  The Krea 2 template pads mid-sequence (`[prompt | PAD | suffix]`). This
+  stably gathers the valid tokens of every row to the front, then truncates the
+  sequence to `round_up_to_multiple(max valid count over the batch, multiple)`
+  (clipped to the input length), so the returned mask is a prefix mask.
+
+  Exactness: text rotary ids are all zero and the text-fusion refiner blocks
+  carry no positional information, so reordering text tokens leaves every
+  valid token's output unchanged; padded tokens are masked out as keys and
+  their query rows are never read (only image tokens are decoded).
+
+  Args:
+    prompt_embeds: `(B, S, num_text_layers, text_hidden_dim)` embeddings.
+    mask: `(B, S)` validity mask (True/1 = valid).
+    multiple: bucket granularity (> 0).
+
+  Returns:
+    `(prompt_embeds[:, :bucket], mask[:, :bucket])` with the valid tokens first.
+    Needs one host read of the (small) mask to pick the bucket.
+  """
+  if multiple <= 0:
+    raise ValueError(f"compact_text_embeddings needs a positive multiple, got {multiple}.")
+  mask_np = np.asarray(mask).astype(bool)
+  seq_len = mask_np.shape[1]
+  max_valid = int(mask_np.sum(axis=1).max()) if mask_np.size else 0
+  bucket = min(round_up_to_multiple(max(max_valid, 1), multiple), seq_len)
+  order = np.argsort(~mask_np, axis=1, kind="stable")[:, :bucket]
+  compact_mask = np.take_along_axis(mask_np, order, axis=1)
+  index = jnp.asarray(order.astype(np.int32))[:, :, None, None]
+  compact_embeds = jnp.take_along_axis(jnp.asarray(prompt_embeds), index, axis=1)
+  return compact_embeds, jnp.asarray(compact_mask)
+
+
+def tokenize_krea2_prompts(tokenizer, prompts: List[str], max_sequence_length: int):
+  """Tokenizes prompts with the Qwen-Image fixed-length template `[prefix | prompt | PAD | suffix]`.
+
+  Returns numpy int32 `(input_ids, attention_mask, position_ids)`, each of shape
+  `(B, max_sequence_length + KREA2_PROMPT_TEMPLATE_START_IDX)`. Krea 2 pads
+  mid-template, so rotary positions count only valid tokens (padding does not
+  consume a position).
+  """
+  prefix_idx = KREA2_PROMPT_TEMPLATE_START_IDX
+  num_suffix = KREA2_PROMPT_TEMPLATE_NUM_SUFFIX_TOKENS
+
+  text = [KREA2_PROMPT_TEMPLATE_PREFIX + p for p in prompts]
+  text_tokens = tokenizer(
+      text,
+      truncation=True,
+      padding="max_length",
+      max_length=max_sequence_length + prefix_idx - num_suffix,
+      return_tensors="np",
+  )
+  suffix_tokens = tokenizer([KREA2_PROMPT_TEMPLATE_SUFFIX] * len(text), return_tensors="np")
+
+  input_ids = np.concatenate([text_tokens["input_ids"], suffix_tokens["input_ids"]], axis=1).astype(np.int32)
+  attention_mask = np.concatenate([text_tokens["attention_mask"], suffix_tokens["attention_mask"]], axis=1)
+  attention_mask = attention_mask.astype(np.int32)
+  position_ids = np.clip(np.cumsum(attention_mask, axis=-1) - 1, 0, None).astype(np.int32)
+  return input_ids, attention_mask, position_ids
+
+
+def krea2_text_encoder_hidden_states(text_encoder, q_params, ids, mask, position_ids):
+  """Runs the text encoder and returns the Krea 2 conditioning hidden states.
+
+  `ids` is either `(B, S)` token ids or, with a host-side embedding table,
+  `(B, S, hidden)` token embeddings. Returns the tapped decoder layers
+  (`KREA2_TEXT_ENCODER_SELECT_LAYERS`) stacked per token, with the system-prefix
+  tokens dropped: `(B, S - KREA2_PROMPT_TEMPLATE_START_IDX, num_text_layers, hidden)`.
+  """
+  inputs = {"inputs_embeds": ids} if ids.ndim == 3 else {"input_ids": ids}
+  _, all_hidden_states = text_encoder.apply({"params": q_params}, attention_mask=mask, position_ids=position_ids, **inputs)
+  hidden = jnp.stack([all_hidden_states[i] for i in KREA2_TEXT_ENCODER_SELECT_LAYERS], axis=2)
+  return hidden[:, KREA2_PROMPT_TEMPLATE_START_IDX:]
+
+
 KREA2_OFFLOADABLE_COMPONENTS = frozenset(("text_encoder", "transformer"))
 
 
@@ -191,10 +274,15 @@ class FlaxKrea2Pipeline:
       lora_compile_spec=(),
       offload_components=(),
       param_shardings=None,
+      text_embedding_table=None,
   ):
     """`offload_components` names components ("text_encoder", "transformer")
     whose params are passed as host trees and placed on device, with
-    `param_shardings[component]`, only for their phase, then freed."""
+    `param_shardings[component]`, only for their phase, then freed.
+
+    `text_embedding_table` (optional host `(vocab, hidden)` array): when set,
+    the text encoder was built without its embedding table and prompt token
+    embeddings are gathered on the host and passed as `inputs_embeds`."""
     offload_components = frozenset(offload_components or ())
     unsupported = offload_components - KREA2_OFFLOADABLE_COMPONENTS
     if unsupported:
@@ -211,6 +299,7 @@ class FlaxKrea2Pipeline:
     self.vae = vae
     self.vae_cache = vae_cache
     self.text_encoder = text_encoder
+    self.text_embedding_table = text_embedding_table
     self.tokenizer = tokenizer
     self.scheduler = scheduler
     self._config = config
@@ -219,6 +308,15 @@ class FlaxKrea2Pipeline:
     self.vae_logical_axis_rules = (
         vae_logical_axis_rules if vae_logical_axis_rules is not None else config.logical_axis_rules
     )
+    # flash_custom reduces the key mask to a per-row valid count, so it needs a
+    # prefix mask; the Krea 2 template pads mid-sequence, so always compact.
+    self.text_compaction_multiple = int(getattr(config, "krea2_text_compaction_multiple", 0) or 0)
+    if transformer.attention_kernel == "flash_custom" and self.text_compaction_multiple <= 0:
+      self.text_compaction_multiple = int(config.max_sequence_length)
+      max_logging.log(
+          "attention=flash_custom needs a prefix text mask: compacting prompt tokens with "
+          f"multiple=max_sequence_length={self.text_compaction_multiple} (valid tokens first, no length change)."
+      )
     self._staged_block_lora_specs = (
         index_staged_block_lora_specs(lora_compile_spec, transformer.num_layers)
         if getattr(config, "krea2_staged_transformer", False)
@@ -226,6 +324,7 @@ class FlaxKrea2Pipeline:
     )
 
     self._jitted_qwen3_forward = None
+    self._jitted_transformer_text_context = None
     self._jitted_transformer_step = None
     self._jitted_vae_decode = None
     # Staged-transformer executables, exposed for AOT compilation (compile_krea2).
@@ -237,18 +336,19 @@ class FlaxKrea2Pipeline:
     if self._jitted_qwen3_forward is not None:
       return
 
-    select_layers = tuple(KREA2_TEXT_ENCODER_SELECT_LAYERS)
-    start_idx = KREA2_PROMPT_TEMPLATE_START_IDX
-
     @aot_cache.cached_jit
     def qwen3_forward(q_params, ids, mask, position_ids):
-      _, all_hidden_states = self.text_encoder.apply(
-          {"params": q_params}, input_ids=ids, attention_mask=mask, position_ids=position_ids
+      return krea2_text_encoder_hidden_states(self.text_encoder, q_params, ids, mask, position_ids)
+
+    @aot_cache.cached_jit
+    def transformer_text_context(text_params, prompt_embeds, text_mask):
+      # Prompt-only (text fusion + txt_in): run once per prompt, not per step.
+      return self.transformer.apply(
+          {"params": text_params},
+          prompt_embeds,
+          text_mask,
+          method=self.transformer.encode_text_context,
       )
-      # Stack the tapped decoder layers per token: (B, S, num_text_layers, hidden)
-      hidden = jnp.stack([all_hidden_states[i] for i in select_layers], axis=2)
-      # Drop the system-prefix tokens.
-      return hidden[:, start_idx:]
 
     if getattr(self._config, "krea2_staged_transformer", False):
       staged_block = Krea2TransformerBlock(
@@ -261,19 +361,20 @@ class FlaxKrea2Pipeline:
           flash_min_seq_length=self.transformer.flash_min_seq_length,
           flash_block_sizes=self.transformer.flash_block_sizes,
           mask_padding_tokens=self.transformer.mask_padding_tokens,
+          rope_layout=self.transformer.rope_layout,
           mesh=self.transformer.mesh,
           dtype=self.transformer.dtype,
           weights_dtype=self.transformer.weights_dtype,
           precision=self.transformer.precision,
       )
-      prelude_keys = ("img_in", "time_embed", "time_mod_proj", "text_fusion", "txt_in")
+      prelude_keys = KREA2_PRELUDE_KEYS
 
       @aot_cache.cached_jit
-      def transformer_prelude(prelude_params, latents, prompt_embeds, text_mask, img_ids, txt_ids, t_vec):
+      def transformer_prelude(prelude_params, latents, text_hidden, text_mask, img_ids, txt_ids, t_vec):
         return self.transformer.apply(
             {"params": prelude_params},
             latents,
-            prompt_embeds,
+            text_hidden,
             t_vec,
             img_ids,
             txt_ids,
@@ -303,11 +404,12 @@ class FlaxKrea2Pipeline:
 
       @aot_cache.cached_jit
       def transformer_final(final_params, hidden_states, temb, text_mask):
+        # [image | text]: the image tokens are the leading seq_len - text_len.
         return self.transformer.apply(
             {"params": {"final_layer": final_params}},
             hidden_states,
             temb,
-            text_mask.shape[1],
+            hidden_states.shape[1] - text_mask.shape[1],
             method=self.transformer.finalize_output,
         )
 
@@ -315,10 +417,10 @@ class FlaxKrea2Pipeline:
       self._jitted_transformer_block = transformer_block
       self._jitted_transformer_final = transformer_final
 
-      def transformer_step(t_params, latents, prompt_embeds, text_mask, img_ids, txt_ids, t_vec):
+      def transformer_step(t_params, latents, text_hidden, text_mask, img_ids, txt_ids, t_vec):
         prelude_params = {key: t_params[key] for key in prelude_keys}
         hidden_states, temb, temb_mod, rotary_emb, attention_mask = transformer_prelude(
-            prelude_params, latents, prompt_embeds, text_mask, img_ids, txt_ids, t_vec
+            prelude_params, latents, text_hidden, text_mask, img_ids, txt_ids, t_vec
         )
         for block_idx in range(self.transformer.num_layers):
           block_params = t_params[f"blocks_{block_idx}"]
@@ -338,18 +440,20 @@ class FlaxKrea2Pipeline:
     else:
 
       @aot_cache.cached_jit
-      def transformer_step(t_params, latents, prompt_embeds, text_mask, img_ids, txt_ids, t_vec):
+      def transformer_step(t_params, latents, text_hidden, text_mask, img_ids, txt_ids, t_vec):
         return self.transformer.apply(
             {"params": t_params},
-            hidden_states=latents,
-            encoder_hidden_states=prompt_embeds,
-            timestep=t_vec,
-            img_ids=img_ids,
-            txt_ids=txt_ids,
-            encoder_attention_mask=text_mask,
-        ).sample
+            latents,
+            text_hidden,
+            t_vec,
+            img_ids,
+            txt_ids,
+            text_mask,
+            method=self.transformer.forward_with_text_context,
+        )
 
     self._jitted_qwen3_forward = qwen3_forward
+    self._jitted_transformer_text_context = transformer_text_context
     self._jitted_transformer_step = transformer_step
     self._jitted_vae_decode = vae_decode_pass
 
@@ -374,30 +478,19 @@ class FlaxKrea2Pipeline:
     `(B, max_sequence_length, num_text_layers, text_hidden_dim)` and
     `(B, max_sequence_length)`.
     """
-    max_sequence_length = self._config.max_sequence_length
     prefix_idx = KREA2_PROMPT_TEMPLATE_START_IDX
-    num_suffix = KREA2_PROMPT_TEMPLATE_NUM_SUFFIX_TOKENS
-
-    text = [KREA2_PROMPT_TEMPLATE_PREFIX + p for p in prompts]
-    text_tokens = self.tokenizer(
-        text,
-        truncation=True,
-        padding="max_length",
-        max_length=max_sequence_length + prefix_idx - num_suffix,
-        return_tensors="np",
+    input_ids, attention_mask, position_ids = tokenize_krea2_prompts(
+        self.tokenizer, prompts, self._config.max_sequence_length
     )
-    suffix_tokens = self.tokenizer([KREA2_PROMPT_TEMPLATE_SUFFIX] * len(text), return_tensors="np")
+    if self.text_embedding_table is not None:
+      # Exact host-side embedding lookup; the table never occupies HBM.
+      text_inputs = jnp.asarray(self.text_embedding_table[input_ids])
+    else:
+      text_inputs = jnp.asarray(input_ids, dtype=jnp.int32)
+    attention_mask = jnp.asarray(attention_mask, dtype=jnp.int32)
+    position_ids = jnp.asarray(position_ids, dtype=jnp.int32)
 
-    input_ids = np.concatenate([text_tokens["input_ids"], suffix_tokens["input_ids"]], axis=1)
-    attention_mask = np.concatenate([text_tokens["attention_mask"], suffix_tokens["attention_mask"]], axis=1)
-
-    input_ids = jnp.array(input_ids, dtype=jnp.int32)
-    attention_mask = jnp.array(attention_mask, dtype=jnp.int32)
-    # Krea 2 pads mid-template, so rotary positions count only valid tokens
-    # (padding does not consume a position).
-    position_ids = jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, 0, None)
-
-    prompt_embeds = self._jitted_qwen3_forward(qwen3_params, input_ids, attention_mask, position_ids)
+    prompt_embeds = self._jitted_qwen3_forward(qwen3_params, text_inputs, attention_mask, position_ids)
     prompt_embeds_mask = attention_mask[:, prefix_idx:].astype(jnp.bool_)
     return prompt_embeds, prompt_embeds_mask
 
@@ -466,7 +559,6 @@ class FlaxKrea2Pipeline:
     grid_height = height // 16
     grid_width = width // 16
     seq_len_img = grid_height * grid_width
-    seq_len_txt = self._config.max_sequence_length
 
     # Latents (packed): (B, seq_len_img, 64)
     if latents is not None:
@@ -476,7 +568,6 @@ class FlaxKrea2Pipeline:
     else:
       latents_jax = self._prepare_latents(batch_size, height, width)
 
-    txt_ids_val = prepare_krea2_text_ids(batch_size, seq_len_txt)
     img_ids_val = prepare_krea2_image_ids(batch_size, grid_height, grid_width)
 
     # Scheduler: resolution-aware exponential shift for Raw, fixed mu for Turbo.
@@ -521,6 +612,27 @@ class FlaxKrea2Pipeline:
         if offload_text_encoder and do_classifier_free_guidance:
           negative_prompt_embeds.block_until_ready()
 
+      # Gather valid text tokens to the front and truncate to a bucket: a
+      # shorter, tail-padded text sequence for every denoise step.
+      compaction_multiple = self.text_compaction_multiple
+      if compaction_multiple > 0:
+        full_len = prompt_embeds.shape[1]
+        prompt_embeds, prompt_embeds_mask = compact_text_embeddings(
+            prompt_embeds, prompt_embeds_mask, compaction_multiple
+        )
+        buckets = f"prompt {prompt_embeds.shape[1]}"
+        if do_classifier_free_guidance:
+          negative_prompt_embeds, negative_prompt_embeds_mask = compact_text_embeddings(
+              negative_prompt_embeds, negative_prompt_embeds_mask, compaction_multiple
+          )
+          buckets += f", negative prompt {negative_prompt_embeds.shape[1]}"
+        max_logging.log(
+            f"Text compaction (multiple {compaction_multiple}): text length {full_len} -> {buckets} tokens"
+        )
+      txt_ids_val = prepare_krea2_text_ids(batch_size, prompt_embeds.shape[1])
+      if do_classifier_free_guidance:
+        negative_txt_ids_val = prepare_krea2_text_ids(batch_size, negative_prompt_embeds.shape[1])
+
       if offload_text_encoder:
         qwen3_params = free_params(qwen3_params, host_qwen3_params)
 
@@ -547,6 +659,7 @@ class FlaxKrea2Pipeline:
       if do_classifier_free_guidance:
         negative_prompt_embeds = put_data_on_devices(negative_prompt_embeds, data_sharding)
         negative_prompt_embeds_mask = put_data_on_devices(negative_prompt_embeds_mask, data_sharding)
+        negative_txt_ids_val = put_data_on_devices(negative_txt_ids_val, data_sharding)
 
       multihost_utils.sync_global_devices("krea2_pre_phase_b_start")
 
@@ -562,17 +675,37 @@ class FlaxKrea2Pipeline:
       max_logging.log(f"[PHASE B] Running {num_inference_steps}-step denoise loop ({cfg_note})...")
       t0 = time.perf_counter()
 
+      # Prompt-only text context (text fusion + txt_in), once per prompt. The
+      # raw tapped-layer embeddings are dropped right after so their buffers
+      # can be freed before the denoise loop.
+      with jax.profiler.TraceAnnotation("krea2_text_context"):
+        text_params = {key: params[key] for key in KREA2_TEXT_CONTEXT_KEYS}
+        text_hidden = self._jitted_transformer_text_context(text_params, prompt_embeds, prompt_embeds_mask)
+        del prompt_embeds
+        if do_classifier_free_guidance:
+          negative_text_hidden = self._jitted_transformer_text_context(
+              text_params, negative_prompt_embeds, negative_prompt_embeds_mask
+          )
+          del negative_prompt_embeds
+        del text_params
+
       for step_idx in range(num_inference_steps):
         with jax.profiler.StepTraceAnnotation("krea2_denoise", step_num=step_idx):
           timestep = scheduler_state.timesteps[step_idx]
           t_vec = jnp.full((batch_size,), timestep / 1000.0, dtype=latents_jax.dtype)
 
           noise_pred = self._jitted_transformer_step(
-              params, latents_jax, prompt_embeds, prompt_embeds_mask, img_ids_val, txt_ids_val, t_vec
+              params, latents_jax, text_hidden, prompt_embeds_mask, img_ids_val, txt_ids_val, t_vec
           )
           if do_classifier_free_guidance:
             neg_noise_pred = self._jitted_transformer_step(
-                params, latents_jax, negative_prompt_embeds, negative_prompt_embeds_mask, img_ids_val, txt_ids_val, t_vec
+                params,
+                latents_jax,
+                negative_text_hidden,
+                negative_prompt_embeds_mask,
+                img_ids_val,
+                negative_txt_ids_val,
+                t_vec,
             )
             # Krea 2 guidance convention: cond + g * (cond - uncond); equals standard
             # CFG with scale (1 + g).
@@ -593,7 +726,9 @@ class FlaxKrea2Pipeline:
       multihost_utils.sync_global_devices("krea2_phase_b_complete")
 
       trace["denoise_loop"] = time.perf_counter() - t0
-      max_logging.log(f" -> [TIMING] Denoising Loop: {trace['denoise_loop']:.4f} seconds")
+      max_logging.log(
+          f" -> [TIMING] Denoising Loop (incl. prompt text context): {trace['denoise_loop']:.4f} seconds"
+      )
 
     # -----------------------------------------------------------------
     # PHASE C: Decode latents (Qwen-Image VAE, single frame)

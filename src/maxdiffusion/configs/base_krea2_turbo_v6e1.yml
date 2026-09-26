@@ -12,8 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Krea 2 Turbo preset for a single TPU v6e chip (v6e-1, 32 GB HBM, batch 1).
+#
+# - Residency: everything stays in HBM, zero host<->HBM swap per generation
+#   (krea2_offload_components []). The bf16 transformer (23.88 GiB) and the VAE
+#   (0.24 GiB) are resident as-is; the Qwen3-VL text encoder is int8
+#   weight-only quantized (krea2_text_encoder_quantization 'int8', tile 128,
+#   3.44 GiB instead of ~7.5 GiB bf16) and its 0.72 GiB embedding table stays on
+#   the host (krea2_text_embed_on_host, exact lookup). compile_krea2.py v6e-1:
+#   1024x1024 peak 28.84 GiB (VAE decode) of 31.25 GiB usable. 2048x2048 does
+#   NOT fit this way (VAE decode ~5.1 GiB of activations -> 32.62 GiB); there
+#   use krea2_offload_components ['text_encoder'] (peak 29.18 GiB, 3.44 GiB
+#   int8 swap per generation).
+# - attention 'flash_custom': the Krea 2 Pallas kernel (GQA without K/V
+#   expansion, prefix key mask); flash_block_sizes {} = kernel's auto sizes.
+# - krea2_rope_layout 'rotate_half': q/k head dims are permuted at load time so
+#   RoPE works on lane-dense 64-wide halves (exact).
+# - krea2_text_compaction_multiple 128: valid prompt tokens are gathered to the
+#   front and the text is truncated to a 128-token bucket (exact); typical
+#   prompts use 128 instead of 512 text tokens.
+# - Single chip: every ici_* axis is 1 (no communication), monolithic step
+#   (krea2_staged_transformer False). Check the fit with compile_krea2.py.
+
 # This sentinel is a reminder to choose a real run name.
-run_name: 'krea2_turbo_test_run'
+run_name: 'krea2_turbo_v6e1'
 
 metrics_file: "" # for testing, local file that stores scalar metrics. If empty, no metrics are written.
 # If true save metrics such as loss and TFLOPS to GCS in {base_output_directory}/{run_name}/metrics/
@@ -63,7 +85,7 @@ jit_initializers: True
 # Set true to load weights from pytorch
 from_pt: True
 split_head_dim: True
-attention: 'flash' # Supported attention: dot_product, flash, cudnn_flash_te
+attention: 'flash_custom' # Krea 2 Pallas kernel (see header)
 # If mask_padding_tokens is True, we pass in segment ids to splash attention to avoid attending to padding tokens.
 # Else we do not pass in segment ids and on vpu bound hardware like trillium this is faster.
 # However, when padding tokens are significant, this will lead to worse quality and should be set to True.
@@ -159,7 +181,7 @@ dcn_fsdp_parallelism: -1
 dcn_context_parallelism: 1
 dcn_tensor_parallelism: 1
 ici_data_parallelism: 1
-ici_fsdp_parallelism: -1
+ici_fsdp_parallelism: 1
 ici_context_parallelism: 1
 ici_tensor_parallelism: 1
 
@@ -316,22 +338,22 @@ krea2_offload_components: []
 # RoPE layout of the DiT blocks: "interleaved" (checkpoint order, rotates
 # (2i, 2i+1) pairs) or "rotate_half" (q/k head dims are permuted at load time so
 # RoPE rotates the two 64-lane halves; identical outputs, cheaper on TPU).
-krea2_rope_layout: 'interleaved'
+krea2_rope_layout: 'rotate_half'
 # If > 0, valid prompt tokens are gathered to the front and the text sequence is
 # truncated to the next multiple of this value (e.g. 128) before denoising.
 # Exact (text positions are all zero); one step executable per bucket. 0 = off.
-krea2_text_compaction_multiple: 0
+krea2_text_compaction_multiple: 128
 # Text encoder (Qwen3-VL text tower) weight quantization: '' (off, weights_dtype)
 # or 'int8' (qwix weight-only PTQ of the q/k/v/o and gate/up/down projection
 # kernels; one scale per krea2_text_encoder_quant_tile_size input rows and output
 # column, stored in the compute dtype; norms and the embedding stay unquantized).
 # Roughly halves the text encoder's HBM (bf16 ~6.8 GiB -> int8 ~3.4 GiB, excluding the embedding).
-krea2_text_encoder_quantization: ''
+krea2_text_encoder_quantization: 'int8'
 krea2_text_encoder_quant_tile_size: 128
 # Look up prompt token embeddings on the host and pass them to the text encoder
 # as inputs_embeds, so the 151936x2560 embedding table (0.72 GiB bf16) never
 # occupies HBM. Exact.
-krea2_text_embed_on_host: False
+krea2_text_embed_on_host: True
 
 # VAE (Qwen-Image / Wan 2.1 architecture) mesh + sharding.
 # vae_spatial = -1 shards VAE spatial activations across all devices.

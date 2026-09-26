@@ -36,6 +36,7 @@ from maxdiffusion.max_utils import safe_getattr
 
 
 from ..kernels import custom_splash_attention as custom_splash
+from ..kernels import krea2_attention as krea2_kernel
 from . import quantizations
 from .modeling_flax_utils import get_activation
 
@@ -1738,6 +1739,122 @@ def tokamax_ring_custom_kernel(q, k, v, context):
   )
 
 
+def _read_custom_block_sizes(flash_block_sizes):
+  """Reads the custom-kernel block-size carrier without filling defaults.
+
+  Same dict / attribute handling as `_extract_custom_block_sizes`, but missing or
+  None fields stay None so the caller can apply its own defaults.
+  """
+  names = ("block_q", "block_kv", "block_kv_compute", "block_kv_compute_in", "vmem_limit_bytes")
+  if flash_block_sizes is None:
+    return dict.fromkeys(names)
+  if isinstance(flash_block_sizes, dict):
+    return {name: flash_block_sizes.get(name, None) or None for name in names}
+  return {name: getattr(flash_block_sizes, name, None) or None for name in names}
+
+
+def _krea2_reject_sharded_sequence(mesh, q_axis_names, kv_axis_names):
+  """Raises if the sequence axis (index 2 of the (B, H, L, D) specs) is split over devices.
+
+  The flash_custom kernel is built for the global q/kv lengths, so a sharded
+  sequence axis would hand it a shorter local shard than it expects.
+  """
+
+  def seq_shards(spec):
+    entry = spec[2] if len(spec) > 2 else None
+    if entry is None:
+      return 1
+    names = (entry,) if isinstance(entry, str) else tuple(entry)
+    return math.prod(mesh.shape[name] for name in names)
+
+  if seq_shards(q_axis_names) > 1 or seq_shards(kv_axis_names) > 1:
+    raise NotImplementedError(
+        "flash_custom does not support sharding the sequence axis (context parallelism); "
+        f"shard heads or batch instead, got q spec {q_axis_names}, kv spec {kv_axis_names}"
+    )
+
+
+@register_kernel("flash_custom")
+def krea2_custom_flash_kernel(q, k, v, context):
+  """Krea 2 prefix-masked GQA flash attention (`kernels/krea2_attention.py`).
+
+  q is (B, Hq, L, D) or (B, L, Hq*D); k/v are (B, Hkv, L, D) or (B, L, Hkv*D).
+  GQA is handled natively by the kernel (k/v are not repeated).
+
+  `context["attention_mask"]` ((B, L_kv) or (1, L_kv), True/1 = valid) is
+  reduced to a per-batch valid length, i.e. it MUST be a prefix mask: every valid
+  kv position precedes every padded one. Krea 2 guarantees this by ordering the
+  sequence as [image | text] with the text padding at the tail. A mask with
+  holes is silently treated as its valid-token count.
+
+  Returns (B, L, Hq*D) like the other registered kernels.
+  """
+  heads = context["heads"]
+  dim_head = context["dim_head"]
+  mesh = context["mesh"]
+
+  query, _ = _reshape_data_for_flash(q, heads)
+  num_kv_heads = k.shape[1] if k.ndim == 4 else k.shape[-1] // dim_head
+  key, _ = _reshape_data_for_flash(k, num_kv_heads)
+  value, _ = _reshape_data_for_flash(v, num_kv_heads)
+
+  batch, _, q_seq_len, _ = query.shape
+  kv_seq_len = key.shape[2]
+
+  # The kernel uses exp2, so fold softmax scale and log2(e) into q.
+  query = query * jnp.asarray(context["scale"] * LOG2E, dtype=query.dtype)
+
+  attention_mask = context["attention_mask"]
+  if attention_mask is None:
+    valid_kv_len = jnp.full((batch,), kv_seq_len, dtype=jnp.int32)
+  else:
+    valid_kv_len = attention_mask.astype(jnp.int32).sum(axis=-1)
+    valid_kv_len = jnp.broadcast_to(valid_kv_len, (batch,))
+
+  user_sizes = _read_custom_block_sizes(context["flash_block_sizes"])
+  block_sizes = krea2_kernel.select_krea2_block_sizes(q_seq_len, user=user_sizes)
+  vmem_limit_bytes = user_sizes["vmem_limit_bytes"]
+
+  q_pad = krea2_kernel.padded_len(q_seq_len, block_sizes.block_q) - q_seq_len
+  kv_pad = krea2_kernel.padded_len(kv_seq_len, block_sizes.block_kv) - kv_seq_len
+  if q_pad:
+    query = jnp.pad(query, ((0, 0), (0, 0), (0, q_pad), (0, 0)))
+  if kv_pad:
+    key = jnp.pad(key, ((0, 0), (0, 0), (0, kv_pad), (0, 0)))
+    value = jnp.pad(value, ((0, 0), (0, 0), (0, kv_pad), (0, 0)))
+
+  attention = krea2_kernel.make_krea2_attention(
+      block_sizes,
+      q_seq_len=q_seq_len,
+      kv_seq_len=kv_seq_len,
+      use_base2_exp=True,
+      vmem_limit_bytes=vmem_limit_bytes,
+      interpret=krea2_kernel.INTERPRET,
+  )
+
+  def local_attention(q_local, k_local, v_local, valid_local):
+    assert q_local.shape[1] % k_local.shape[1] == 0, (
+        f"local q heads {q_local.shape[1]} must be a multiple of local kv heads {k_local.shape[1]}; "
+        "shard q and kv heads over the same mesh axis."
+    )
+    out = attention(q_local, k_local, v_local, valid_local)  # (b, hq, d, l)
+    return jnp.swapaxes(out, 2, 3)
+
+  q_axis_names = nn.logical_to_mesh_axes(context["axis_names_q"])
+  kv_axis_names = nn.logical_to_mesh_axes(context["axis_names_kv"])
+  _krea2_reject_sharded_sequence(mesh, q_axis_names, kv_axis_names)
+  valid_axis_names = jax.sharding.PartitionSpec(q_axis_names[0])
+  mapped_attention = jax.shard_map(
+      local_attention,
+      mesh=mesh,
+      in_specs=(q_axis_names, kv_axis_names, kv_axis_names, valid_axis_names),
+      out_specs=q_axis_names,
+      check_vma=False,
+  )
+  out = mapped_attention(query, key, value, valid_kv_len)  # (B, Hq, L, D)
+  return _reshape_heads_to_head_dim(out)
+
+
 @register_kernel("cudnn_flash_te")
 def cudnn_flash_te_kernel(q, k, v, context):
   return _cudnn_flash_attention(q, k, v, context["heads"], context["mesh"], context["dpa_layer"])
@@ -1777,7 +1894,15 @@ def _apply_attention(
     seq_len_idx = 2
 
   can_use_flash_attention = True
-  if attention_kernel in ["flash", "tokamax_flash", "ulysses", "ulysses_custom", "ulysses_custom_fixed_m", "ulysses_ring"]:
+  if attention_kernel in [
+      "flash",
+      "flash_custom",
+      "tokamax_flash",
+      "ulysses",
+      "ulysses_custom",
+      "ulysses_custom_fixed_m",
+      "ulysses_ring",
+  ]:
     can_use_flash_attention = (
         query.shape[seq_len_idx] >= flash_min_seq_length
         and key.shape[seq_len_idx] >= flash_min_seq_length

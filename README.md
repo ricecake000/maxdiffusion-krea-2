@@ -837,6 +837,13 @@ The optimal attention tile sizes (`block_q` / `block_kv`) depend on the sequence
     krea2_staged_transformer=True 'krea2_offload_components=["text_encoder","transformer"]'
   ```
 
+  For a single v6e chip, `base_krea2_turbo_v6e1.yml` keeps everything resident with no host<->HBM swap per generation: the bf16 transformer (23.9 GiB), the text encoder as int8 weight-only (`krea2_text_encoder_quantization: int8`, qwix PTQ, one scale per 128 input rows; 3.4 GiB) with its embedding table looked up on the host (`krea2_text_embed_on_host`), and the VAE. It also enables the `flash_custom` Krea 2 attention kernel, rotate-half RoPE (`krea2_rope_layout`) and 128-token text compaction (`krea2_text_compaction_multiple`), which are exact. The estimator puts 1024x1024 at 28.8 GiB peak; 2048x2048 needs `'krea2_offload_components=["text_encoder"]'` (the VAE decode adds ~5 GiB; the int8 encoder swap is 3.4 GiB). On the real checkpoint the int8 encoder's tapped hidden states differ from bf16 by 1.4% relative L2 (mean cosine 0.99993); `python -m maxdiffusion.tools.krea2_text_encoder_quant_check` reproduces that table on CPU.
+
+  ```bash
+  python src/maxdiffusion/generate_krea2.py src/maxdiffusion/configs/base_krea2_turbo_v6e1.yml \
+    output_dir=output/ prompt="a fox in the snow"
+  ```
+
   To check whether a setting fits before you provision a TPU, run the compile-only estimator on CPU. It prints the per-phase resident weights, activations and peak HBM for the target topology:
 
   ```bash

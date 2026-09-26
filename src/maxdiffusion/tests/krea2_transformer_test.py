@@ -34,6 +34,7 @@ from maxdiffusion.models.krea2.transformer_krea2_flax import (
     Krea2TimestepEmbedding,
     Krea2Transformer2DModel,
     Krea2TransformerBlock,
+    krea2_rotary_tables,
 )
 from maxdiffusion.models.krea2.util import (
     calculate_krea2_shift,
@@ -42,7 +43,7 @@ from maxdiffusion.models.krea2.util import (
     prepare_krea2_text_ids,
     round_up_to_multiple,
 )
-from maxdiffusion.pipelines.krea2.krea2_pipeline import is_classifier_free_guidance_enabled
+from maxdiffusion.pipelines.krea2.krea2_pipeline import compact_text_embeddings, is_classifier_free_guidance_enabled
 
 
 def _unbox(params):
@@ -184,6 +185,55 @@ class Krea2AttentionTest(unittest.TestCase):
     self.assertTrue(seen_values)
     self.assertTrue(all(value is False for value in seen_values))
 
+  def test_flash_custom_receives_4d_unexpanded_gqa_after_rope(self):
+    """flash_custom contract: (B, H, L, D) q and (B, H_kv, L, D) k/v, unscaled,
+    after RoPE, with the int32 key mask; returns (B, L, H*D)."""
+    seen = {}
+    head_dim, heads, kv_heads = 8, 4, 2
+
+    def fake_apply_attention(module, query, key, value, attention_mask=None):
+      seen.update(query=query.shape, key=key.shape, value=value.shape, mask=attention_mask)
+      # Reference attention in the kernel's own terms: expand GQA, scale, softmax.
+      repeats = query.shape[1] // key.shape[1]
+      k = jnp.repeat(key, repeats, axis=1).astype(jnp.float32)
+      v = jnp.repeat(value, repeats, axis=1).astype(jnp.float32)
+      scores = jnp.einsum("bhqd,bhkd->bhqk", query.astype(jnp.float32), k) * module.scale
+      if attention_mask is not None:
+        scores = jnp.where(attention_mask[:, None, None, :] > 0, scores, -1e9)
+      out = jnp.einsum("bhqk,bhkd->bhqd", jax.nn.softmax(scores, axis=-1), v)
+      b, h, l, d = out.shape
+      return jnp.transpose(out, (0, 2, 1, 3)).reshape(b, l, h * d)
+
+    rng = np.random.RandomState(0)
+    x = jnp.array(rng.randn(2, 6, 32), dtype=jnp.float32)
+    ids = prepare_krea2_image_ids(1, 2, 3)[0]
+    mask = jnp.array([[1, 1, 1, 1, 0, 0], [1, 1, 1, 0, 0, 0]], dtype=jnp.bool_)
+    for layout in ("interleaved", "rotate_half"):
+      rotary = krea2_rotary_tables(ids, (4, 2, 2), 1000.0, layout)
+      reference = Krea2Attention(
+          dim=32, num_heads=heads, num_kv_heads=kv_heads, head_dim=head_dim, rope_layout=layout
+      )
+      custom = Krea2Attention(
+          dim=32,
+          num_heads=heads,
+          num_kv_heads=kv_heads,
+          head_dim=head_dim,
+          rope_layout=layout,
+          attention_kernel="flash_custom",
+          flash_min_seq_length=0,
+      )
+      params = _unbox(reference.init(jax.random.PRNGKey(0), x, mask, rotary)["params"])
+      expected = reference.apply({"params": params}, x, mask, rotary)
+      seen.clear()
+      with mock.patch.object(AttentionOp, "apply_attention", fake_apply_attention):
+        actual = custom.apply({"params": params}, x, mask, rotary)
+      self.assertEqual(seen["query"], (2, heads, 6, head_dim))
+      self.assertEqual(seen["key"], (2, kv_heads, 6, head_dim))
+      self.assertEqual(seen["value"], (2, kv_heads, 6, head_dim))
+      self.assertEqual(seen["mask"].dtype, jnp.int32)
+      np.testing.assert_array_equal(np.asarray(seen["mask"]), np.asarray(mask).astype(np.int32))
+      np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), rtol=1e-5, atol=1e-5)
+
 
 class Krea2GuidanceTest(unittest.TestCase):
 
@@ -265,12 +315,19 @@ class Krea2TransformerModelTest(unittest.TestCase):
     params = model.init(jax.random.PRNGKey(0), hs, ehs, timestep, img_ids, txt_ids, mask)["params"]
 
     expected = model.apply({"params": params}, hs, ehs, timestep, img_ids, txt_ids, mask).sample
-    prelude_keys = ("img_in", "time_embed", "time_mod_proj", "text_fusion", "txt_in")
+    text_keys = ("text_fusion", "txt_in")
+    text_hidden = model.apply(
+        {"params": {key: params[key] for key in text_keys}},
+        ehs,
+        mask,
+        method=model.encode_text_context,
+    )
+    prelude_keys = ("img_in", "time_embed", "time_mod_proj")
     prelude_params = {key: params[key] for key in prelude_keys}
     hidden, temb, temb_mod, rotary_emb, attention_mask = model.apply(
         {"params": prelude_params},
         hs,
-        ehs,
+        text_hidden,
         timestep,
         img_ids,
         txt_ids,
@@ -296,9 +353,128 @@ class Krea2TransformerModelTest(unittest.TestCase):
         {"params": {"final_layer": params["final_layer"]}},
         hidden,
         temb,
-        S_txt,
+        S_img,
         method=model.finalize_output,
     )
+    np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), rtol=1e-5, atol=1e-5)
+
+
+class Krea2FlashCustomFallbackTest(unittest.TestCase):
+
+  def test_short_sequences_use_masked_dot_product(self):
+    """Below flash_min_seq_length, flash_custom must not reach the shared
+    dispatcher (whose dot_product fallback ignores the mask and 4-D GQA)."""
+    B, S_img, S_txt = 2, 6, 5
+    rng = np.random.RandomState(6)
+    hs = jnp.array(rng.randn(B, S_img, 16), dtype=jnp.float32)
+    ehs = jnp.array(rng.randn(B, S_txt, 3, 24), dtype=jnp.float32)
+    t = jnp.full((B,), 0.5)
+    img_ids = prepare_krea2_image_ids(B, 2, 3)
+    txt_ids = prepare_krea2_text_ids(B, S_txt)
+    mask = jnp.array([[True, True, True, False, False], [True, False, False, False, False]])
+    reference = _tiny_model(attention_kernel="dot_product")
+    custom = _tiny_model(attention_kernel="flash_custom", flash_min_seq_length=512)
+    params = reference.init(jax.random.PRNGKey(0), hs, ehs, t, img_ids, txt_ids, mask)["params"]
+    expected = reference.apply({"params": params}, hs, ehs, t, img_ids, txt_ids, mask).sample
+
+    def fail(*args, **kwargs):
+      raise AssertionError("flash_custom attention op called below flash_min_seq_length")
+
+    with mock.patch.object(AttentionOp, "apply_attention", fail):
+      actual = custom.apply({"params": params}, hs, ehs, t, img_ids, txt_ids, mask).sample
+    np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), rtol=1e-6, atol=1e-6)
+
+
+class Krea2SequenceLayoutTest(unittest.TestCase):
+
+  def _setup(self, mask_row=(True, True, False, False, True, False)):
+    model = _tiny_model()
+    B, S_txt = 2, len(mask_row)
+    rng = np.random.RandomState(4)
+    hs = jnp.array(rng.randn(B, 6, 16), dtype=jnp.float32)
+    ehs = jnp.array(rng.randn(B, S_txt, 3, 24), dtype=jnp.float32)
+    timestep = jnp.full((B,), 0.3)
+    img_ids = prepare_krea2_image_ids(B, 2, 3)
+    mask = jnp.array([mask_row, (True,) * 3 + (False,) * (S_txt - 3)])
+    params = model.init(jax.random.PRNGKey(0), hs, ehs, timestep, img_ids, prepare_krea2_text_ids(B, S_txt), mask)[
+        "params"
+    ]
+    params = _unbox(params)
+    # Non-zero modulation tables / norms so every path matters.
+    leaves, treedef = jax.tree_util.tree_flatten(params)
+    params = jax.tree_util.tree_unflatten(
+        treedef, [jnp.asarray(0.3 * rng.randn(*x.shape), dtype=x.dtype) for x in leaves]
+    )
+    return model, params, hs, ehs, timestep, img_ids, mask
+
+  def test_image_text_order_matches_reference_text_image_order(self):
+    """[image | text] must equal the reference [text, image] sequence order."""
+    model, params, hs, ehs, timestep, img_ids, mask = self._setup()
+    S_img, S_txt = hs.shape[1], ehs.shape[1]
+    txt_ids = prepare_krea2_text_ids(hs.shape[0], S_txt)
+    actual = model.apply({"params": params}, hs, ehs, timestep, img_ids, txt_ids, mask).sample
+
+    text_hidden = model.apply({"params": params}, ehs, mask, method=model.encode_text_context)
+    hidden, temb, temb_mod, (cos, sin), attn_mask = model.apply(
+        {"params": params}, hs, text_hidden, timestep, img_ids, txt_ids, mask, method=model.prepare_inputs
+    )
+    np.testing.assert_array_equal(np.asarray(attn_mask[:, :S_img]), True)
+    np.testing.assert_array_equal(np.asarray(attn_mask[:, S_img:]), np.asarray(mask))
+    # Rebuild the reference [text, image] order and drop the leading text tokens.
+    roll = lambda x, axis: jnp.concatenate(  # noqa: E731
+        [jax.lax.slice_in_dim(x, S_img, S_img + S_txt, axis=axis), jax.lax.slice_in_dim(x, 0, S_img, axis=axis)],
+        axis=axis,
+    )
+    hidden, rotary, attn_mask = roll(hidden, 1), (roll(cos, 0), roll(sin, 0)), roll(attn_mask, 1)
+    block = Krea2TransformerBlock(hidden_size=32, intermediate_size=64, num_heads=4, num_kv_heads=2)
+    for block_idx in range(model.num_layers):
+      hidden = block.apply(
+          {"params": params[f"blocks_{block_idx}"]},
+          hidden,
+          temb_mod=temb_mod,
+          image_rotary_emb=rotary,
+          attention_mask=attn_mask,
+      )
+    expected = model.apply(
+        {"params": params}, hidden[:, S_txt:], temb, S_img, method=model.finalize_output
+    )
+    np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), rtol=1e-5, atol=1e-5)
+
+  def test_compact_text_embeddings(self):
+    rng = np.random.RandomState(0)
+    embeds = jnp.array(rng.randn(2, 8, 2, 3), dtype=jnp.float32)
+    mask = jnp.array(
+        [[1, 1, 0, 0, 0, 1, 1, 0], [1, 0, 0, 0, 0, 0, 0, 1]], dtype=jnp.bool_
+    )
+    out, out_mask = compact_text_embeddings(embeds, mask, 2)
+    # max valid count 4 -> bucket 4; valid tokens first, stable order.
+    self.assertEqual(out.shape, (2, 4, 2, 3))
+    np.testing.assert_array_equal(np.asarray(out_mask), [[1, 1, 1, 1], [1, 1, 0, 0]])
+    np.testing.assert_array_equal(np.asarray(out[0]), np.asarray(embeds)[0, [0, 1, 5, 6]])
+    np.testing.assert_array_equal(np.asarray(out[1, :2]), np.asarray(embeds)[1, [0, 7]])
+    # Bucket rounds up and is clipped to the input length.
+    self.assertEqual(compact_text_embeddings(embeds, mask, 3)[0].shape[1], 6)
+    self.assertEqual(compact_text_embeddings(embeds, mask, 128)[0].shape[1], 8)
+    with self.assertRaises(ValueError):
+      compact_text_embeddings(embeds, mask, 0)
+
+  def test_compacted_text_gives_identical_output(self):
+    model, params, hs, ehs, timestep, img_ids, mask = self._setup()
+    B = hs.shape[0]
+    expected = model.apply(
+        {"params": params}, hs, ehs, timestep, img_ids, prepare_krea2_text_ids(B, ehs.shape[1]), mask
+    ).sample
+    compact_ehs, compact_mask = compact_text_embeddings(ehs, mask, 2)
+    self.assertEqual(compact_ehs.shape[1], 4)
+    actual = model.apply(
+        {"params": params},
+        hs,
+        compact_ehs,
+        timestep,
+        img_ids,
+        prepare_krea2_text_ids(B, compact_ehs.shape[1]),
+        compact_mask,
+    ).sample
     np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), rtol=1e-5, atol=1e-5)
 
 

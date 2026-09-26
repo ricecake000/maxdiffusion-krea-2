@@ -49,8 +49,10 @@ def _unbox(params):
   )
 
 
-def _tiny_transformer(in_channels=16):
+def _tiny_transformer(in_channels=16, rope_layout="interleaved", attention_kernel="dot_product"):
   return Krea2Transformer2DModel(
+      rope_layout=rope_layout,
+      attention_kernel=attention_kernel,
       in_channels=in_channels,
       num_layers=2,
       attention_head_dim=8,
@@ -66,7 +68,6 @@ def _tiny_transformer(in_channels=16):
       num_layerwise_text_blocks=2,
       num_refiner_text_blocks=2,
       axes_dims_rope=(4, 2, 2),
-      attention_kernel="dot_product",
   )
 
 
@@ -122,10 +123,16 @@ class Krea2StagedDonationTest(unittest.TestCase):
         self.transformer.init(jax.random.PRNGKey(0), latents, prompt_embeds, t_vec, img_ids, txt_ids, text_mask)["params"]
     )
 
+  def _step_inputs(self, pipeline):
+    latents, prompt_embeds, text_mask, img_ids, txt_ids, t_vec = self.inputs
+    text_params = {key: self.params[key] for key in krea2_pipeline.KREA2_TEXT_CONTEXT_KEYS}
+    text_hidden = pipeline._jitted_transformer_text_context(text_params, prompt_embeds, text_mask)
+    return latents, text_hidden, text_mask, img_ids, txt_ids, t_vec
+
   def _step(self, donate):
     pipeline = _pipeline(self.transformer, krea2_staged_donate_hidden_states=donate)
     pipeline._setup_jit_functions()
-    return pipeline, np.asarray(pipeline._jitted_transformer_step(self.params, *self.inputs))
+    return pipeline, np.asarray(pipeline._jitted_transformer_step(self.params, *self._step_inputs(pipeline)))
 
   def test_donated_step_matches_undonated_and_monolithic(self):
     _, donated = self._step(donate=True)
@@ -145,8 +152,10 @@ class Krea2StagedDonationTest(unittest.TestCase):
       self.assertFalse(leaf.is_deleted())
 
   def _prelude_outputs(self, pipeline):
-    prelude_keys = ("img_in", "time_embed", "time_mod_proj", "text_fusion", "txt_in")
-    return pipeline._jitted_transformer_prelude({key: self.params[key] for key in prelude_keys}, *self.inputs)
+    prelude_keys = ("img_in", "time_embed", "time_mod_proj")
+    return pipeline._jitted_transformer_prelude(
+        {key: self.params[key] for key in prelude_keys}, *self._step_inputs(pipeline)
+    )
 
   def test_block_donates_hidden_states(self):
     pipeline, _ = self._step(donate=True)
@@ -158,6 +167,18 @@ class Krea2StagedDonationTest(unittest.TestCase):
     self.assertTrue(hidden_states.is_deleted())
     self.assertFalse(temb_mod.is_deleted())
     self.assertEqual(out.shape, hidden_states.shape)
+
+  def test_staged_rotate_half_step_matches_monolithic(self):
+    transformer = _tiny_transformer(rope_layout="rotate_half")
+    latents, prompt_embeds, text_mask, img_ids, txt_ids, t_vec = self.inputs
+    expected = transformer.apply(
+        {"params": self.params}, latents, prompt_embeds, t_vec, img_ids, txt_ids, text_mask
+    ).sample
+    for staged in (True, False):
+      pipeline = _pipeline(transformer, krea2_staged_transformer=staged)
+      pipeline._setup_jit_functions()
+      actual = pipeline._jitted_transformer_step(self.params, *self._step_inputs(pipeline))
+      np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), rtol=1e-5, atol=1e-5)
 
   def test_block_keeps_hidden_states_without_donation(self):
     pipeline, _ = self._step(donate=False)
@@ -244,6 +265,75 @@ class Krea2ParamResidencyTest(unittest.TestCase):
     self.assertEqual(pipeline.offload_components, frozenset())
 
 
+class Krea2QuantizedTextEncoderResidencyTest(unittest.TestCase):
+  """int8 text encoder + offload: place/free a qwix-quantized host tree."""
+
+  _RULES = (("vocab", None), ("embed", None), ("mlp", "data"), ("heads", "data"), ("kv", None), ("norm", None))
+
+  def test_place_forward_free_quantized_tree(self):
+    from flax import linen as nn
+    from flax.linen import partitioning as nn_partitioning
+    from qwix._src.core.qarray import QArray
+    from qwix._src.providers.ptq import WithAux
+
+    from maxdiffusion.models.krea2.text_encoder_quant import (
+        quantize_text_encoder_model,
+        quantize_text_encoder_params,
+        safe_param_shardings,
+    )
+    from maxdiffusion.models.qwen3_flax import FlaxQwen3Model
+    from maxdiffusion.tests.krea2_text_encoder_quant_test import _TILE
+    from maxdiffusion.tests.krea2_text_encoder_quant_test import _config as _qwen3_config
+
+    model = FlaxQwen3Model(_qwen3_config())
+    qmodel = quantize_text_encoder_model(model, _TILE)
+    rng = np.random.RandomState(0)
+    ids = jnp.asarray(rng.randint(0, 100, size=(1, 8)), dtype=jnp.int32)
+    mask = jnp.ones_like(ids)
+    position_ids = jnp.cumsum(mask, axis=-1) - 1
+    host = jax.tree_util.tree_map(np.asarray, nn.unbox(model.init(jax.random.PRNGKey(0), ids, mask)["params"]))
+
+    # Same derivation as generate_krea2: boxed abstract tree -> logical specs -> mesh shardings.
+    mesh = _mesh()
+    with mesh, nn_partitioning.axis_rules(self._RULES):
+      abstract = jax.eval_shape(lambda: qmodel.init(jax.random.PRNGKey(0), ids, mask))["params"]
+      shardings = nn.logical_to_mesh_sharding(nn.get_partition_spec(abstract), mesh, self._RULES)
+    shardings = safe_param_shardings(nn.unbox(abstract), shardings, mesh)
+    host_q = quantize_text_encoder_params(host, abstract)
+    kernel = host_q["layers_0"]["mlp"]["down_proj"]["kernel"]
+    self.assertIsInstance(kernel, WithAux)
+    self.assertIsInstance(kernel.array, QArray)
+    self.assertIsInstance(kernel.array.qvalue, np.ndarray)
+
+    expected_last, _ = qmodel.apply({"params": host_q}, ids, mask, position_ids=position_ids)
+    device = jax.devices()[0]
+    fwd = jax.jit(lambda p: qmodel.apply({"params": p}, ids, mask, position_ids=position_ids)[0])
+    for _ in range(2):  # a second cycle mirrors the next generation's `_swap_in`
+      placed = place_params(host_q, shardings)
+      self.assertEqual(jax.tree_util.tree_structure(placed), jax.tree_util.tree_structure(host_q))
+      placed_kernel = placed["layers_0"]["mlp"]["down_proj"]["kernel"]
+      self.assertIsInstance(placed_kernel, WithAux)
+      self.assertIsInstance(placed_kernel.array, QArray)
+      self.assertEqual(placed_kernel.array.qvalue.dtype, jnp.int8)
+      leaves = jax.tree_util.tree_leaves(placed)
+      self.assertEqual(len(leaves), len(jax.tree_util.tree_leaves(host_q)))
+      for leaf in leaves:
+        self.assertIsInstance(leaf, jax.Array)
+        self.assertEqual(leaf.devices(), {device})
+        self.assertFalse(leaf.is_deleted())
+      self.assertEqual(params_device_bytes(placed), sum(x.nbytes for x in jax.tree_util.tree_leaves(host_q)))
+
+      last = np.asarray(fwd(placed))
+      self.assertTrue(np.all(np.isfinite(last)))
+      np.testing.assert_allclose(last, np.asarray(expected_last), rtol=1e-5, atol=1e-5)
+
+      self.assertIsNone(free_params(placed, host_q))
+      for leaf in leaves:
+        self.assertTrue(leaf.is_deleted())
+      # The host tree survives for the next placement.
+      self.assertIsInstance(host_q["layers_0"]["mlp"]["down_proj"]["kernel"].array.qvalue, np.ndarray)
+
+
 class Krea2OffloadCallTest(unittest.TestCase):
   """Runs `__call__` end to end on CPU with stub text encoder and VAE."""
 
@@ -262,14 +352,14 @@ class Krea2OffloadCallTest(unittest.TestCase):
     self.prompt_embeds = prompt_embeds
     self.text_mask = text_mask
 
-  def _run(self, offload_components):
+  def _run(self, offload_components, text_mask=None, transformer=None, **config_overrides):
     sharding = NamedSharding(_mesh(), P())
     shardings = {
         "transformer": jax.tree_util.tree_map(lambda _: sharding, self.host_params),
         "text_encoder": jax.tree_util.tree_map(lambda _: sharding, self.host_qwen3),
     }
     pipeline = FlaxKrea2Pipeline(
-        transformer=self.transformer,
+        transformer=transformer or self.transformer,
         vae=types.SimpleNamespace(latents_mean=[0.0] * 16, latents_std=[1.0] * 16),
         vae_cache=None,
         text_encoder=None,
@@ -280,7 +370,7 @@ class Krea2OffloadCallTest(unittest.TestCase):
             use_dynamic_shifting=True,
             time_shift_type="exponential",
         ),
-        config=_config(is_distilled=True),
+        config=_config(is_distilled=True, **config_overrides),
         mesh=_mesh(),
         offload_components=offload_components,
         param_shardings=shardings,
@@ -288,9 +378,11 @@ class Krea2OffloadCallTest(unittest.TestCase):
     pipeline._setup_jit_functions()
     seen = {}
 
+    mask = self.text_mask if text_mask is None else text_mask
+
     def fake_encode_prompt(prompts, qwen3_params):
       seen.setdefault("qwen3_params", []).append(qwen3_params)
-      return self.prompt_embeds, self.text_mask
+      return self.prompt_embeds, mask
 
     def fake_vae_decode(graphdef, state, rest_of_state, latents_5d):
       seen["latents_5d"] = np.asarray(latents_5d)
@@ -348,6 +440,37 @@ class Krea2OffloadCallTest(unittest.TestCase):
     self.assertIs(offload_seen["freed"][0], placed_qwen3[0])
     for leaf in jax.tree_util.tree_leaves(offload_seen["freed"][1]):
       self.assertTrue(leaf.is_deleted())
+
+  def test_text_compaction_matches_uncompacted_call(self):
+    # Mid-sequence padding [valid | PAD | valid] like the Krea 2 template.
+    mid_padded = jnp.array([[True, False, True]])
+    _, plain_seen = self._run((), text_mask=mid_padded)
+    _, compact_seen = self._run(
+        ("text_encoder",), text_mask=mid_padded, krea2_text_compaction_multiple=2, krea2_staged_transformer=False
+    )
+    np.testing.assert_allclose(compact_seen["latents_5d"], plain_seen["latents_5d"], rtol=1e-5, atol=1e-5)
+
+  def test_flash_custom_always_compacts_to_a_prefix_mask(self):
+    # flash_custom needs a prefix key mask, so compaction is forced (with the
+    # full length as the bucket) even when krea2_text_compaction_multiple=0.
+    mid_padded = jnp.array([[True, False, True]])
+    transformer = _tiny_transformer(in_channels=64, attention_kernel="flash_custom")
+    calls = []
+    real_compact = krea2_pipeline.compact_text_embeddings
+
+    def spy_compact(embeds, mask, multiple):
+      out = real_compact(embeds, mask, multiple)
+      calls.append((multiple, np.asarray(out[1])))
+      return out
+
+    with mock.patch.object(krea2_pipeline, "compact_text_embeddings", side_effect=spy_compact):
+      _, custom_seen = self._run((), text_mask=mid_padded, transformer=transformer, krea2_text_compaction_multiple=0)
+    self.assertEqual([multiple for multiple, _ in calls], [_S_TXT, _S_TXT])  # positive + negative (CFG)
+    for _, mask in calls:
+      np.testing.assert_array_equal(mask, [[True, True, False]])
+    # Tiny sequences fall back to masked dot-product attention: same result as dot_product.
+    _, plain_seen = self._run((), text_mask=mid_padded)
+    np.testing.assert_allclose(custom_seen["latents_5d"], plain_seen["latents_5d"], rtol=1e-5, atol=1e-5)
     # Host trees are left intact for the next generation.
     self.assertIsInstance(self.host_qwen3["embed"], np.ndarray)
     self.assertTrue(all(isinstance(x, np.ndarray) for x in jax.tree_util.tree_leaves(self.host_params)))

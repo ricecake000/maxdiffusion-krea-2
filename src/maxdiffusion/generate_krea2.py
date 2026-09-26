@@ -172,6 +172,7 @@ def build_krea2_transformer(transformer_cfg, config, mesh):
       attention_kernel=config.attention,
       flash_block_sizes=max_utils.get_flash_block_sizes(config),
       mask_padding_tokens=config.mask_padding_tokens,
+      rope_layout=getattr(config, "krea2_rope_layout", "interleaved"),
       mesh=mesh,
       dtype=config.activations_dtype,
       weights_dtype=config.weights_dtype,
@@ -206,9 +207,22 @@ def main(argv):
   from maxdiffusion.models.krea2.util import (
       KREA2_PROMPT_TEMPLATE_START_IDX,
       load_and_convert_krea2_weights,
+      load_krea2_tokenizer,
+      permute_rope_weights_to_rotate_half,
       round_up_to_multiple,
   )
-  from maxdiffusion.models.qwen3_flax import FlaxQwen3Model, load_and_convert_qwen3_weights
+  from maxdiffusion.models.qwen3_flax import (
+      FlaxQwen3Model,
+      load_and_convert_qwen3_weights,
+      load_qwen3_embedding_table,
+  )
+  from maxdiffusion.models.krea2.text_encoder_quant import (
+      describe_text_encoder_residency,
+      quantize_text_encoder_model,
+      quantize_text_encoder_params,
+      resolve_text_encoder_quantization,
+      safe_param_shardings,
+  )
   from maxdiffusion.models.flux.util import cast_dict_to_bfloat16_inplace
   from maxdiffusion.schedulers.scheduling_flow_match_flax import FlaxFlowMatchScheduler
   from maxdiffusion.pipelines.krea2.krea2_pipeline import FlaxKrea2Pipeline
@@ -286,7 +300,15 @@ def main(argv):
   with open(os.path.join(text_encoder_path, "config.json"), "r") as f:
     te_config = json.load(f)
   qwen3_config = build_qwen3_config(te_config, config)
+  # `qwen3_model` is the unquantized structure the checkpoint loader fills;
+  # `qwen3_runtime_model` is what the pipeline applies (qwix-wrapped for int8).
   qwen3_model = FlaxQwen3Model(qwen3_config)
+  te_quantization, te_quant_tile_size, te_embed_on_host = resolve_text_encoder_quantization(config)
+  if te_quantization == "int8":
+    qwen3_runtime_model = quantize_text_encoder_model(qwen3_model, te_quant_tile_size)
+  else:
+    qwen3_runtime_model = qwen3_model
+  max_logging.log(describe_text_encoder_residency(te_quantization, te_quant_tile_size, te_embed_on_host))
 
   # 5. Transformer config
   transformer_cfg = {}
@@ -361,15 +383,28 @@ def main(argv):
         encoder_attention_mask=text_mask_dummy,
     )
 
-  def qwen3_init_fn():
-    return qwen3_model.init(qwen_key, qwen_ids_dummy, qwen_mask_dummy)
+  def qwen3_init_fn(model):
+    # With the embedding lookup on the host the model is initialized from
+    # embeddings, so its tree has no `embed_tokens` table.
+    if te_embed_on_host:
+      qwen_embeds_dummy = jnp.zeros(
+          (config.batch_size, seq_len_txt_full, qwen3_config.hidden_size), dtype=qwen3_config.dtype
+      )
+      return model.init(qwen_key, None, qwen_mask_dummy, inputs_embeds=qwen_embeds_dummy)
+    return model.init(qwen_key, qwen_ids_dummy, qwen_mask_dummy)
 
   with ExitStack() as stack:
     for interceptor in lora_interceptors:
       stack.enter_context(nn.intercept_methods(interceptor))
     with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
       abstract_transformer_vars = jax.eval_shape(transformer_init_fn)
-      abstract_qwen3_vars = jax.eval_shape(qwen3_init_fn)
+      abstract_qwen3_vars = jax.eval_shape(lambda: qwen3_init_fn(qwen3_runtime_model))
+      # The loader fills the unquantized structure; int8 params are derived from it.
+      abstract_qwen3_load_vars = (
+          jax.eval_shape(lambda: qwen3_init_fn(qwen3_model))
+          if qwen3_runtime_model is not qwen3_model
+          else abstract_qwen3_vars
+      )
 
       logical_transformer_specs = nn.get_partition_spec(abstract_transformer_vars)
       logical_qwen3_specs = nn.get_partition_spec(abstract_qwen3_vars)
@@ -379,6 +414,16 @@ def main(argv):
 
   transformer_shardings = flax.core.freeze(transformer_mesh_shardings["params"])
   qwen3_shardings = flax.core.freeze(qwen3_mesh_shardings["params"])
+  if te_quantization:
+    # qwix scale leaves inherit the kernel's logical axes on a tiled dim; fall
+    # back to replication wherever the mesh does not divide a leaf.
+    qwen3_shardings = flax.core.freeze(
+        safe_param_shardings(
+            flax.core.unfreeze(nn.unbox(abstract_qwen3_vars["params"])),
+            flax.core.unfreeze(qwen3_shardings),
+            mesh,
+        )
+    )
 
   # 7. Stream weights on host CPU, overlap the independent components, then
   # place the final trees directly into their target TPU shardings.
@@ -416,7 +461,7 @@ def main(argv):
 
         qwen3_params = jax.tree_util.tree_map(
             unbox_fn,
-            abstract_qwen3_vars["params"],
+            abstract_qwen3_load_vars["params"],
             is_leaf=lambda k: isinstance(k, flax_spmd.LogicallyPartitioned),
         )
         qwen3_params = flax.core.unfreeze(qwen3_params)
@@ -426,6 +471,9 @@ def main(argv):
           result = load_and_convert_krea2_weights(transformer_path, params, num_layers)
           return result, time.perf_counter() - t0
 
+        # Host-side embedding table (krea2_text_embed_on_host), filled by load_qwen_timed.
+        text_embedding = []
+
         def load_qwen_timed():
           t0 = time.perf_counter()
           result = load_and_convert_qwen3_weights(
@@ -434,6 +482,18 @@ def main(argv):
           if config.weights_dtype == jnp.bfloat16:
             max_logging.log("Normalizing Qwen3 dtypes (BF16 weights, FP32 norms; matching dtypes are reused)...")
             cast_dict_to_bfloat16_inplace(result, exclude_keywords=("norm",))
+          if te_quantization == "int8":
+            t_quant = time.perf_counter()
+            # Scales in the compute dtype: dequantized weights (and so every
+            # matmul and activation) keep the unquantized model's dtypes.
+            result = quantize_text_encoder_params(
+                result, abstract_qwen3_vars["params"], scale_dtype=qwen3_config.dtype, device=cpu_device
+            )
+            load_trace["qwen_quantize"] = time.perf_counter() - t_quant
+          if te_embed_on_host:
+            t_embed = time.perf_counter()
+            text_embedding.append(load_qwen3_embedding_table(text_encoder_path, key_prefix="model.language_model."))
+            load_trace["qwen_embedding_table"] = time.perf_counter() - t_embed
           return result, time.perf_counter() - t0
 
         if parallel_loading:
@@ -452,6 +512,18 @@ def main(argv):
         params = insert_lora_params(params, lora_flat_params)
         params = apply_diff_updates(params, lora_diff_updates)
         load_trace["lora_apply"] = time.perf_counter() - t0
+
+        # rotate_half RoPE needs q/k head dims reordered. Runs after the LoRA
+        # up kernels and diff updates are in the tree so they are permuted too.
+        if transformer.rope_layout == "rotate_half":
+          t0 = time.perf_counter()
+          params = permute_rope_weights_to_rotate_half(
+              params,
+              num_heads=transformer.num_attention_heads,
+              num_kv_heads=transformer.num_key_value_heads,
+              head_dim=transformer.attention_head_dim,
+          )
+          load_trace["rope_permute"] = time.perf_counter() - t0
 
         params = flax.core.freeze(params)
         qwen3_params = flax.core.freeze(qwen3_params)
@@ -493,12 +565,7 @@ def main(argv):
   )
 
   # 9. Tokenizer
-  from transformers import AutoTokenizer
-
-  try:
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, local_files_only=True)
-  except Exception:
-    tokenizer = AutoTokenizer.from_pretrained(snapshot_dir, subfolder="tokenizer", local_files_only=True)
+  tokenizer = load_krea2_tokenizer(tokenizer_path, snapshot_dir)
 
   # 10. FlowMatch scheduler (exponential dynamic shifting; mu is set per-call)
   scheduler = FlaxFlowMatchScheduler(
@@ -519,7 +586,7 @@ def main(argv):
       transformer=transformer,
       vae=vae,
       vae_cache=vae_cache,
-      text_encoder=qwen3_model,
+      text_encoder=qwen3_runtime_model,
       tokenizer=tokenizer,
       scheduler=scheduler,
       config=config,
@@ -529,6 +596,7 @@ def main(argv):
       lora_compile_spec=lora_compile_spec,
       offload_components=offload_components,
       param_shardings={"transformer": transformer_shardings, "text_encoder": qwen3_shardings},
+      text_embedding_table=text_embedding[0] if text_embedding else None,
   )
   # Register the Krea-specific jitted entry points before installing the
   # process-global AOT cache so existing per-shape executables can load.
@@ -547,6 +615,9 @@ def main(argv):
           "krea2_staged_transformer": str(config.krea2_staged_transformer),
           "krea2_staged_donate_hidden_states": str(getattr(config, "krea2_staged_donate_hidden_states", True)),
           "krea2_offload_components": str(offload_components),
+          "krea2_text_encoder_quantization": f"{te_quantization}:{te_quant_tile_size}" if te_quantization else "",
+          "krea2_text_embed_on_host": str(te_embed_on_host),
+          "krea2_rope_layout": transformer.rope_layout,
           "lora_compile_spec": lora_compile_spec,
           "jax": jax.__version__,
       },

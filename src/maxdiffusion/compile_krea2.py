@@ -57,7 +57,15 @@ TOPOLOGIES = {
 }
 # attention_flax.py's dispatcher only applies flash_min_seq_length (falling back
 # to dot_product below it) for these kernels; others always run the kernel.
-THRESHOLD_GATED_KERNELS = ("flash", "tokamax_flash", "ulysses", "ulysses_custom", "ulysses_custom_fixed_m", "ulysses_ring")
+THRESHOLD_GATED_KERNELS = (
+    "flash",
+    "flash_custom",
+    "tokamax_flash",
+    "ulysses",
+    "ulysses_custom",
+    "ulysses_custom_fixed_m",
+    "ulysses_ring",
+)
 _CHIP_SPECS = {"v5e": (15.75, 197), "v6e": (31.25, 918)}
 
 # Qwen3-VL-4B text tower, used when text_encoder/config.json is unavailable.
@@ -72,8 +80,6 @@ DEFAULT_QWEN3_TEXT_CONFIG = {
     "rope_theta": 5000000.0,
     "max_position_embeddings": 262144,
 }
-
-_PRELUDE_KEYS = ("img_in", "time_embed", "time_mod_proj", "text_fusion", "txt_in")
 
 # Pipeline components in residency order -> key in the report's resident_weights dict.
 COMPONENT_WEIGHT_KEYS = {"transformer": "transformer", "text_encoder": "qwen3", "vae": "vae"}
@@ -187,21 +193,32 @@ def resolve_model_configs(repo):
     return None, {}, {"text_config": DEFAULT_QWEN3_TEXT_CONFIG}
 
 
-def abstract_linen_params(init_fn, mesh, logical_axis_rules, dtype_fn):
-  """Evaluates a linen init abstractly and returns its params as sharded ShapeDtypeStructs."""
+def abstract_linen_params(init_fn, mesh, logical_axis_rules, dtype_fn, safe_shardings=False):
+  """Evaluates a linen init abstractly and returns its params as sharded ShapeDtypeStructs.
+
+  safe_shardings: replicate leaves whose sharding the mesh cannot divide (as generate_krea2 does for the
+  quantized text encoder).
+  """
   with mesh, nn_partitioning.axis_rules(logical_axis_rules):
     abstract_vars = jax.eval_shape(init_fn)
     logical_specs = nn.get_partition_spec(abstract_vars)
     shardings = nn.logical_to_mesh_sharding(logical_specs, mesh, logical_axis_rules)
-  params = jax.tree_util.tree_map(
-      lambda x: x.unbox() if isinstance(x, flax_spmd.LogicallyPartitioned) else x,
-      abstract_vars["params"],
-      is_leaf=lambda x: isinstance(x, flax_spmd.LogicallyPartitioned),
+  params = flax.core.unfreeze(
+      jax.tree_util.tree_map(
+          lambda x: x.unbox() if isinstance(x, flax_spmd.LogicallyPartitioned) else x,
+          abstract_vars["params"],
+          is_leaf=lambda x: isinstance(x, flax_spmd.LogicallyPartitioned),
+      )
   )
+  shardings = flax.core.unfreeze(shardings["params"])
+  if safe_shardings:
+    from maxdiffusion.models.krea2.text_encoder_quant import safe_param_shardings
+
+    shardings = safe_param_shardings(params, shardings, mesh)
   return jax.tree_util.tree_map_with_path(
       lambda path, x, sharding: jax.ShapeDtypeStruct(x.shape, dtype_fn(path, x), sharding=sharding),
-      flax.core.unfreeze(params),
-      flax.core.unfreeze(shardings["params"]),
+      params,
+      shardings,
   )
 
 
@@ -285,8 +302,9 @@ def compile_executable(name, entry, param_args, activation_args, calls):
       "generated_code_size": mem.generated_code_size_in_bytes,
       "activation_inputs": activation_inputs,
       "alias_size": alias_size,
-      "retained": 0,
-      "retained_buffers": [],
+      # None until add_retained runs; it must run exactly once per record.
+      "retained": None,
+      "retained_buffers": None,
       "subtotal": mem.temp_size_in_bytes + activation_inputs + mem.output_size_in_bytes - alias_size,
       "dispatch_runahead": 0,
       "flops_per_device": xla_flops(compiled),
@@ -298,6 +316,8 @@ def compile_executable(name, entry, param_args, activation_args, calls):
 
 def add_retained(record, live_buffers, activation_args, outputs):
   """Adds the pipeline buffers live in __call__ during this executable that are not its own inputs/outputs."""
+  if record["retained"] is not None:
+    raise ValueError(f"add_retained called twice for {record['name']}")
   own = {id(leaf) for leaf in jax.tree_util.tree_leaves((activation_args, outputs))}
   retained = {name: buf for name, buf in live_buffers.items() if id(buf) not in own}
   record["retained"] = tree_shard_bytes(list(retained.values()))
@@ -345,6 +365,7 @@ def print_report(report):
     if r["retained_buffers"]:
       max_logging.log(f"  retained during {r['name']}: {', '.join(r['retained_buffers'])}")
   weights = report["resident_weights"]
+  max_logging.log(report["text_encoder_residency"])
   max_logging.log(
       f"Component weights per chip: transformer {fmt_bytes(weights['transformer'])} + "
       f"text_encoder (qwen3) {fmt_bytes(weights['qwen3'])} + vae {fmt_bytes(weights['vae'])} = "
@@ -445,8 +466,15 @@ def main(argv):
 
   from maxdiffusion.models.krea2.util import KREA2_PROMPT_TEMPLATE_START_IDX, round_up_to_multiple
   from maxdiffusion.models.qwen3_flax import FlaxQwen3Model
+  from maxdiffusion.models.krea2.text_encoder_quant import (
+      describe_text_encoder_residency,
+      quantize_text_encoder_model,
+      resolve_text_encoder_quantization,
+  )
   from maxdiffusion.models.wan.autoencoder_kl_wan import AutoencoderKLWanCache
   from maxdiffusion.pipelines.krea2.krea2_pipeline import (
+      KREA2_PRELUDE_KEYS,
+      KREA2_TEXT_CONTEXT_KEYS,
       FlaxKrea2Pipeline,
       is_classifier_free_guidance_enabled,
   )
@@ -479,7 +507,13 @@ def main(argv):
   max_logging.log("LoRA is not modeled: compiling with lora_compile_spec=() and no interceptors.")
 
   snapshot_dir, transformer_cfg, te_config = resolve_model_configs(config.pretrained_model_name_or_path)
-  qwen3_model = FlaxQwen3Model(build_qwen3_config(te_config, config))
+  qwen3_config = build_qwen3_config(te_config, config)
+  qwen3_model = FlaxQwen3Model(qwen3_config)
+  te_quantization, te_quant_tile_size, te_embed_on_host = resolve_text_encoder_quantization(config)
+  if te_quantization == "int8":
+    qwen3_model = quantize_text_encoder_model(qwen3_model, te_quant_tile_size)
+  te_residency = describe_text_encoder_residency(te_quantization, te_quant_tile_size, te_embed_on_host)
+  max_logging.log(te_residency)
   transformer = build_krea2_transformer(transformer_cfg, config, mesh)
 
   batch = config.batch_size
@@ -488,6 +522,13 @@ def main(argv):
   grid_h, grid_w = height // 16, width // 16
   seq_img = grid_h * grid_w
   seq_txt = config.max_sequence_length
+  compaction_multiple = int(getattr(config, "krea2_text_compaction_multiple", 0) or 0)
+  if compaction_multiple > 0:
+    max_logging.log(
+        f"krea2_text_compaction_multiple={compaction_multiple}: the text bucket is prompt-dependent, so the estimate "
+        f"uses the worst case text length max_sequence_length={seq_txt}."
+    )
+  max_logging.log(f"RoPE layout: {transformer.rope_layout}; attention kernel: {transformer.attention_kernel}")
   seq_txt_full = seq_txt + KREA2_PROMPT_TEMPLATE_START_IDX
   in_channels = transformer.in_channels
 
@@ -506,13 +547,29 @@ def main(argv):
     )
 
   def qwen3_init_fn():
-    ids = jnp.zeros((batch, seq_txt_full), dtype=jnp.int32)
-    return qwen3_model.init(qwen_key, ids, jnp.ones((batch, seq_txt_full), dtype=jnp.int32))
+    mask = jnp.ones((batch, seq_txt_full), dtype=jnp.int32)
+    if te_embed_on_host:
+      embeds = jnp.zeros((batch, seq_txt_full, qwen3_config.hidden_size), dtype=qwen3_config.dtype)
+      return qwen3_model.init(qwen_key, None, mask, inputs_embeds=embeds)
+    return qwen3_model.init(qwen_key, jnp.zeros((batch, seq_txt_full), dtype=jnp.int32), mask)
+
+  def quantized_leaf_dtype(path):
+    """int8 qvalues; scales are stored in the text encoder compute dtype (generate_krea2); else None."""
+    last = path[-1] if path else None
+    name = getattr(last, "name", None)
+    if name == "qvalue":
+      return jnp.int8
+    if name == "scale":
+      return qwen3_config.dtype
+    return None
 
   if config.weights_dtype == jnp.bfloat16:
 
     def qwen3_dtype(path, _):
       # Mirrors cast_dict_to_bfloat16_inplace(exclude_keywords=("norm",)) in generate_krea2.
+      quantized = quantized_leaf_dtype(path)
+      if quantized is not None:
+        return quantized
       return jnp.float32 if "norm" in jax.tree_util.keystr(path) else jnp.bfloat16
 
   else:
@@ -522,12 +579,14 @@ def main(argv):
     )
 
     def qwen3_dtype(path, _):
-      del path
-      return jnp.bfloat16
+      quantized = quantized_leaf_dtype(path)
+      return quantized if quantized is not None else jnp.bfloat16
 
   max_logging.log("Evaluating abstract parameter shapes and shardings...")
   t_params = abstract_linen_params(transformer_init_fn, mesh, config.logical_axis_rules, lambda _, x: x.dtype)
-  q_params = abstract_linen_params(qwen3_init_fn, mesh, config.logical_axis_rules, qwen3_dtype)
+  q_params = abstract_linen_params(
+      qwen3_init_fn, mesh, config.logical_axis_rules, qwen3_dtype, safe_shardings=bool(te_quantization)
+  )
   vae, vae_graphdef, vae_state, vae_rest = abstract_vae(config, snapshot_dir, vae_mesh)
 
   pipeline = FlaxKrea2Pipeline(
@@ -557,16 +616,32 @@ def main(argv):
 
   with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
     text_ids = sds((batch, seq_txt_full), jnp.int32, replicated)
-    qwen3_args = (text_ids, text_ids, text_ids)
-    record, prompt_embeds = compile_executable(
+    if te_embed_on_host:
+      # Host-gathered token embeddings replace the token ids.
+      text_inputs = sds((batch, seq_txt_full, qwen3_config.hidden_size), qwen3_config.dtype, replicated)
+    else:
+      text_inputs = text_ids
+    qwen3_args = (text_inputs, text_ids, text_ids)
+    qwen3_record, prompt_embeds = compile_executable(
         "qwen3_forward", pipeline._jitted_qwen3_forward, (q_params,), qwen3_args, cfg_passes
     )
-    records.append(record)
+    records.append(qwen3_record)
+
+    text_mask = sds((batch, seq_txt), jnp.bool_, data)
+    text_context_args = (sds(prompt_embeds.shape, prompt_embeds.dtype, data), text_mask)
+    text_context_record, text_hidden = compile_executable(
+        "transformer_text_context",
+        pipeline._jitted_transformer_text_context,
+        ({k: t_params[k] for k in KREA2_TEXT_CONTEXT_KEYS},),
+        text_context_args,
+        cfg_passes,
+    )
+    records.append(text_context_record)
 
     step_inputs = (
         sds((batch, seq_img, in_channels), jnp.float32, data),
-        sds(prompt_embeds.shape, prompt_embeds.dtype, data),
-        sds((batch, seq_txt), jnp.bool_, data),
+        sds(text_hidden.shape, text_hidden.dtype, data),
+        text_mask,
         sds((batch, seq_img, 3), jnp.float32, data),
         sds((batch, seq_txt, 3), jnp.float32, data),
         sds((batch,), jnp.float32, replicated),
@@ -582,9 +657,9 @@ def main(argv):
     if cfg_passes == 2:
       qwen3_live["prompt_embeds"] = clone(prompt_embeds)
       qwen3_live["prompt_embeds_mask"] = sds((batch, seq_txt), jnp.bool_, replicated)
-    add_retained(record, qwen3_live, qwen3_args, prompt_embeds)
+    add_retained(qwen3_record, qwen3_live, qwen3_args, prompt_embeds)
     if staged:
-      prelude_params = {k: t_params[k] for k in _PRELUDE_KEYS}
+      prelude_params = {k: t_params[k] for k in KREA2_PRELUDE_KEYS}
       record, prelude_out = compile_executable(
           "transformer_prelude",
           pipeline._jitted_transformer_prelude,
@@ -629,20 +704,36 @@ def main(argv):
       records.append(record)
       transformer_runs.append((record, step_inputs, noise_pred))
 
-  # Pipeline-level buffers FlaxKrea2Pipeline.__call__ keeps live from the
-  # denoise loop through the VAE decode. Under CFG the negative embeds/mask and
-  # the conditional noise_pred (held while the negative pass runs) are distinct
-  # buffers, so the positive-pass arguments stand in for the negative pass's.
-  live_buffers = {
+  # The raw prompt embeds are dropped once the text context is computed, so
+  # only text_hidden (per prompt) stays live through the loop.
+  text_context_live = {
       "latents": step_inputs[0],
-      "prompt_embeds": step_inputs[1],
       "prompt_embeds_mask": step_inputs[2],
       "img_ids": step_inputs[3],
       "txt_ids": step_inputs[4],
   }
   if cfg_passes == 2:
-    live_buffers["negative_prompt_embeds"] = clone(step_inputs[1])
+    # Positive context: the negative embeds are still live (the positive
+    # embeds are this executable's own input).
+    text_context_live["negative_prompt_embeds"] = clone(text_context_args[0])
+    text_context_live["negative_prompt_embeds_mask"] = clone(text_mask)
+  add_retained(text_context_record, text_context_live, text_context_args, text_hidden)
+  # Pipeline-level buffers FlaxKrea2Pipeline.__call__ keeps live from the
+  # denoise loop through the VAE decode. Under CFG the negative text context,
+  # mask and txt_ids and the conditional noise_pred (held while the negative
+  # pass runs) are distinct buffers, so the positive-pass arguments stand in for
+  # the negative pass's.
+  live_buffers = {
+      "latents": step_inputs[0],
+      "text_hidden": step_inputs[1],
+      "prompt_embeds_mask": step_inputs[2],
+      "img_ids": step_inputs[3],
+      "txt_ids": step_inputs[4],
+  }
+  if cfg_passes == 2:
+    live_buffers["negative_text_hidden"] = clone(step_inputs[1])
     live_buffers["negative_prompt_embeds_mask"] = clone(step_inputs[2])
+    live_buffers["negative_txt_ids"] = clone(step_inputs[4])
     live_buffers["noise_pred"] = clone(noise_pred)
   # After the loop noise_pred (and neg_noise_pred under CFG) stay live through the VAE decode.
   vae_live = dict(live_buffers, noise_pred=clone(noise_pred))
@@ -668,7 +759,7 @@ def main(argv):
       "vae": tree_shard_bytes(vae_state),
   }
   weights["total"] = sum(weights.values())
-  denoise_executables = (
+  denoise_executables = ("transformer_text_context",) + (
       ("transformer_prelude", "transformer_block", "transformer_final") if staged else ("transformer_step",)
   )
   phase_specs = [
@@ -717,6 +808,10 @@ def main(argv):
       "staged": staged,
       "staged_donate_hidden_states": donate_hidden_states,
       "offload_components": list(offload),
+      "text_encoder_quantization": te_quantization,
+      "text_encoder_quant_tile_size": te_quant_tile_size if te_quantization else None,
+      "text_embed_on_host": te_embed_on_host,
+      "text_encoder_residency": te_residency,
       "attention": config.attention,
       "attention_uses_kernel": uses_kernel,
       "flash_min_seq_length": transformer.flash_min_seq_length,
@@ -744,6 +839,10 @@ def main(argv):
     suffix += "_nodonate"
   if offload:
     suffix += "_offload-" + "-".join(offload)
+  if te_quantization:
+    suffix += f"_te-{te_quantization}"
+  if te_embed_on_host:
+    suffix += "_embed-host"
   json_path = os.path.join(config.output_dir, f"compile_krea2_{topology}_{width}x{height}{suffix}.json")
   with open(json_path, "w") as f:
     json.dump(report, f, indent=2)

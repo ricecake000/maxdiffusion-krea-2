@@ -355,35 +355,45 @@ class FlaxQwen3Model(nn.Module):
   @nn.compact
   def __call__(
       self,
-      input_ids: jnp.ndarray,
+      input_ids: Optional[jnp.ndarray] = None,
       attention_mask: Optional[jnp.ndarray] = None,
       position_ids: Optional[jnp.ndarray] = None,
+      inputs_embeds: Optional[jnp.ndarray] = None,
   ) -> Tuple[jnp.ndarray, List[jnp.ndarray]]:
     """
     Runs the full Qwen3-4B model.
 
     Args:
-        input_ids: (batch, seq_len) token ids.
+        input_ids: (batch, seq_len) token ids. Exactly one of `input_ids` and
+            `inputs_embeds` must be given.
         attention_mask: optional (batch, seq_len) padding mask.
         position_ids: optional (batch, seq_len) per-token rotary positions. When
             omitted, positions default to `arange(seq_len)`.
+        inputs_embeds: optional (batch, seq_len, hidden_size) token embeddings,
+            e.g. `embedding_table[input_ids]` gathered on the host. When given,
+            the `embed_tokens` module is not created, so the parameter tree has
+            no embedding table (the lookup is exact either way).
     Returns:
         last_hidden_state: Output of the final layer (batch, seq_len, 2560)
         all_hidden_states: List of activations from every layer, including token embeddings (length 37)
     """
-    batch_size, seq_len = input_ids.shape
+    if (input_ids is None) == (inputs_embeds is None):
+      raise ValueError("FlaxQwen3Model needs exactly one of input_ids and inputs_embeds.")
 
     # 1. Token Embeddings
-    embed_tokens = nn.Embed(
-        num_embeddings=self.config.vocab_size,
-        features=self.config.hidden_size,
-        embedding_init=nn.with_logical_partitioning(
-            nn.initializers.normal(stddev=self.config.hidden_size**-0.5), ("vocab", "embed")
-        ),
-        dtype=self.config.dtype,
-        name="embed_tokens",
-    )
-    hidden_states = embed_tokens(input_ids)
+    if inputs_embeds is not None:
+      hidden_states = inputs_embeds.astype(self.config.dtype)
+    else:
+      embed_tokens = nn.Embed(
+          num_embeddings=self.config.vocab_size,
+          features=self.config.hidden_size,
+          embedding_init=nn.with_logical_partitioning(
+              nn.initializers.normal(stddev=self.config.hidden_size**-0.5), ("vocab", "embed")
+          ),
+          dtype=self.config.dtype,
+          name="embed_tokens",
+      )
+      hidden_states = embed_tokens(input_ids)
 
     # Track all layer activations (including embedding layer)
     all_hidden_states = [hidden_states]
@@ -672,18 +682,40 @@ def load_and_convert_qwen3_weights(
     return _convert_qwen3_weights(reader, jax_params, config, key_prefix)
 
 
+def _detect_qwen3_key_prefix(torch_weights, key_prefix: str) -> str:
+  """Returns `key_prefix`, or a detected alternative if its embedding key is absent."""
+  if f"{key_prefix}embed_tokens.weight" not in torch_weights:
+    for candidate in ("model.", "model.language_model.", "language_model.", ""):
+      if f"{candidate}embed_tokens.weight" in torch_weights:
+        max_logging.log(f"Qwen3 key prefix '{key_prefix}' not found; using detected prefix '{candidate}'.")
+        return candidate
+  return key_prefix
+
+
+def load_qwen3_embedding_table(safetensors_path: str, key_prefix: str = "model.") -> np.ndarray:
+  """Reads only the token-embedding table `(vocab_size, hidden_size)` as a bf16 host array.
+
+  Used when the embedding lookup runs on the host (`FlaxQwen3Model(inputs_embeds=...)`),
+  so the table never occupies device memory. Key-prefix detection matches
+  `load_and_convert_qwen3_weights`.
+  """
+  reader = SafetensorsShardReader(safetensors_path)
+  with reader:
+    key_prefix = _detect_qwen3_key_prefix(reader, key_prefix)
+    table = reader.get_tensor(f"{key_prefix}embed_tokens.weight")
+  table = np.asarray(table)
+  if np.dtype(table.dtype) != np.dtype(jnp.bfloat16):
+    table = table.astype(jnp.bfloat16)
+  max_logging.log(f"Loaded Qwen3 embedding table {table.shape} ({table.nbytes / 1024**3:.2f} GiB) for host-side lookup.")
+  return table
+
+
 def _convert_qwen3_weights(torch_weights, jax_params: dict, config: FlaxQwen3Config, key_prefix: str) -> dict:
   """Maps only the Qwen language-tower tensors requested by the Flax tree."""
   del config
   max_logging.log("Starting lazy Qwen3 JAX parameter mapping...")
 
-  # Auto-detect the decoder key prefix if the requested one is absent.
-  if f"{key_prefix}embed_tokens.weight" not in torch_weights:
-    for candidate in ("model.", "model.language_model.", "language_model.", ""):
-      if f"{candidate}embed_tokens.weight" in torch_weights:
-        max_logging.log(f"Qwen3 key prefix '{key_prefix}' not found; using detected prefix '{candidate}'.")
-        key_prefix = candidate
-        break
+  key_prefix = _detect_qwen3_key_prefix(torch_weights, key_prefix)
 
   # Helper to transpose and cast weight
   def get_w(name: str, transpose: bool = True) -> np.ndarray:

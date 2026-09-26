@@ -839,11 +839,17 @@ class EndToEndTinyModelTest(unittest.TestCase):
       expected = model.apply({"params": params}, *inputs).sample
 
     hs, ehs, timestep, img_ids, txt_ids, mask = inputs
-    prelude_keys = ("img_in", "time_embed", "time_mod_proj", "text_fusion", "txt_in")
+    text_hidden = model.apply(
+        {"params": {key: params[key] for key in ("text_fusion", "txt_in")}},
+        ehs,
+        mask,
+        method=model.encode_text_context,
+    )
+    prelude_keys = ("img_in", "time_embed", "time_mod_proj")
     hidden, temb, temb_mod, rotary_emb, attention_mask = model.apply(
         {"params": {key: params[key] for key in prelude_keys}},
         hs,
-        ehs,
+        text_hidden,
         timestep,
         img_ids,
         txt_ids,
@@ -872,7 +878,7 @@ class EndToEndTinyModelTest(unittest.TestCase):
         {"params": {"final_layer": params["final_layer"]}},
         hidden,
         temb,
-        mask.shape[1],
+        hs.shape[1],
         method=model.finalize_output,
     )
 
