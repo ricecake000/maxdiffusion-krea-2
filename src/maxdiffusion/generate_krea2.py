@@ -220,6 +220,9 @@ def main(argv):
 
   config = pyconfig.config
   os.makedirs(config.output_dir, exist_ok=True)
+  # Offloaded components keep their host tree; the pipeline places them on
+  # device only for their phase (validated by FlaxKrea2Pipeline).
+  offload_components = tuple(getattr(config, "krea2_offload_components", None) or ())
 
   # A line-oriented file avoids shell quoting limits for heterogeneous
   # production batches.
@@ -299,9 +302,14 @@ def main(argv):
   # The interceptors must be live around shape evaluation AND every pipeline
   # call so the abstract param tree (and the jit traces) include the lora-*
   # subtrees; with no adapters configured this is a single no-op interceptor.
-  lora_flat_params, lora_interceptors, lora_diff_updates, lora_compile_spec = maybe_load_krea2_lora(
-      config, config.weights_dtype, return_compile_spec=True
-  )
+  # Adapter arrays are materialized on host CPU like every other host-tree
+  # leaf: a device-resident leaf would share a device with its placed copy,
+  # so free_params would never release an offloaded transformer's adapters.
+  cpu_device = jax.local_devices(backend="cpu")[0]
+  with jax.default_device(cpu_device):
+    lora_flat_params, lora_interceptors, lora_diff_updates, lora_compile_spec = maybe_load_krea2_lora(
+        config, config.weights_dtype, return_compile_spec=True
+    )
 
   # 6. Evaluate shapes & extract mesh shardings
   max_logging.log("Evaluating model shapes and shardings...")
@@ -392,7 +400,6 @@ def main(argv):
   vae_future = common_executor.submit(load_vae_timed) if common_executor is not None else None
 
   try:
-    cpu_device = jax.local_devices(backend="cpu")[0]
     with jax.default_device(cpu_device):
       with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
         import flax.linen.spmd as flax_spmd
@@ -453,15 +460,19 @@ def main(argv):
           (vae, vae_cache), load_trace["vae"] = vae_future.result()
 
         max_logging.log("Placing parameters into final TPU shardings...")
+        if offload_components:
+          max_logging.log(f"Keeping offloaded components on host until their phase: {', '.join(offload_components)}")
         t0 = time.perf_counter()
         with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
           # Keep the established callback path: it supplies process-local
           # slices directly and was faster than staging a batched device_put
           # on the single-host v5e reference run.
-          params = jax.tree_util.tree_map(max_utils.device_put_replicated, params, transformer_shardings)
-          qwen3_params = jax.tree_util.tree_map(max_utils.device_put_replicated, qwen3_params, qwen3_shardings)
+          if "transformer" not in offload_components:
+            params = jax.tree_util.tree_map(max_utils.device_put_replicated, params, transformer_shardings)
+          if "text_encoder" not in offload_components:
+            qwen3_params = jax.tree_util.tree_map(max_utils.device_put_replicated, qwen3_params, qwen3_shardings)
         load_trace["device_placement"] = time.perf_counter() - t0
-        max_logging.log("All parameters placed on device HBM successfully!")
+        max_logging.log("All resident parameters placed on device HBM successfully!")
         gc.collect()
         jax.effects_barrier()
   finally:
@@ -516,6 +527,8 @@ def main(argv):
       vae_mesh=vae_mesh,
       vae_logical_axis_rules=vae_logical_axis_rules,
       lora_compile_spec=lora_compile_spec,
+      offload_components=offload_components,
+      param_shardings={"transformer": transformer_shardings, "text_encoder": qwen3_shardings},
   )
   # Register the Krea-specific jitted entry points before installing the
   # process-global AOT cache so existing per-shape executables can load.
@@ -532,6 +545,8 @@ def main(argv):
           "activations_dtype": str(config.activations_dtype),
           "max_sequence_length": str(config.max_sequence_length),
           "krea2_staged_transformer": str(config.krea2_staged_transformer),
+          "krea2_staged_donate_hidden_states": str(getattr(config, "krea2_staged_donate_hidden_states", True)),
+          "krea2_offload_components": str(offload_components),
           "lora_compile_spec": lora_compile_spec,
           "jax": jax.__version__,
       },
@@ -559,6 +574,20 @@ def main(argv):
       output_dir=config.output_dir,
   )
 
+  # Swap-in entries are only present for offloaded components.
+  timed_phases = (
+      "text_encoder_swap_in",
+      "prompt_encoding",
+      "transformer_swap_in",
+      "denoise_loop",
+      "vae_decode",
+  )
+
+  def log_swap(trace, component, label):
+    if f"{component}_swap_in" in trace:
+      swap_gib = trace[f"{component}_swap_bytes"] / 1024**3
+      max_logging.log(f"   - {label}: {trace[f'{component}_swap_in']:.2f}s ({swap_gib:.2f} GiB)")
+
   # One interceptor context spans both passes so every (re)trace of the jitted
   # transformer step sees the LoRA interceptors.
   with ExitStack() as stack:
@@ -576,13 +605,13 @@ def main(argv):
     # Persist newly-seen shape signatures synchronously. Saving in the
     # background competes with the first real request for CPU and disk I/O.
     aot_cache.save_pending()
-    warmup_time = sum(warmup_trace.get(k, 0.0) for k in ("prompt_encoding", "denoise_loop", "vae_decode"))
+    warmup_time = sum(warmup_trace.get(k, 0.0) for k in timed_phases)
 
     max_logging.log("Running timed pass at full device speed...")
     with max_utils.Profiler(config, session_name="krea2_timed"):
       with jax.profiler.StepTraceAnnotation("krea2_generate", step_num=0):
         _, main_trace = pipeline(prompt=active_prompts, output_name=config.output_name, **call_kwargs)
-    main_time = sum(main_trace.get(k, 0.0) for k in ("prompt_encoding", "denoise_loop", "vae_decode"))
+    main_time = sum(main_trace.get(k, 0.0) for k in timed_phases)
 
   if getattr(config, "enable_profiler", False) and jax.process_index() == 0:
     profile_dir = os.path.join(config.tensorboard_dir, "krea2_timed")
@@ -609,11 +638,15 @@ def main(argv):
   max_logging.log("=" * 80)
   max_logging.log(f"1) Total Model Loading & Placement Time:  {load_time:.2f} seconds")
   max_logging.log(f"2) Cold-Start / Warmup Pass (XLA Compilation): {warmup_time:.2f} seconds")
+  log_swap(warmup_trace, "text_encoder", "Qwen3-VL Swap-in ")
   max_logging.log(f"   - Qwen3-VL Encoding: {warmup_trace.get('prompt_encoding', 0.0):.2f}s")
+  log_swap(warmup_trace, "transformer", "Krea2 Swap-in    ")
   max_logging.log(f"   - Krea2 Denoising:   {warmup_trace.get('denoise_loop', 0.0):.2f}s")
   max_logging.log(f"   - VAE Decoding:      {warmup_trace.get('vae_decode', 0.0):.2f}s")
   max_logging.log(f"3) Main Warmed-Up Pass: {main_time:.2f} seconds")
+  log_swap(main_trace, "text_encoder", "Qwen3-VL Swap-in ")
   max_logging.log(f"   - Qwen3-VL Encoding: {main_trace.get('prompt_encoding', 0.0):.2f}s")
+  log_swap(main_trace, "transformer", "Krea2 Swap-in    ")
   max_logging.log(f"   - Krea2 Denoising:   {main_trace.get('denoise_loop', 0.0):.2f}s")
   max_logging.log(f"   - VAE Decoding:      {main_trace.get('vae_decode', 0.0):.2f}s")
   max_logging.log("=" * 80)

@@ -303,6 +303,15 @@ interactive: False
 # cost of additional dispatch overhead. LoRA adapters are passed explicitly to
 # each staged block.
 krea2_staged_transformer: False
+# Donate the residual stream between staged DiT blocks so async dispatch does not
+# allocate one output buffer per block ahead of execution (saves ~num_layers x
+# hidden-state bytes of HBM at 2K). Only affects krea2_staged_transformer=True.
+krea2_staged_donate_hidden_states: True
+# Components whose weights stay on the host and are placed on device only for
+# their phase (text_encoder: prompt encoding, transformer: denoising), then
+# freed. Lowers peak HBM at the cost of a host->device transfer per generation.
+# Allowed entries: "text_encoder", "transformer".
+krea2_offload_components: []
 
 # VAE (Qwen-Image / Wan 2.1 architecture) mesh + sharding.
 # vae_spatial = -1 shards VAE spatial activations across all devices.

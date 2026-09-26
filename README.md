@@ -810,7 +810,7 @@ The optimal attention tile sizes (`block_q` / `block_kv`) depend on the sequence
   python src/maxdiffusion/generate_krea2.py src/maxdiffusion/configs/base_krea2_turbo.yml jax_cache_dir=/tmp/cache_dir run_name=krea2_turbo output_dir=output/ prompt="a fox in the snow"
   ```
 
-  The bf16 transformer weighs ~26GB, so single-chip runs are not possible; the default config shards the model with FSDP across all devices (and falls back to tensor parallelism within a slice for `batch_size=1`). Splash-based attention kernels retain a separate text-padding mask for every batch element, so one batch may mix prompts of different token lengths. Heights/widths that are not multiples of 16 are rounded up with a warning.
+  The bf16 transformer weighs ~26GB, so it does not fit a 16 GB chip at all, and on a 32 GB chip (e.g. v6e-1) it only fits with both the text encoder and the transformer offloaded (see "Krea 2 HBM options"); the default config shards the model with FSDP across all devices (and falls back to tensor parallelism within a slice for `batch_size=1`). Splash-based attention kernels retain a separate text-padding mask for every batch element, so one batch may mix prompts of different token lengths. Heights/widths that are not multiples of 16 are rounded up with a warning.
 
   ### Krea 2 LoRA
 
@@ -823,6 +823,19 @@ The optimal attention tile sizes (`block_q` / `block_kv`) depend on the sequence
   ```
 
   Multiple adapters can be listed (one entry per list) and are applied additively; `scale` controls each adapter's strength.
+
+  ### Krea 2 HBM options
+
+  Two config keys (in `base_krea2.yml`/`base_krea2_turbo.yml`) lower peak HBM per chip:
+
+  - `krea2_staged_donate_hidden_states` (default `True`): with `krea2_staged_transformer=True`, each DiT block donates its residual-stream input so its output reuses that buffer. Without donation, the host loop dispatches every block ahead of the device and each dispatch allocates a fresh hidden-state buffer, so `num_layers + 1` of them are live at peak (about 5 GiB per chip at 2048x2048 on v5e-4). Ignored for the monolithic transformer step.
+  - `krea2_offload_components` (default `[]`; allowed entries `"text_encoder"`, `"transformer"`): the listed components stay in host memory after loading and are placed on device only for their phase (text encoder: prompt encoding, transformer: the denoise loop), then freed. Each generation pays a host-to-HBM transfer for every offloaded component; the timings appear as swap-in lines in the latency breakdown. The VAE (~0.24 GiB) always stays resident. On a single v6e chip (32 GB HBM) the bf16 text encoder (~7.5 GiB) and transformer (~23.9 GiB) do not fit together, so offload both:
+
+  ```bash
+  python src/maxdiffusion/generate_krea2.py src/maxdiffusion/configs/base_krea2_turbo.yml \
+    run_name=krea2_turbo output_dir=output/ prompt="a fox in the snow" \
+    krea2_staged_transformer=True 'krea2_offload_components=["text_encoder","transformer"]'
+  ```
 
   ## Wan LoRA
 

@@ -16,6 +16,7 @@ limitations under the License.
 
 # End-to-end JAX inference pipeline for Krea 2 (K2) Raw and Turbo.
 
+import functools
 import os
 import time
 from typing import Any, List, Optional, Union
@@ -123,6 +124,48 @@ def build_staged_block_lora_params(block_params, block_spec):
   }
 
 
+KREA2_OFFLOADABLE_COMPONENTS = frozenset(("text_encoder", "transformer"))
+
+
+def place_params(tree, shardings):
+  """Places a host parameter tree into its device shardings and waits for the transfer."""
+  placed = jax.tree_util.tree_map(device_put_replicated, tree, shardings)
+  return jax.block_until_ready(placed)
+
+
+def free_params(tree, host_tree=None):
+  """Deletes the device buffers of a tree returned by `place_params`; returns None.
+
+  A leaf that shares a device with its `host_tree` counterpart is left to the
+  garbage collector: placement onto the source's own device may alias the
+  source buffer (e.g. CPU-only runs), and deleting it would corrupt the host
+  copy that later generations place again.
+  """
+  leaves = jax.tree_util.tree_leaves(tree)
+  host_leaves = jax.tree_util.tree_leaves(host_tree) if host_tree is not None else [None] * len(leaves)
+  if len(host_leaves) != len(leaves):
+    raise ValueError("free_params: host_tree does not match the placed tree structure.")
+  for leaf, host_leaf in zip(leaves, host_leaves):
+    if not hasattr(leaf, "delete"):
+      continue
+    if isinstance(host_leaf, jax.Array) and set(host_leaf.devices()) & set(leaf.devices()):
+      continue
+    leaf.delete()
+  return None
+
+
+def params_device_bytes(tree):
+  """Bytes of a placed tree summed over this process's addressable device shards."""
+  total = 0
+  for leaf in jax.tree_util.tree_leaves(tree):
+    shards = getattr(leaf, "addressable_shards", None)
+    if shards:
+      total += shards[0].data.nbytes * len(shards)
+    else:
+      total += getattr(leaf, "nbytes", 0)
+  return total
+
+
 class FlaxKrea2Pipeline:
   """
   Unified end-to-end inference pipeline for Krea 2 (Raw and Turbo) on JAX.
@@ -146,7 +189,24 @@ class FlaxKrea2Pipeline:
       vae_mesh=None,
       vae_logical_axis_rules=None,
       lora_compile_spec=(),
+      offload_components=(),
+      param_shardings=None,
   ):
+    """`offload_components` names components ("text_encoder", "transformer")
+    whose params are passed as host trees and placed on device, with
+    `param_shardings[component]`, only for their phase, then freed."""
+    offload_components = frozenset(offload_components or ())
+    unsupported = offload_components - KREA2_OFFLOADABLE_COMPONENTS
+    if unsupported:
+      raise ValueError(
+          f"Unsupported krea2_offload_components entries {sorted(unsupported)}; "
+          f"allowed: {sorted(KREA2_OFFLOADABLE_COMPONENTS)}."
+      )
+    missing = sorted(c for c in offload_components if not param_shardings or param_shardings.get(c) is None)
+    if missing:
+      raise ValueError(f"param_shardings must provide shardings for offloaded components {missing}.")
+    self.offload_components = offload_components
+    self.param_shardings = dict(param_shardings or {})
     self.transformer = transformer
     self.vae = vae
     self.vae_cache = vae_cache
@@ -168,6 +228,10 @@ class FlaxKrea2Pipeline:
     self._jitted_qwen3_forward = None
     self._jitted_transformer_step = None
     self._jitted_vae_decode = None
+    # Staged-transformer executables, exposed for AOT compilation (compile_krea2).
+    self._jitted_transformer_prelude = None
+    self._jitted_transformer_block = None
+    self._jitted_transformer_final = None
 
   def _setup_jit_functions(self):
     if self._jitted_qwen3_forward is not None:
@@ -217,7 +281,16 @@ class FlaxKrea2Pipeline:
             method=self.transformer.prepare_inputs,
         )
 
-      @aot_cache.cached_jit
+      # Donating the residual stream lets each block's output alias its input,
+      # so the host loop (which runs ahead of the device) does not allocate
+      # one hidden-state buffer per block. `transformer_step` rebinds
+      # `hidden_states` to every block's output and never reads a donated one.
+      if getattr(self._config, "krea2_staged_donate_hidden_states", True):
+        block_jit = functools.partial(aot_cache.cached_jit, donate_argnames=("hidden_states",))
+      else:
+        block_jit = aot_cache.cached_jit
+
+      @block_jit
       def transformer_block(block_params, lora_params, hidden_states, temb_mod, rotary_emb, attention_mask):
         return staged_block.apply(
             {"params": block_params},
@@ -237,6 +310,10 @@ class FlaxKrea2Pipeline:
             text_mask.shape[1],
             method=self.transformer.finalize_output,
         )
+
+      self._jitted_transformer_prelude = transformer_prelude
+      self._jitted_transformer_block = transformer_block
+      self._jitted_transformer_final = transformer_final
 
       def transformer_step(t_params, latents, prompt_embeds, text_mask, img_ids, txt_ids, t_vec):
         prelude_params = {key: t_params[key] for key in prelude_keys}
@@ -275,6 +352,19 @@ class FlaxKrea2Pipeline:
     self._jitted_qwen3_forward = qwen3_forward
     self._jitted_transformer_step = transformer_step
     self._jitted_vae_decode = vae_decode_pass
+
+  def _swap_in(self, component, host_params, trace):
+    """Places an offloaded component's host params on device, recording timing and bytes."""
+    t0 = time.perf_counter()
+    with jax.profiler.TraceAnnotation(f"krea2_{component}_swap_in"):
+      device_params = place_params(host_params, self.param_shardings[component])
+    trace[f"{component}_swap_in"] = time.perf_counter() - t0
+    trace[f"{component}_swap_bytes"] = params_device_bytes(device_params)
+    max_logging.log(
+        f" -> [TIMING] {component} host->HBM swap-in: {trace[f'{component}_swap_in']:.4f} seconds "
+        f"({trace[f'{component}_swap_bytes'] / 1024**3:.2f} GiB)"
+    )
+    return device_params
 
   def encode_prompt(self, prompts: List[str], qwen3_params):
     """Tokenizes prompts with the Qwen-Image fixed-length template
@@ -415,6 +505,11 @@ class FlaxKrea2Pipeline:
       # -----------------------------------------------------------------
       # PHASE A: Encode prompts (Qwen3-VL text tower)
       # -----------------------------------------------------------------
+      offload_text_encoder = "text_encoder" in self.offload_components
+      if offload_text_encoder:
+        host_qwen3_params = qwen3_params
+        qwen3_params = self._swap_in("text_encoder", host_qwen3_params, trace)
+
       max_logging.log(f"[PHASE A] Encoding {len(prompts)} prompt(s) with the Qwen3-VL text encoder...")
       t0 = time.perf_counter()
 
@@ -423,6 +518,11 @@ class FlaxKrea2Pipeline:
         if do_classifier_free_guidance:
           negative_prompt_embeds, negative_prompt_embeds_mask = self.encode_prompt(negative_prompts, qwen3_params)
         prompt_embeds.block_until_ready()
+        if offload_text_encoder and do_classifier_free_guidance:
+          negative_prompt_embeds.block_until_ready()
+
+      if offload_text_encoder:
+        qwen3_params = free_params(qwen3_params, host_qwen3_params)
 
       trace["prompt_encoding"] = time.perf_counter() - t0
       max_logging.log(f" -> [TIMING] Prompt Encoding (Qwen3-VL): {trace['prompt_encoding']:.4f} seconds")
@@ -454,6 +554,11 @@ class FlaxKrea2Pipeline:
       # PHASE B: Denoising loop
       # -----------------------------------------------------------------
       cfg_note = f"CFG scale {guidance_scale}" if do_classifier_free_guidance else "no guidance"
+      offload_transformer = "transformer" in self.offload_components
+      if offload_transformer:
+        host_params = params
+        params = self._swap_in("transformer", host_params, trace)
+
       max_logging.log(f"[PHASE B] Running {num_inference_steps}-step denoise loop ({cfg_note})...")
       t0 = time.perf_counter()
 
@@ -483,6 +588,8 @@ class FlaxKrea2Pipeline:
           latents_jax = prev_sample
 
       latents_jax.block_until_ready()
+      if offload_transformer:
+        params = free_params(params, host_params)
       multihost_utils.sync_global_devices("krea2_phase_b_complete")
 
       trace["denoise_loop"] = time.perf_counter() - t0
