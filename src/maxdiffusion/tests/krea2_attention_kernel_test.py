@@ -161,6 +161,142 @@ class Krea2AttentionKernelTest(unittest.TestCase):
     self.assertEqual(krea2_attention.padded_len(4096, 1024), 4096)
 
 
+_V6E = "TPU v6 lite"
+_V5E = "TPU v5 lite"
+
+# (device_kind, user kv sizes or None, max_auto_block_q, {seq_len: block_q}).
+_AUTO_BLOCK_Q_CASES = (
+    (
+        _V6E,
+        (2048, 1024, 256),
+        4992,
+        {
+            200: 256,
+            1152: 1152,
+            3728: 3840,
+            4224: 4224,
+            4352: 4352,
+            4480: 4480,
+            4608: 4608,
+            5000: 2560,
+            9344: 4736,
+            16512: 3328,
+            16896: 4224,
+        },
+    ),
+    (_V6E, None, 7808, {4224: 4224, 5000: 5120, 16512: 5504, 16640: 3328, 16896: 5632}),
+    (_V6E, (4096, 1024, 256), 4480, {4480: 4480, 4608: 2304, 16512: 3328}),
+    (_V6E, (2048, 2048, 256), 3072, {4224: 1408, 4352: 2176, 16512: 1664, 16896: 2816}),
+    (_V6E, (2048, 1024, 128), 2048, {4224: 1408, 4352: 896, 16512: 1664}),
+    (_V6E, (1024, 256, 256), 8192, {16512: 5504}),
+    (_V5E, (2048, 1024, 256), 2304, {4224: 1408, 4352: 2176, 4608: 2304, 16512: 1664}),
+    (_V5E, None, 3840, {3728: 3840, 4224: 1408, 16512: 3328}),
+)
+
+# Compile-only calibration FAIL points:
+# (device_kind, block_q, block_kv, block_kv_compute, block_kv_compute_in).
+_VMEM_FAIL_POINTS = (
+    (_V6E, 9088, 1024, 512, 256),
+    (_V6E, 8832, 2048, 512, 256),
+    (_V6E, 5888, 1024, 1024, 256),
+    (_V6E, 5632, 2048, 1024, 256),
+    (_V6E, 5120, 4096, 1024, 256),
+    (_V6E, 3712, 2048, 2048, 256),
+    (_V6E, 3328, 4096, 2048, 256),
+    (_V6E, 5504, 2048, 1024, 128),
+    (_V5E, 4608, 1024, 512, 256),
+    (_V5E, 3072, 2048, 1024, 256),
+    (_V5E, 3072, 4096, 1024, 256),
+)
+
+
+def _kv_user(kv_sizes, **extra):
+  user = dict(extra)
+  if kv_sizes is not None:
+    user.update(zip(("block_kv", "block_kv_compute", "block_kv_compute_in"), kv_sizes))
+  return user or None
+
+
+class Krea2AutoBlockQTest(unittest.TestCase):
+
+  def test_max_auto_block_q(self):
+    for device_kind, kv_sizes, expected_max, _ in _AUTO_BLOCK_Q_CASES:
+      with self.subTest(device_kind=device_kind, kv_sizes=kv_sizes):
+        sizes = krea2_attention.select_krea2_block_sizes(4224, user=_kv_user(kv_sizes))
+        kv = (sizes.block_kv, sizes.block_kv_compute, sizes.block_kv_compute_in)
+        self.assertEqual(krea2_attention.max_auto_block_q(device_kind, *kv), expected_max)
+    # Uncalibrated chips and a user VMEM limit keep the pre-budget maximum.
+    for device_kind in (None, "cpu", "TPU v4", "TPU v5p"):
+      self.assertEqual(krea2_attention.max_auto_block_q(device_kind, 1024, 512, 256), 2048)
+    self.assertEqual(krea2_attention.max_auto_block_q(_V6E, 2048, 1024, 256, vmem_limit_bytes=67108864), 2048)
+    # Never below the base, even when the base itself exceeds the estimate budget.
+    self.assertEqual(krea2_attention.max_auto_block_q(_V5E, 4096, 2048, 256), 2048)
+
+  def test_auto_block_q_per_device(self):
+    for device_kind, kv_sizes, _, expected in _AUTO_BLOCK_Q_CASES:
+      for seq_len, block_q in expected.items():
+        with self.subTest(device_kind=device_kind, kv_sizes=kv_sizes, seq_len=seq_len):
+          sizes = krea2_attention.select_krea2_block_sizes(seq_len, user=_kv_user(kv_sizes), device_kind=device_kind)
+          self.assertEqual(sizes.block_q, block_q)
+          if kv_sizes is not None:
+            self.assertEqual((sizes.block_kv, sizes.block_kv_compute, sizes.block_kv_compute_in), kv_sizes)
+
+  def test_uncalibrated_device_keeps_previous_choice(self):
+    for device_kind in (None, "cpu"):
+      for kv_sizes in (None, (2048, 1024, 256), (1024, 256, 256)):
+        for seq_len, block_q in {4224: 1408, 4352: 896, 16512: 1664}.items():
+          with self.subTest(device_kind=device_kind, kv_sizes=kv_sizes, seq_len=seq_len):
+            sizes = krea2_attention.select_krea2_block_sizes(seq_len, user=_kv_user(kv_sizes), device_kind=device_kind)
+            self.assertEqual(sizes.block_q, block_q)
+
+  def test_user_vmem_limit_and_block_q(self):
+    user = _kv_user((2048, 1024, 256), vmem_limit_bytes=67108864)
+    self.assertEqual(krea2_attention.select_krea2_block_sizes(4224, user=user, device_kind=_V6E).block_q, 1408)
+    carrier = max_utils.CustomFlashBlockSizes(
+        block_q=None,
+        block_kv=2048,
+        block_kv_compute=1024,
+        block_kv_compute_in=256,
+        heads_per_tile=None,
+        vmem_limit_bytes=67108864,
+    )
+    self.assertEqual(krea2_attention.select_krea2_block_sizes(4224, user=carrier, device_kind=_V6E).block_q, 1408)
+    # A user block_q always wins.
+    user = _kv_user((2048, 1024, 256), block_q=1408)
+    self.assertEqual(krea2_attention.select_krea2_block_sizes(4224, user=user, device_kind=_V6E).block_q, 1408)
+
+  def test_budget_only_for_bfloat16_operands(self):
+    user = _kv_user((2048, 1024, 256))
+    # The VMEM budget is calibrated with bf16 q/k/v; wider operands keep the previous choice.
+    for dtype in (jnp.float32, jnp.float16, np.float32, "float32"):
+      with self.subTest(dtype=dtype):
+        self.assertEqual(krea2_attention.max_auto_block_q(_V6E, 2048, 1024, 256, dtype=dtype), 2048)
+        for seq_len, block_q in {4224: 1408, 16512: 1664}.items():
+          sizes = krea2_attention.select_krea2_block_sizes(seq_len, user=user, device_kind=_V6E, dtype=dtype)
+          self.assertEqual(sizes.block_q, block_q)
+    # None means bf16; bf16 is accepted as a jnp scalar type, a numpy dtype object and a string.
+    for dtype in (None, jnp.bfloat16, np.dtype(jnp.bfloat16), "bfloat16", jnp.zeros((1,), jnp.bfloat16).dtype):
+      with self.subTest(dtype=dtype):
+        self.assertEqual(krea2_attention.max_auto_block_q(_V6E, 2048, 1024, 256, dtype=dtype), 4992)
+        sizes = krea2_attention.select_krea2_block_sizes(4224, user=user, device_kind=_V6E, dtype=dtype)
+        self.assertEqual(sizes.block_q, 4224)
+
+  def test_vmem_budget_covers_choices_and_excludes_failures(self):
+    budgets = krea2_attention._VMEM_BUDGET_BYTES  # pylint: disable=protected-access
+    estimate = krea2_attention._estimated_vmem_bytes  # pylint: disable=protected-access
+    for device_kind, kv_sizes, _, expected in _AUTO_BLOCK_Q_CASES:
+      for seq_len in expected:
+        with self.subTest(device_kind=device_kind, kv_sizes=kv_sizes, seq_len=seq_len):
+          sizes = krea2_attention.select_krea2_block_sizes(seq_len, user=_kv_user(kv_sizes), device_kind=device_kind)
+          self.assertLessEqual(estimate(sizes.block_q, sizes.block_kv, sizes.block_kv_compute), budgets[device_kind])
+    # Nobody may raise a budget past a block_q that is known to fail the compile.
+    for device_kind, block_q, block_kv, block_kv_compute, block_kv_compute_in in _VMEM_FAIL_POINTS:
+      with self.subTest(device_kind=device_kind, block_q=block_q, block_kv=block_kv, block_kv_compute=block_kv_compute):
+        self.assertGreater(estimate(block_q, block_kv, block_kv_compute), budgets[device_kind])
+        max_block_q = krea2_attention.max_auto_block_q(device_kind, block_kv, block_kv_compute, block_kv_compute_in)
+        self.assertLess(max_block_q, block_q)
+
+
 class Krea2FlashCustomRegistryTest(unittest.TestCase):
 
   def setUp(self):
@@ -269,6 +405,44 @@ class Krea2RejectShardedSequenceTest(unittest.TestCase):
       attention_flax._krea2_reject_sharded_sequence(mesh, P(None, None, ("data", "context"), None), unsharded)
     attention_flax._krea2_reject_sharded_sequence(mesh, P(None, "context", "data", None), unsharded)
 
+
+class Krea2MeshDeviceKindTest(unittest.TestCase):
+
+  def test_real_mesh(self):
+    mesh = Mesh(np.array(jax.devices()[:1]), ("data",))
+    self.assertEqual(attention_flax._mesh_device_kind(mesh), "cpu")
+    fake = types.SimpleNamespace(devices=np.array([types.SimpleNamespace(device_kind=_V6E)], dtype=object))
+    self.assertEqual(attention_flax._mesh_device_kind(fake), _V6E)
+
+  def test_undeterminable_device_kind_is_none(self):
+    real_mesh = Mesh(np.array(jax.devices()[:1]), ("data",))
+    meshes = {
+        "none": None,
+        "abstract_mesh": real_mesh.abstract_mesh,
+        "no_devices": types.SimpleNamespace(shape={"data": 1}),
+        "empty_devices": types.SimpleNamespace(devices=np.empty((0,), dtype=object)),
+        "no_device_kind": types.SimpleNamespace(devices=np.array([types.SimpleNamespace(id=0)], dtype=object)),
+    }
+    for name, mesh in meshes.items():
+      with self.subTest(mesh=name):
+        self.assertIsNone(attention_flax._mesh_device_kind(mesh))
+
+
+class Krea2OperandDtypeTest(unittest.TestCase):
+
+  def test_one_other_operand_keeps_the_previous_block_q(self):
+    bf16, f32 = jnp.zeros((1,), jnp.bfloat16), jnp.zeros((1,), jnp.float32)
+    f16, i32, b = jnp.zeros((1,), jnp.float16), jnp.zeros((1,), jnp.int32), jnp.zeros((1,), jnp.bool_)
+    user = {"block_kv": 2048, "block_kv_compute": 1024, "block_kv_compute_in": 256}
+    cases = [((bf16, bf16, bf16), 4224), ((f32, f32, f32), 1408)]
+    # Integer and bool operands promote to bfloat16 with bfloat16: they must not pass either.
+    for other in (f32, f16, i32, b):
+      cases += [((other, bf16, bf16), 1408), ((bf16, other, bf16), 1408), ((bf16, bf16, other), 1408)]
+    for operands, expected in cases:
+      with self.subTest(dtypes=[str(x.dtype) for x in operands]):
+        dtype = attention_flax._krea2_operand_dtype(*operands)
+        sizes = krea2_attention.select_krea2_block_sizes(4224, user=user, device_kind=_V6E, dtype=dtype)
+        self.assertEqual(sizes.block_q, expected)
 
 
 if __name__ == "__main__":

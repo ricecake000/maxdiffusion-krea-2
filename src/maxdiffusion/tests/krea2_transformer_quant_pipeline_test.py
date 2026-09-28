@@ -33,7 +33,12 @@ from flax.linen import partitioning as nn_partitioning
 from flax.traverse_util import flatten_dict
 from jax.sharding import PartitionSpec as P
 
-from maxdiffusion.generate_krea2 import build_krea2_transformer, transformer_quantization_aot_meta
+from maxdiffusion.generate_krea2 import (
+    build_krea2_transformer,
+    flash_custom_block_selection_aot_meta,
+    transformer_quantization_aot_meta,
+)
+from maxdiffusion.kernels.krea2_attention import KREA2_BLOCK_SELECTION_REVISION
 from maxdiffusion.loaders.krea2_lora_pipeline import Krea2LoraLoaderMixin, insert_lora_params, make_lora_compile_spec
 from maxdiffusion.models.krea2.lora_util import convert_krea2_lora_to_flax
 from maxdiffusion.models.krea2.transformer_krea2_flax import Krea2Transformer2DModel
@@ -373,6 +378,20 @@ class TransformerQuantizationAotMetaTest(unittest.TestCase):
     self.assertEqual(
         transformer_quantization_aot_meta("w8a8", ("to_k", "up_proj")),
         {"krea2_transformer_quantization": f"w8a8:to_k,up_proj:{revision}"},
+    )
+
+
+class FlashCustomBlockSelectionAotMetaTest(unittest.TestCase):
+
+  def test_other_kernels_add_no_key(self):
+    # Other attention kernels keep the AOT cache fingerprint they had before the key existed.
+    for attention in ("flash", "dot_product", "cudnn_flash_te", ""):
+      self.assertEqual(flash_custom_block_selection_aot_meta(attention), {})
+
+  def test_flash_custom_records_revision(self):
+    self.assertEqual(
+        flash_custom_block_selection_aot_meta("flash_custom"),
+        {"krea2_block_selection": f"r{KREA2_BLOCK_SELECTION_REVISION}"},
     )
 
 

@@ -31,6 +31,14 @@ On top of that it supports a dynamic per-batch PREFIX key mask: kv position p of
 batch element b is valid iff p < valid_kv_len[b]. The lengths are delivered via
 scalar prefetch and batch is a grid axis (not a vmap) so the kernel can read
 them. Only kv blocks that can contain invalid positions pay for the mask.
+
+Every q block re-reads all k/v blocks from HBM, so fewer, larger q blocks are
+faster. The automatic block_q minimizes padded query waste over multiples of 128
+in [512, max], where max is 2048 unless the chip has a calibrated VMEM budget
+(`_VMEM_BUDGET_BYTES`, keyed by device_kind, calibrated for bfloat16 q/k/v):
+there it grows to the largest block_q whose `_estimated_vmem_bytes` fits the
+budget (up to 8192), since the compile fails once the kernel exceeds Mosaic's
+default scoped VMEM limit. Other operand dtypes keep max at 2048.
 """
 
 import dataclasses
@@ -55,7 +63,25 @@ INTERPRET = False
 _DEFAULT_BLOCK_KV = 1024
 _DEFAULT_BLOCK_KV_COMPUTE = 512
 _DEFAULT_BLOCK_KV_COMPUTE_IN = 256
-_BLOCK_Q_CANDIDATES = tuple(range(512, 2048 + 1, 128))
+_BLOCK_Q_MIN = 512
+_BLOCK_Q_BASE_MAX = 2048  # always allowed: the range before the VMEM budget
+_BLOCK_Q_ABS_MAX = 8192  # never picked automatically above this
+
+# Bumped whenever the automatic block-size choice changes, so AOT caches keyed
+# on it miss executables compiled with the previous choice.
+KREA2_BLOCK_SELECTION_REVISION = 2
+
+# Budget for `_estimated_vmem_bytes` per device kind, ~8 % under the smallest
+# estimate that failed to compile. Compile-only calibration with bfloat16
+# q/k/v (jax 0.11.2, libtpu 0.0.48, no vmem_limit_bytes); wider operands need
+# more VMEM, so other dtypes keep the base maximum. Largest OK / smallest
+# failing block_q for block_kv/block_kv_compute/block_kv_compute_in:
+#   v6e: 1024/512/256 8832/9088, 2048/512/256 8320/8832, 1024/1024/256 5632/5888,
+#        2048/1024/256 5504/5632, 4096/1024/256 4992/5120, 2048/2048/256 3328/3712,
+#        4096/2048/256 2688/3328, 2048/1024/128 5120/5504;
+#   v5e: 1024/512/256 4224/4608, 2048/1024/256 2560/3072, 4096/1024/256 2048/3072.
+# Every failing point estimates >= 39.39e6 bytes on v6e and >= 21.76e6 on v5e.
+_VMEM_BUDGET_BYTES = {"TPU v6 lite": 36_000_000, "TPU v5 lite": 18_500_000}
 
 
 def padded_len(n: int, multiple: int) -> int:
@@ -100,10 +126,44 @@ def _user_block_value(user, name):
   return getattr(user, name, None)
 
 
-def _default_block_q(seq_len: int) -> int:
+def _estimated_vmem_bytes(block_q: int, block_kv: int, block_kv_compute: int) -> int:
+  """Empirical VMEM estimate: f32 (bkv_compute, bq) scores, per-bq temporaries, k/v buffers."""
+  return block_q * (4 * block_kv_compute + 2304) + 1664 * block_kv
+
+
+def max_auto_block_q(
+    device_kind,
+    block_kv: int,
+    block_kv_compute: int,
+    block_kv_compute_in: int,
+    vmem_limit_bytes=None,
+    dtype=None,
+) -> int:
+  """Largest block_q the automatic choice may use for these kv block sizes.
+
+  Returns `_BLOCK_Q_BASE_MAX` for chips without a calibrated budget, when the
+  user sets `vmem_limit_bytes`, when block_kv_compute_in < 256 or when the q/k/v
+  `dtype` is not bfloat16 (not calibrated; None means bfloat16). Otherwise the
+  largest multiple of 128 in [_BLOCK_Q_BASE_MAX, _BLOCK_Q_ABS_MAX] whose
+  estimate fits the chip's budget, never below the base.
+  """
+  budget = _VMEM_BUDGET_BYTES.get(device_kind)
+  bf16 = dtype is None or jnp.dtype(dtype) == jnp.bfloat16
+  if budget is None or vmem_limit_bytes is not None or block_kv_compute_in < 256 or not bf16:
+    return _BLOCK_Q_BASE_MAX
+  block_q = _BLOCK_Q_BASE_MAX
+  while (
+      block_q + NUM_LANES <= _BLOCK_Q_ABS_MAX
+      and _estimated_vmem_bytes(block_q + NUM_LANES, block_kv, block_kv_compute) <= budget
+  ):
+    block_q += NUM_LANES
+  return block_q
+
+
+def _default_block_q(seq_len: int, max_block_q: int = _BLOCK_Q_BASE_MAX) -> int:
   """Picks block_q minimizing padded query waste, preferring larger blocks on ties."""
   cap = padded_len(max(seq_len, 1), NUM_LANES)
-  candidates = [bq for bq in _BLOCK_Q_CANDIDATES if bq <= cap] or [cap]
+  candidates = [bq for bq in range(_BLOCK_Q_MIN, max_block_q + 1, NUM_LANES) if bq <= cap] or [cap]
   best = None
   for bq in candidates:
     waste = padded_len(seq_len, bq) - seq_len
@@ -113,21 +173,26 @@ def _default_block_q(seq_len: int) -> int:
   return best[1]
 
 
-def select_krea2_block_sizes(seq_len: int, user=None) -> Krea2BlockSizes:
+def select_krea2_block_sizes(seq_len: int, user=None, device_kind=None, dtype=None) -> Krea2BlockSizes:
   """Selects kernel block sizes for a sequence of length `seq_len`.
 
   Args:
     seq_len: static (unpadded) sequence length.
     user: optional CustomFlashBlockSizes-like object or dict. Its non-None
       block_q / block_kv / block_kv_compute / block_kv_compute_in override the
-      defaults; missing or None fields fall back to the defaults.
+      defaults; missing or None fields fall back to the defaults. A non-None
+      vmem_limit_bytes keeps the automatic block_q at most 2048.
+    device_kind: `device_kind` of the chip the kernel runs on (e.g.
+      'TPU v6 lite'); None or an uncalibrated chip keeps block_q at most 2048.
+    dtype: dtype of q/k/v. None means bfloat16, the dtype the VMEM budget is
+      calibrated for; any other dtype keeps block_q at most 2048.
 
   Returns:
     A validated Krea2BlockSizes. Default block_q is the multiple of 128 in
-    [512, 2048] (capped at seq_len rounded up to 128) minimizing the padded
-    waste ceil(seq_len / bq) * bq - seq_len, larger bq winning ties.
+    [512, max_auto_block_q(...)] (capped at seq_len rounded up to 128)
+    minimizing the padded waste ceil(seq_len / bq) * bq - seq_len, larger bq
+    winning ties.
   """
-  block_q = _user_block_value(user, "block_q") or _default_block_q(seq_len)
   block_kv = _user_block_value(user, "block_kv") or _DEFAULT_BLOCK_KV
   block_kv_compute = _user_block_value(user, "block_kv_compute")
   block_kv_compute_in = _user_block_value(user, "block_kv_compute_in")
@@ -135,6 +200,17 @@ def select_krea2_block_sizes(seq_len: int, user=None) -> Krea2BlockSizes:
     block_kv_compute = min(_DEFAULT_BLOCK_KV_COMPUTE, block_kv)
   if block_kv_compute_in is None:
     block_kv_compute_in = min(_DEFAULT_BLOCK_KV_COMPUTE_IN, block_kv_compute)
+  block_q = _user_block_value(user, "block_q")
+  if not block_q:
+    max_block_q = max_auto_block_q(
+        device_kind,
+        block_kv,
+        block_kv_compute,
+        block_kv_compute_in,
+        _user_block_value(user, "vmem_limit_bytes"),
+        dtype=dtype,
+    )
+    block_q = _default_block_q(seq_len, max_block_q)
   return Krea2BlockSizes(
       block_q=block_q,
       block_kv=block_kv,

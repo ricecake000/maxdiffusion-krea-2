@@ -204,6 +204,21 @@ def transformer_quantization_aot_meta(mode, targets) -> dict:
   return {"krea2_transformer_quantization": f"{mode}:{','.join(targets)}:r{KREA2_TRANSFORMER_QUANT_REVISION}"}
 
 
+def flash_custom_block_selection_aot_meta(attention) -> dict:
+  """AOT cache meta entry for the flash_custom automatic block sizes; empty for other kernels.
+
+  `flash_block_sizes` in the meta only records the configured sizes, not the
+  automatic choice, so the value carries `KREA2_BLOCK_SELECTION_REVISION` and a
+  changed choice misses executables cached for the previous one. Other kernels
+  keep their fingerprint.
+  """
+  from maxdiffusion.kernels.krea2_attention import KREA2_BLOCK_SELECTION_REVISION
+
+  if attention != "flash_custom":
+    return {}
+  return {"krea2_block_selection": f"r{KREA2_BLOCK_SELECTION_REVISION}"}
+
+
 def main(argv):
   jax.config.update("jax_use_shardy_partitioner", True)
 
@@ -676,6 +691,8 @@ def main(argv):
           "krea2_rope_layout": transformer.rope_layout,
           # Conditional key: with quantization off the meta (and fingerprint) matches older caches.
           **transformer_quantization_aot_meta(transformer_quantization, transformer_quant_targets),
+          # Conditional key: only flash_custom picks block sizes automatically per chip.
+          **flash_custom_block_selection_aot_meta(config.attention),
           "lora_compile_spec": lora_compile_spec,
           "jax": jax.__version__,
       },

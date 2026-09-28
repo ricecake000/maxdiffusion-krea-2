@@ -1753,6 +1753,29 @@ def _read_custom_block_sizes(flash_block_sizes):
   return {name: getattr(flash_block_sizes, name, None) or None for name in names}
 
 
+def _mesh_device_kind(mesh):
+  """`device_kind` of the mesh's first device, or None when it cannot be determined.
+
+  None covers no mesh, an AbstractMesh (its `devices` raises ValueError), an
+  empty device array and a device without `device_kind`.
+  """
+  try:
+    return mesh.devices.flat[0].device_kind
+  except (AttributeError, IndexError, TypeError, ValueError):
+    return None
+
+
+def _krea2_operand_dtype(query, key, value):
+  """bfloat16 when all three kernel operands are, else the first operand dtype that is not.
+
+  Not a promotion: bfloat16 with an integer or bool operand promotes to bfloat16.
+  """
+  for operand in (query, key, value):
+    if operand.dtype != jnp.bfloat16:
+      return operand.dtype
+  return jnp.dtype(jnp.bfloat16)
+
+
 def _krea2_reject_sharded_sequence(mesh, q_axis_names, kv_axis_names):
   """Raises if the sequence axis (index 2 of the (B, H, L, D) specs) is split over devices.
 
@@ -1812,7 +1835,15 @@ def krea2_custom_flash_kernel(q, k, v, context):
     valid_kv_len = jnp.broadcast_to(valid_kv_len, (batch,))
 
   user_sizes = _read_custom_block_sizes(context["flash_block_sizes"])
-  block_sizes = krea2_kernel.select_krea2_block_sizes(q_seq_len, user=user_sizes)
+  # The automatic block_q depends on the chip's VMEM budget and the operand
+  # dtype it was calibrated for (all of q/k/v must have it); topology-desc
+  # devices of a cross-compile report the target chip here too.
+  block_sizes = krea2_kernel.select_krea2_block_sizes(
+      q_seq_len,
+      user=user_sizes,
+      device_kind=_mesh_device_kind(mesh),
+      dtype=_krea2_operand_dtype(query, key, value),
+  )
   vmem_limit_bytes = user_sizes["vmem_limit_bytes"]
 
   q_pad = krea2_kernel.padded_len(q_seq_len, block_sizes.block_q) - q_seq_len
