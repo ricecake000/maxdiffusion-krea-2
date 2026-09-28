@@ -23,7 +23,9 @@
 #   1024x1024 peak 28.84 GiB (VAE decode) of 31.25 GiB usable. 2048x2048 does
 #   NOT fit this way (VAE decode ~5.1 GiB of activations -> 32.62 GiB); there
 #   use krea2_offload_components ['text_encoder'] (peak 29.18 GiB, 3.44 GiB
-#   int8 swap per generation).
+#   int8 swap per generation). Transformer W8A8 (int8 weights and activations)
+#   is available via krea2_transformer_quantization=w8a8 but stays off by
+#   default until its image quality is validated.
 # - attention 'flash_custom': the Krea 2 Pallas kernel (GQA without K/V
 #   expansion, prefix key mask); flash_block_sizes {} = kernel's auto sizes.
 # - krea2_rope_layout 'rotate_half': q/k head dims are permuted at load time so
@@ -354,6 +356,15 @@ krea2_text_encoder_quant_tile_size: 128
 # as inputs_embeds, so the 151936x2560 embedding table (0.72 GiB bf16) never
 # occupies HBM. Exact.
 krea2_text_embed_on_host: True
+# Transformer block matmul quantization: '' (off) or 'w8a8' (int8 weights, quantized on the host at
+# load time with one scale per output column, and int8 activations, quantized per token inside the
+# step; int8 x int8 matmuls run ~2x faster than bf16 on TPU v6e and halve the transformer's HBM).
+# Image quality with quantized activations must be checked against the unquantized output.
+krea2_transformer_quantization: ''
+# DiT block projections that run as W8A8. Allowed: to_q, to_k, to_v, to_gate, to_out, gate_proj,
+# up_proj, down_proj. to_k/to_v are small (6144 -> 1536) and stay float by default.
+# Command-line override: "krea2_transformer_quant_targets=['gate_proj','up_proj','down_proj']".
+krea2_transformer_quant_targets: ['to_q', 'to_gate', 'to_out', 'gate_proj', 'up_proj', 'down_proj']
 
 # VAE (Qwen-Image / Wan 2.1 architecture) mesh + sharding.
 # vae_spatial = -1 shards VAE spatial activations across all devices.

@@ -201,7 +201,11 @@ class Krea2LoraLoaderMixin(LoRABaseMixin):
   @classmethod
   def make_lora_interceptor(cls, ranks_by_path, network_alphas_by_path, adapter_name, scale=1.0):
     """Builds an `nn.intercept_methods` interceptor adding this adapter's LoRA
-    update to every Dense whose module path appears in `ranks_by_path`."""
+    update to every Dense whose module path appears in `ranks_by_path`.
+
+    The intercepted module may take extra call arguments (a W8A8 projection is
+    called as `proj(x, quantized_inputs)`); the LoRA layer only ever sees the
+    first argument, the projection's float input."""
     lora_keys = frozenset(ranks_by_path.keys())
 
     def _intercept(next_fn, args, kwargs, context):
@@ -224,7 +228,10 @@ class Krea2LoraLoaderMixin(LoRABaseMixin):
               lora_scale=scale,
               name=f"lora-{adapter_name}",
           )
-          return lora_layer(h, *args, **kwargs)
+          # Only the float input feeds the low-rank update; any further
+          # arguments (e.g. pre-quantized int8 activations) are not forwarded.
+          inputs = args[0] if args else kwargs["inputs"]
+          return lora_layer(h, inputs)
       return h
 
     return _intercept

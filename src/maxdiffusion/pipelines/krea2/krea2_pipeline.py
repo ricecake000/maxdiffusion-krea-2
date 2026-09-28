@@ -366,6 +366,7 @@ class FlaxKrea2Pipeline:
           dtype=self.transformer.dtype,
           weights_dtype=self.transformer.weights_dtype,
           precision=self.transformer.precision,
+          quant_targets=self.transformer.quant_targets,
       )
       prelude_keys = KREA2_PRELUDE_KEYS
 

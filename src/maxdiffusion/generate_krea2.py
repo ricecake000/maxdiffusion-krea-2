@@ -147,9 +147,18 @@ def build_qwen3_config(te_config, config):
   )
 
 
-def build_krea2_transformer(transformer_cfg, config, mesh):
-  """Builds the Krea 2 transformer module from a `transformer/config.json` dict (defaults if empty)."""
+def build_krea2_transformer(transformer_cfg, config, mesh, quant_targets=None):
+  """Builds the Krea 2 transformer module from a `transformer/config.json` dict (defaults if empty).
+
+  `quant_targets` selects the W8A8 block projections; None takes them from the
+  config (`krea2_transformer_quantization` / `krea2_transformer_quant_targets`),
+  `()` builds the unquantized model.
+  """
   from maxdiffusion.models.krea2.transformer_krea2_flax import Krea2Transformer2DModel
+  from maxdiffusion.models.krea2.transformer_quant import normalize_quant_targets, resolve_transformer_quantization
+
+  if quant_targets is None:
+    _, quant_targets = resolve_transformer_quantization(config)
 
   return Krea2Transformer2DModel(
       in_channels=transformer_cfg.get("in_channels", 64),
@@ -176,7 +185,19 @@ def build_krea2_transformer(transformer_cfg, config, mesh):
       mesh=mesh,
       dtype=config.activations_dtype,
       weights_dtype=config.weights_dtype,
+      quant_targets=normalize_quant_targets(quant_targets),
   )
+
+
+def transformer_quantization_aot_meta(mode, targets) -> dict:
+  """AOT cache meta entry for transformer quantization; empty when it is off.
+
+  The key is present only when quantization is on, so the fingerprint of an
+  unquantized setup (and its existing cached executables) stays unchanged.
+  """
+  if not mode:
+    return {}
+  return {"krea2_transformer_quantization": f"{mode}:{','.join(targets)}"}
 
 
 def main(argv):
@@ -222,6 +243,12 @@ def main(argv):
       quantize_text_encoder_params,
       resolve_text_encoder_quantization,
       safe_param_shardings,
+  )
+  from maxdiffusion.models.krea2.transformer_quant import (
+      check_transformer_param_tree,
+      describe_transformer_quantization,
+      quantize_transformer_params,
+      resolve_transformer_quantization,
   )
   from maxdiffusion.models.flux.util import cast_dict_to_bfloat16_inplace
   from maxdiffusion.schedulers.scheduling_flow_match_flax import FlaxFlowMatchScheduler
@@ -318,7 +345,15 @@ def main(argv):
       transformer_cfg = json.load(f)
 
   num_layers = transformer_cfg.get("num_layers", 28)
-  transformer = build_krea2_transformer(transformer_cfg, config, mesh)
+  # `transformer_load_model` is the float structure the checkpoint loader fills;
+  # `transformer` is what the pipeline applies (int8 block projections for w8a8).
+  transformer_quantization, transformer_quant_targets = resolve_transformer_quantization(config)
+  transformer = build_krea2_transformer(transformer_cfg, config, mesh, quant_targets=transformer_quant_targets)
+  if transformer_quantization:
+    transformer_load_model = build_krea2_transformer(transformer_cfg, config, mesh, quant_targets=())
+  else:
+    transformer_load_model = transformer
+  max_logging.log(describe_transformer_quantization(transformer_quantization, transformer_quant_targets))
 
   # 5b. Optionally load LoRA adapters (kohya/ComfyUI/diffusers .safetensors).
   # The interceptors must be live around shape evaluation AND every pipeline
@@ -372,8 +407,8 @@ def main(argv):
   key = jax.random.PRNGKey(config.seed if config.seed is not None else 0)
   key, qwen_key = jax.random.split(key)
 
-  def transformer_init_fn():
-    return transformer.init(
+  def transformer_init_fn(model):
+    return model.init(
         key,
         hidden_states=img_dummy,
         encoder_hidden_states=txt_dummy,
@@ -397,7 +432,13 @@ def main(argv):
     for interceptor in lora_interceptors:
       stack.enter_context(nn.intercept_methods(interceptor))
     with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
-      abstract_transformer_vars = jax.eval_shape(transformer_init_fn)
+      abstract_transformer_vars = jax.eval_shape(lambda: transformer_init_fn(transformer))
+      # The loader fills the float structure; int8 block kernels are derived from it.
+      abstract_transformer_load_vars = (
+          jax.eval_shape(lambda: transformer_init_fn(transformer_load_model))
+          if transformer_load_model is not transformer
+          else abstract_transformer_vars
+      )
       abstract_qwen3_vars = jax.eval_shape(lambda: qwen3_init_fn(qwen3_runtime_model))
       # The loader fills the unquantized structure; int8 params are derived from it.
       abstract_qwen3_load_vars = (
@@ -454,7 +495,7 @@ def main(argv):
 
         params = jax.tree_util.tree_map(
             unbox_fn,
-            abstract_transformer_vars["params"],
+            abstract_transformer_load_vars["params"],
             is_leaf=lambda k: isinstance(k, flax_spmd.LogicallyPartitioned),
         )
         params = flax.core.unfreeze(params)
@@ -502,6 +543,9 @@ def main(argv):
             qwen_future = weight_executor.submit(load_qwen_timed)
             params, load_trace["transformer_host"] = transformer_future.result()
             qwen3_params, load_trace["qwen_host"] = qwen_future.result()
+            # Drop the futures: they would pin the float trees (with W8A8 the ~24 GiB
+            # float kernels that quantize_transformer_params replaces) until main returns.
+            del transformer_future, qwen_future
         else:
           params, load_trace["transformer_host"] = load_transformer_timed()
           qwen3_params, load_trace["qwen_host"] = load_qwen_timed()
@@ -524,6 +568,14 @@ def main(argv):
               head_dim=transformer.attention_head_dim,
           )
           load_trace["rope_permute"] = time.perf_counter() - t0
+
+        # W8A8: quantize the final float kernels (LoRA subtrees and the rotate-half
+        # permutation included), then check the tree against the runtime model's.
+        if transformer_quantization:
+          t0 = time.perf_counter()
+          params = quantize_transformer_params(params, transformer_quant_targets, scale_dtype=config.weights_dtype)
+          check_transformer_param_tree(params, abstract_transformer_vars["params"])
+          load_trace["transformer_quantize"] = time.perf_counter() - t0
 
         params = flax.core.freeze(params)
         qwen3_params = flax.core.freeze(qwen3_params)
@@ -618,6 +670,8 @@ def main(argv):
           "krea2_text_encoder_quantization": f"{te_quantization}:{te_quant_tile_size}" if te_quantization else "",
           "krea2_text_embed_on_host": str(te_embed_on_host),
           "krea2_rope_layout": transformer.rope_layout,
+          # Conditional key: with quantization off the meta (and fingerprint) matches older caches.
+          **transformer_quantization_aot_meta(transformer_quantization, transformer_quant_targets),
           "lora_compile_spec": lora_compile_spec,
           "jax": jax.__version__,
       },

@@ -682,7 +682,71 @@ class _DenseHost(nn.Module):
     return nn.Dense(self.features, use_bias=False, name="proj")(x)
 
 
+class _TwoArgProj(nn.Module):
+  """Stand-in for a W8A8 projection: called as `proj(inputs, quantized_inputs)`
+  and exposing the fields the Krea 2 LoRA interceptor reads. The base product
+  uses the second argument, so the test can tell which input feeds LoRA."""
+
+  features: int
+  dtype: jnp.dtype = jnp.float32
+  param_dtype: jnp.dtype = jnp.float32
+  precision: jax.lax.Precision = None
+
+  @nn.compact
+  def __call__(self, inputs, quantized_inputs=None):
+    kernel = self.param("kernel", nn.initializers.lecun_normal(), (inputs.shape[-1], self.features), self.param_dtype)
+    if quantized_inputs is None:
+      return jnp.matmul(inputs, kernel)
+    x_q, x_scale = quantized_inputs
+    return jnp.matmul(x_q * x_scale, kernel)
+
+
+class _TwoArgHost(nn.Module):
+  features: int = 8
+  use_kwargs: bool = False
+
+  @nn.compact
+  def __call__(self, x, quantized):
+    proj = _TwoArgProj(self.features, name="proj")
+    if self.use_kwargs:
+      return proj(inputs=x, quantized_inputs=quantized)
+    return proj(x, quantized)
+
+
 class InterceptorTest(unittest.TestCase):
+
+  def test_interceptor_feeds_only_the_first_argument_of_a_two_argument_projection(self):
+    rank, alpha, scale = 2, 4.0, 0.7
+    rng = np.random.RandomState(0)
+    x = jnp.asarray(_rand(rng, 3, 5))
+    # Deliberately unrelated to x: the base product reads it, LoRA must not.
+    quantized = (jnp.asarray(_rand(rng, 3, 5)), jnp.full((3, 1), 0.5, jnp.float32))
+    interceptor = Krea2LoraLoaderMixin.make_lora_interceptor(
+        {("proj",): rank}, {("proj",): alpha}, "test", scale=scale
+    )
+
+    for use_kwargs in (False, True):
+      with self.subTest(use_kwargs=use_kwargs):
+        host = _TwoArgHost(use_kwargs=use_kwargs)
+        with nn.intercept_methods(interceptor):
+          params = flax.core.unfreeze(host.init(jax.random.PRNGKey(0), x, quantized)["params"])
+
+        flat = flatten_dict(params)
+        self.assertEqual(flat[("proj", "lora-test", "down", "kernel")].shape, (5, rank))
+        self.assertEqual(flat[("proj", "lora-test", "up", "kernel")].shape, (rank, 8))
+        down = _rand(rng, 5, rank)
+        up = _rand(rng, rank, 8)
+        flat[("proj", "lora-test", "down", "kernel")] = jnp.asarray(down)
+        flat[("proj", "lora-test", "up", "kernel")] = jnp.asarray(up)
+        params = unflatten_dict(flat)
+
+        with nn.intercept_methods(interceptor):
+          out = host.apply({"params": params}, x, quantized)
+
+        kernel = flat[("proj", "kernel")]
+        base = jnp.matmul(quantized[0] * quantized[1], kernel)
+        expected = base + scale * (alpha / rank) * jnp.matmul(jnp.matmul(x, jnp.asarray(down)), jnp.asarray(up))
+        np.testing.assert_allclose(np.asarray(out), np.asarray(expected), rtol=1e-5, atol=1e-5)
 
   def test_interceptor_allows_rank_wider_than_output(self):
     host = _DenseHost(features=1)

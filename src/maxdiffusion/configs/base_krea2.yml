@@ -334,6 +334,15 @@ krea2_text_encoder_quant_tile_size: 128
 # as inputs_embeds, so the 151936x2560 embedding table (0.72 GiB bf16) never
 # occupies HBM. Exact.
 krea2_text_embed_on_host: False
+# Transformer block matmul quantization: '' (off) or 'w8a8' (int8 weights, quantized on the host at
+# load time with one scale per output column, and int8 activations, quantized per token inside the
+# step; int8 x int8 matmuls run ~2x faster than bf16 on TPU v6e and halve the transformer's HBM).
+# Image quality with quantized activations must be checked against the unquantized output.
+krea2_transformer_quantization: ''
+# DiT block projections that run as W8A8. Allowed: to_q, to_k, to_v, to_gate, to_out, gate_proj,
+# up_proj, down_proj. to_k/to_v are small (6144 -> 1536) and stay float by default.
+# Command-line override: "krea2_transformer_quant_targets=['gate_proj','up_proj','down_proj']".
+krea2_transformer_quant_targets: ['to_q', 'to_gate', 'to_out', 'gate_proj', 'up_proj', 'down_proj']
 
 # VAE (Qwen-Image / Wan 2.1 architecture) mesh + sharding.
 # vae_spatial = -1 shards VAE spatial activations across all devices.

@@ -30,6 +30,7 @@ from ...configuration_utils import ConfigMixin, flax_register_to_config
 from ...utils import BaseOutput
 from ..modeling_flax_utils import FlaxModelMixin
 from ..attention_flax import AttentionOp, apply_rope
+from .transformer_quant import Krea2QuantDense, normalize_quant_targets, quantize_activation
 
 ROPE_LAYOUTS = ("interleaved", "rotate_half")
 
@@ -129,50 +130,65 @@ def apply_explicit_lora(output, inputs, adapters=(), dtype=jnp.float32, precisio
   return output
 
 
+def _projection(features, kernel_axes, quantized, dtype, weights_dtype, precision):
+  """A bias-free block projection: `Krea2QuantDense` (W8A8) when `quantized`, else `nn.Dense`."""
+  if quantized:
+    return Krea2QuantDense(
+        features, kernel_axes=kernel_axes, dtype=dtype, param_dtype=weights_dtype, precision=precision
+    )
+  return nn.Dense(
+      features,
+      use_bias=False,
+      kernel_init=nn.with_logical_partitioning(nn.initializers.lecun_normal(), kernel_axes),
+      dtype=dtype,
+      param_dtype=weights_dtype,
+      precision=precision,
+  )
+
+
+def _apply_projection(proj, x, quantized_x):
+  """Calls a W8A8 projection with the shared `(x_q, x_scale)` pair, a float one with `x` only."""
+  if isinstance(proj, Krea2QuantDense):
+    return proj(x, quantized_x)
+  return proj(x)
+
+
 class Krea2SwiGLU(nn.Module):
-  """SwiGLU feed-forward with separate gate/up/down projections (no bias)."""
+  """SwiGLU feed-forward with separate gate/up/down projections (no bias).
+
+  Projections named in `quant_targets` run as W8A8 (`Krea2QuantDense`);
+  `gate_proj` and `up_proj` share one quantization of `x`.
+  """
 
   dim: int
   hidden_dim: int
   dtype: jnp.dtype = jnp.float32
   weights_dtype: jnp.dtype = jnp.float32
   precision: Optional[jax.lax.Precision] = None
+  quant_targets: Tuple[str, ...] = ()
 
   def setup(self):
-    self.gate_proj = nn.Dense(
-        self.hidden_dim,
-        use_bias=False,
-        kernel_init=nn.with_logical_partitioning(nn.initializers.lecun_normal(), ("embed", "mlp")),
-        dtype=self.dtype,
-        param_dtype=self.weights_dtype,
-        precision=self.precision,
-    )
-    self.up_proj = nn.Dense(
-        self.hidden_dim,
-        use_bias=False,
-        kernel_init=nn.with_logical_partitioning(nn.initializers.lecun_normal(), ("embed", "mlp")),
-        dtype=self.dtype,
-        param_dtype=self.weights_dtype,
-        precision=self.precision,
-    )
-    self.down_proj = nn.Dense(
-        self.dim,
-        use_bias=False,
-        kernel_init=nn.with_logical_partitioning(nn.initializers.lecun_normal(), ("mlp", "embed")),
-        dtype=self.dtype,
-        param_dtype=self.weights_dtype,
-        precision=self.precision,
-    )
+    normalize_quant_targets(self.quant_targets)  # rejects unknown names
+    proj_kwargs = dict(dtype=self.dtype, weights_dtype=self.weights_dtype, precision=self.precision)
+    self.gate_proj = _projection(self.hidden_dim, ("embed", "mlp"), "gate_proj" in self.quant_targets, **proj_kwargs)
+    self.up_proj = _projection(self.hidden_dim, ("embed", "mlp"), "up_proj" in self.quant_targets, **proj_kwargs)
+    self.down_proj = _projection(self.dim, ("mlp", "embed"), "down_proj" in self.quant_targets, **proj_kwargs)
 
   def __call__(self, x, lora_params=None):
     lora_params = lora_params or {}
+    quantized_x = None
+    if "gate_proj" in self.quant_targets or "up_proj" in self.quant_targets:
+      quantized_x = quantize_activation(x, self.dtype)
     gate = apply_explicit_lora(
-        self.gate_proj(x), x, lora_params.get("gate_proj", ()), self.dtype, self.precision
+        _apply_projection(self.gate_proj, x, quantized_x), x, lora_params.get("gate_proj", ()), self.dtype, self.precision
     )
-    up = apply_explicit_lora(self.up_proj(x), x, lora_params.get("up_proj", ()), self.dtype, self.precision)
+    up = apply_explicit_lora(
+        _apply_projection(self.up_proj, x, quantized_x), x, lora_params.get("up_proj", ()), self.dtype, self.precision
+    )
     down_input = nn.silu(gate) * up
+    quantized_down = quantize_activation(down_input, self.dtype) if "down_proj" in self.quant_targets else None
     return apply_explicit_lora(
-        self.down_proj(down_input),
+        _apply_projection(self.down_proj, down_input, quantized_down),
         down_input,
         lora_params.get("down_proj", ()),
         self.dtype,
@@ -183,7 +199,11 @@ class Krea2SwiGLU(nn.Module):
 class Krea2Attention(nn.Module):
   """Self-attention with grouped-query projections, per-head zero-centered q/k
   RMSNorm, optional rotary embeddings, and a sigmoid output gate applied to the
-  attention output before the output projection."""
+  attention output before the output projection.
+
+  Projections named in `quant_targets` run as W8A8 (`Krea2QuantDense`);
+  `to_q/to_k/to_v/to_gate` share one quantization of `hidden_states`.
+  """
 
   dim: int
   num_heads: int
@@ -200,40 +220,19 @@ class Krea2Attention(nn.Module):
   precision: Optional[jax.lax.Precision] = None
   mask_padding_tokens: bool = True
   rope_layout: str = "interleaved"
+  quant_targets: Tuple[str, ...] = ()
 
   def setup(self):
     _validate_rope_layout(self.rope_layout)
-    dense_kwargs = dict(
-        use_bias=False,
-        dtype=self.dtype,
-        param_dtype=self.weights_dtype,
-        precision=self.precision,
-    )
-    self.to_q = nn.Dense(
-        self.num_heads * self.head_dim,
-        kernel_init=nn.with_logical_partitioning(nn.initializers.lecun_normal(), ("embed", "heads")),
-        **dense_kwargs,
-    )
-    self.to_k = nn.Dense(
-        self.num_kv_heads * self.head_dim,
-        kernel_init=nn.with_logical_partitioning(nn.initializers.lecun_normal(), ("embed", "heads")),
-        **dense_kwargs,
-    )
-    self.to_v = nn.Dense(
-        self.num_kv_heads * self.head_dim,
-        kernel_init=nn.with_logical_partitioning(nn.initializers.lecun_normal(), ("embed", "heads")),
-        **dense_kwargs,
-    )
-    self.to_gate = nn.Dense(
-        self.num_heads * self.head_dim,
-        kernel_init=nn.with_logical_partitioning(nn.initializers.lecun_normal(), ("embed", "heads")),
-        **dense_kwargs,
-    )
-    self.to_out = nn.Dense(
-        self.dim,
-        kernel_init=nn.with_logical_partitioning(nn.initializers.lecun_normal(), ("heads", "embed")),
-        **dense_kwargs,
-    )
+    normalize_quant_targets(self.quant_targets)  # rejects unknown names
+    proj_kwargs = dict(dtype=self.dtype, weights_dtype=self.weights_dtype, precision=self.precision)
+    q_features = self.num_heads * self.head_dim
+    kv_features = self.num_kv_heads * self.head_dim
+    self.to_q = _projection(q_features, ("embed", "heads"), "to_q" in self.quant_targets, **proj_kwargs)
+    self.to_k = _projection(kv_features, ("embed", "heads"), "to_k" in self.quant_targets, **proj_kwargs)
+    self.to_v = _projection(kv_features, ("embed", "heads"), "to_v" in self.quant_targets, **proj_kwargs)
+    self.to_gate = _projection(q_features, ("embed", "heads"), "to_gate" in self.quant_targets, **proj_kwargs)
+    self.to_out = _projection(self.dim, ("heads", "embed"), "to_out" in self.quant_targets, **proj_kwargs)
     self.norm_q = Krea2RMSNorm(self.head_dim, eps=self.eps)
     self.norm_k = Krea2RMSNorm(self.head_dim, eps=self.eps)
 
@@ -263,22 +262,34 @@ class Krea2Attention(nn.Module):
     out = jnp.einsum("bhqk,bhkd->bhqd", probs, value.astype(jnp.float32))
     return out.astype(self.dtype)
 
+  def _gated_output_projection(self, attn_output, gate, lora_params):
+    """`to_out(attn_output * sigmoid(gate))` plus its explicit LoRA updates."""
+    attn_output = attn_output * jax.nn.sigmoid(gate)
+    quantized = quantize_activation(attn_output, self.dtype) if "to_out" in self.quant_targets else None
+    return apply_explicit_lora(
+        _apply_projection(self.to_out, attn_output, quantized),
+        attn_output,
+        lora_params.get("to_out", ()),
+        self.dtype,
+        self.precision,
+    )
+
   def __call__(self, hidden_states, attention_mask=None, image_rotary_emb=None, lora_params=None):
     batch_size, seq_len, _ = hidden_states.shape
     lora_params = lora_params or {}
 
-    query = apply_explicit_lora(
-        self.to_q(hidden_states), hidden_states, lora_params.get("to_q", ()), self.dtype, self.precision
-    ).reshape(batch_size, seq_len, self.num_heads, self.head_dim)
-    key = apply_explicit_lora(
-        self.to_k(hidden_states), hidden_states, lora_params.get("to_k", ()), self.dtype, self.precision
-    ).reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim)
-    value = apply_explicit_lora(
-        self.to_v(hidden_states), hidden_states, lora_params.get("to_v", ()), self.dtype, self.precision
-    ).reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim)
-    gate = apply_explicit_lora(
-        self.to_gate(hidden_states), hidden_states, lora_params.get("to_gate", ()), self.dtype, self.precision
-    )
+    quantized_hidden = None
+    if any(name in self.quant_targets for name in ("to_q", "to_k", "to_v", "to_gate")):
+      quantized_hidden = quantize_activation(hidden_states, self.dtype)
+
+    def project(name):
+      out = _apply_projection(getattr(self, name), hidden_states, quantized_hidden)
+      return apply_explicit_lora(out, hidden_states, lora_params.get(name, ()), self.dtype, self.precision)
+
+    query = project("to_q").reshape(batch_size, seq_len, self.num_heads, self.head_dim)
+    key = project("to_k").reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim)
+    value = project("to_v").reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim)
+    gate = project("to_gate")
 
     query = self.norm_q(query)
     key = self.norm_k(key)
@@ -306,10 +317,7 @@ class Krea2Attention(nn.Module):
       # (B, H_kv, L, D) keys/values, unscaled; the mask must be a prefix
       # key-validity mask ([image | text] with tail-padded, compacted text).
       attn_output = self.attention_op.apply_attention(query, key, value, attention_mask=mask)
-      attn_output = attn_output * jax.nn.sigmoid(gate)
-      return apply_explicit_lora(
-          self.to_out(attn_output), attn_output, lora_params.get("to_out", ()), self.dtype, self.precision
-      )
+      return self._gated_output_projection(attn_output, gate, lora_params)
 
     if self.num_kv_heads != self.num_heads:
       repeats = self.num_heads // self.num_kv_heads
@@ -328,10 +336,7 @@ class Krea2Attention(nn.Module):
       v_flat = jnp.transpose(value, (0, 2, 1, 3)).reshape(batch_size, seq_len, -1)
       attn_output = self.attention_op.apply_attention(q_flat, k_flat, v_flat, attention_mask=mask)
 
-    attn_output = attn_output * jax.nn.sigmoid(gate)
-    return apply_explicit_lora(
-        self.to_out(attn_output), attn_output, lora_params.get("to_out", ()), self.dtype, self.precision
-    )
+    return self._gated_output_projection(attn_output, gate, lora_params)
 
 
 class Krea2TextFusionBlock(nn.Module):
@@ -522,6 +527,7 @@ class Krea2TransformerBlock(nn.Module):
   precision: Optional[jax.lax.Precision] = None
   mask_padding_tokens: bool = True
   rope_layout: str = "interleaved"
+  quant_targets: Tuple[str, ...] = ()
 
   def setup(self):
     self.scale_shift_table = self.param("scale_shift_table", nn.initializers.zeros, (6, self.hidden_size), jnp.float32)
@@ -543,6 +549,7 @@ class Krea2TransformerBlock(nn.Module):
         dtype=self.dtype,
         weights_dtype=self.weights_dtype,
         precision=self.precision,
+        quant_targets=self.quant_targets,
     )
     self.ff = Krea2SwiGLU(
         dim=self.hidden_size,
@@ -550,6 +557,7 @@ class Krea2TransformerBlock(nn.Module):
         dtype=self.dtype,
         weights_dtype=self.weights_dtype,
         precision=self.precision,
+        quant_targets=self.quant_targets,
     )
 
   def __call__(self, hidden_states, temb_mod, image_rotary_emb=None, attention_mask=None, lora_params=None):
@@ -625,6 +633,11 @@ class Krea2Transformer2DModel(nn.Module, FlaxModelMixin, ConfigMixin):
   `rope_layout="rotate_half"` expects q/k projection weights permuted by
   `util.permute_rope_weights_to_rotate_half`; outputs are then identical to the
   default interleaved layout with the original weights.
+
+  `quant_targets` (see `transformer_quant.KREA2_QUANT_TARGETS`) selects the DiT
+  block projections that run as int8 W8A8 matmuls; the params must then come
+  from `transformer_quant.quantize_transformer_params`. Text fusion and the
+  input/output projections always stay float.
   """
 
   in_channels: int = 64
@@ -653,9 +666,12 @@ class Krea2Transformer2DModel(nn.Module, FlaxModelMixin, ConfigMixin):
   precision: Optional[jax.lax.Precision] = None
   mask_padding_tokens: bool = True
   rope_layout: str = "interleaved"
+  quant_targets: Tuple[str, ...] = ()
 
   def setup(self):
     _validate_rope_layout(self.rope_layout)
+    # Raises on unknown names; order and duplicates are normalized away.
+    quant_targets = normalize_quant_targets(self.quant_targets)
     if sum(self.axes_dims_rope) != self.attention_head_dim:
       raise ValueError(
           f"sum(axes_dims_rope)={sum(self.axes_dims_rope)} must equal attention_head_dim={self.attention_head_dim}"
@@ -721,6 +737,7 @@ class Krea2Transformer2DModel(nn.Module, FlaxModelMixin, ConfigMixin):
             dtype=self.dtype,
             weights_dtype=self.weights_dtype,
             precision=self.precision,
+            quant_targets=quant_targets,
         )
         for _ in range(self.num_layers)
     ]

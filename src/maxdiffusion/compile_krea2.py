@@ -40,6 +40,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from maxdiffusion import max_logging, max_utils, pyconfig
 from maxdiffusion.generate_krea2 import build_krea2_transformer, build_qwen3_config
+from maxdiffusion.models.krea2.transformer_quant import describe_transformer_quantization, resolve_transformer_quantization
 
 GIB = 1024**3
 MIB = 1024**2
@@ -367,6 +368,9 @@ def print_report(report):
   weights = report["resident_weights"]
   max_logging.log(report["text_encoder_residency"])
   max_logging.log(
+      describe_transformer_quantization(report["transformer_quantization"], report["transformer_quant_targets"])
+  )
+  max_logging.log(
       f"Component weights per chip: transformer {fmt_bytes(weights['transformer'])} + "
       f"text_encoder (qwen3) {fmt_bytes(weights['qwen3'])} + vae {fmt_bytes(weights['vae'])} = "
       f"{fmt_bytes(weights['total'])}"
@@ -441,6 +445,11 @@ def print_report(report):
         f"Analytic attention flops: {report['attention_flops'] / 1e12:.1f} TFLOP; "
         f"ideal time including them: {report['ideal_seconds_with_attention']:.2f}s"
     )
+  if report["ideal_seconds_xla"] is not None and report["transformer_quantization"]:
+    max_logging.log(
+        "Ideal compute time assumes the bf16 peak rate for every matmul, although the W8A8 int8 matmuls have a "
+        "2x higher peak on v6e."
+    )
   max_logging.log(
       "Caveats: Pallas VMEM scratch and the TPU runtime stack reservation (~0.4 GiB on v5e) are not included; "
       "expect ~5-10% runtime fragmentation on top of the peak; LoRA adapters are not included."
@@ -514,7 +523,10 @@ def main(argv):
     qwen3_model = quantize_text_encoder_model(qwen3_model, te_quant_tile_size)
   te_residency = describe_text_encoder_residency(te_quantization, te_quant_tile_size, te_embed_on_host)
   max_logging.log(te_residency)
-  transformer = build_krea2_transformer(transformer_cfg, config, mesh)
+  # int8 block kernels come straight out of the runtime model's abstract tree.
+  transformer_quantization, transformer_quant_targets = resolve_transformer_quantization(config)
+  transformer = build_krea2_transformer(transformer_cfg, config, mesh, quant_targets=transformer_quant_targets)
+  max_logging.log(describe_transformer_quantization(transformer_quantization, transformer_quant_targets))
 
   batch = config.batch_size
   height = round_up_to_multiple(config.height, 16)
@@ -812,6 +824,8 @@ def main(argv):
       "text_encoder_quant_tile_size": te_quant_tile_size if te_quantization else None,
       "text_embed_on_host": te_embed_on_host,
       "text_encoder_residency": te_residency,
+      "transformer_quantization": transformer_quantization,
+      "transformer_quant_targets": list(transformer_quant_targets),
       "attention": config.attention,
       "attention_uses_kernel": uses_kernel,
       "flash_min_seq_length": transformer.flash_min_seq_length,
@@ -843,6 +857,8 @@ def main(argv):
     suffix += f"_te-{te_quantization}"
   if te_embed_on_host:
     suffix += "_embed-host"
+  if transformer_quantization:
+    suffix += f"_tq-{transformer_quantization}"
   json_path = os.path.join(config.output_dir, f"compile_krea2_{topology}_{width}x{height}{suffix}.json")
   with open(json_path, "w") as f:
     json.dump(report, f, indent=2)
