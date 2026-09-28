@@ -70,7 +70,7 @@ Ulysses는 이미 `_ulysses_attention`(stock 커널, 마스크 지원)과 `use_c
 2. **`[image | text]` 순서**: 패딩을 꼬리로 보내 3.2-5를 성립시킨다. `finalize_output`은 `[:, :L_img]`로, rotary concat 순서도 같이 바꾼다.
 3. **프롬프트 전용 계산을 스텝 밖으로**: text_fusion + txt_in 출력, rotary cos/sin은 생성당 1회. 스텝당 ~8 ms.
 4. **QKV/gate 매트멀 병합**: `[6144, 6144+1536+1536+6144]` 하나, `gate/up`을 `[6144, 32768]` 하나로. 입력 207 MB 재읽기 4회 → 1회. 명시적 LoRA 경로는 병합 커널에 down/up을 더하는 식으로 유지.
-5. **int8 W8A8 (선택, 화질 검증 필요)**: 매트멀이 MXU 한계이므로 유일한 매트멀 가속 수단. v5e 394 TOPS, v6e 1836 TOPS. `use_qwix_quantization` 플래그가 이미 있다. (2026-09-28: 트랜스포머는 qwix 대신 저장소 내 자체 양자화로 구현, `krea2_transformer_quantization=w8a8`, 6.1 참조.) 가중치 전용 int8은 속도가 아니라 HBM 절약(v5e-4 Ulysses 성립)용이다.
+5. **int8 W8A8 (선택, 화질 검증 필요)**: 매트멀이 MXU 한계이므로 유일한 매트멀 가속 수단. v5e 394 TOPS, v6e 1836 TOPS. `use_qwix_quantization` 플래그가 이미 있다. (2026-09-28: 트랜스포머는 qwix 대신 저장소 내 자체 양자화로 구현, `krea2_transformer_quantization=w8a8`. 같은 날 v6e-1에서 화질을 확인해 v6e-1 프리셋에서만 기본 켬, 범용 설정은 기본 꺼짐. 6.1 참조.) 가중치 전용 int8은 속도가 아니라 HBM 절약(v5e-4 Ulysses 성립)용이다.
 
 ### 3.5 하지 않는 것
 
@@ -104,7 +104,7 @@ Ulysses는 이미 `_ulysses_attention`(stock 커널, 마스크 지원)과 `use_c
 | 2. `[image|text]` 순서 + 텍스트 컴팩션 버킷 | `pipelines/krea2/krea2_pipeline.py`, `transformer_krea2_flax.py`(finalize, concat) | 같은 seed/prompt로 픽셀 diff ≈ 0 (bf16 노이즈 수준) |
 | 3. 커널 확장: 마스크 없는 ragged 꼬리, gate 에필로그, `flash_custom` 레지스트리, TP head 샤딩 in_specs | `kernels/custom_splash_attention.py`, `models/attention_flax.py` | `interpret=True`로 CPU 정확도 테스트 → TPU에서 블록 크기 자동 탐색 |
 | 4. 병렬화: TP+SP 샤딩 제약 + XLA 플래그 / Ulysses 설정 프리셋, 텍스트 인코더용 별도 FSDP 메시 | `krea2_pipeline.py`, `configs/base_krea2*.yml`, `generate_krea2.py`(배치 1 자동 설정 분기, 인코더 메시) | xprof에서 all-reduce 소멸 또는 겹침 확인 |
-| 5. (선택) int8 W8A8 (2026-09-28 구현, qwix 대신 자체 양자화, 기본 꺼짐) | `models/krea2/transformer_quant.py`, `transformer_krea2_flax.py`, `generate_krea2.py`, `configs/base_krea2*.yml` | 화질 A/B (`artifacts/krea2_v10_ab` 방식) |
+| 5. (선택) int8 W8A8 (2026-09-28 구현, qwix 대신 자체 양자화; v6e-1 프리셋은 기본 켬, `base_krea2.yml`/`base_krea2_turbo.yml`은 기본 꺼짐) | `models/krea2/transformer_quant.py`, `transformer_krea2_flax.py`, `generate_krea2.py`, `configs/base_krea2*.yml` | 화질 A/B (`artifacts/krea2_v10_ab` 방식; 2026-09-28 v6e-1에서 프롬프트·시드 1개 확인) |
 
 TPU 없이는 1~3단계의 정확성(CPU/interpret)과 HBM 추정(`compile_krea2.py`)까지 확인할 수 있고, 성능 수치는 v5e-4 또는 v6e 인스턴스에서 xprof로 확정해야 한다.
 
@@ -128,7 +128,7 @@ TPU 없이는 1~3단계의 정확성(CPU/interpret)과 HBM 추정(`compile_krea2
 - 1024²에서는 매트멀이 블록 시간의 약 76%라 int8 W8A8(1836 TOPS)이 유일한 큰 레버다. 어텐션 커널과 RoPE 치환은 합쳐 15~20%.
 - 2048²에서는 어텐션이 매트멀과 비슷해진다(추정 18 vs 17 ms/블록). head_dim 128 때문에 QKᵀ가 256×256 MXU를 절반만 채우므로 커널이 도달할 상한은 67%다. bq=2048, bkv_compute=512(256 배수), exp2, bf16 P·V, f32 통계.
 
-우선순위: (1) 상주(양자화 허용 여부에 따라 int8 가중치 전용 또는 TE 스트리밍) → (2) 텍스트 컴팩션 + 프롬프트 전용 계산 호이스팅 → (3) int8 W8A8 화질 A/B → (4) 커널 + RoPE 치환. 2026-09-26 기준 (1) int8 인코더 상주, (2), (4), `flash_custom` 커널 모두 구현됨. 2026-09-28 트랜스포머 int8 W8A8 매트멀 구현(저장소 내 자체 양자화: 가중치는 로드 시 호스트에서 출력 열별 스케일, 활성값은 스텝 안에서 토큰별 동적 스케일, to_k/to_v는 bf16 유지, 기본 꺼짐, `krea2_transformer_quantization=w8a8`). HF int8 ConvRot 체크포인트는 쓰지 않기로 했다(활성값 회전 비용이 W8A8 절감분의 약 40%이고 키 레이아웃도 맞지 않음). v6e-1 매트멀 벤치 기준 예상: 1024² 1.89 s → 약 1.45 s, 트랜스포머 HBM 23.88 → 약 12.6 GiB. 남은 것: TPU에서 동일 시드 화질 A/B와 실측, 2048²용 VAE 타일 디코드.
+우선순위: (1) 상주(양자화 허용 여부에 따라 int8 가중치 전용 또는 TE 스트리밍) → (2) 텍스트 컴팩션 + 프롬프트 전용 계산 호이스팅 → (3) int8 W8A8 화질 A/B → (4) 커널 + RoPE 치환. 2026-09-26 기준 (1) int8 인코더 상주, (2), (4), `flash_custom` 커널 모두 구현됨. 2026-09-28 트랜스포머 int8 W8A8 매트멀 구현(저장소 내 자체 양자화: 가중치는 로드 시 호스트에서 출력 열별 스케일, 활성값은 스텝 안에서 토큰별 동적 스케일, to_k/to_v는 bf16 유지, `krea2_transformer_quantization=w8a8`). HF int8 ConvRot 체크포인트는 쓰지 않기로 했다(활성값 회전 비용이 W8A8 절감분의 약 40%이고 키 레이아웃도 맞지 않음). v6e-1 매트멀 벤치 기준 예상: 1024² 1.89 s → 약 1.45 s, 트랜스포머 HBM 23.88 → 약 12.6 GiB. 같은 날 v6e-1 실측(Turbo 8스텝, 워밍업 후 생성 시간): 1024² 1.88 s → 1.45 s, 2048² 11.29 s(bf16, TE 오프로드) → 9.03 s(전부 상주), 1024² 런타임 HBM 피크 28.01 → 17.19 GiB, 트랜스포머 가중치 23.88 → 13.06 GiB. 동일 시드 이미지는 세부가 다르지만(1024² PSNR 21.3 dB) 구도가 같고 아티팩트가 없어 bf16과 화질이 동등하다고 판단했다(프롬프트·시드 1개). 그래서 W8A8을 v6e-1 프리셋 `base_krea2_turbo_v6e1.yml`의 기본값으로 켰고(bf16은 `krea2_transformer_quantization=''`), 다른 하드웨어에도 쓰는 범용 `base_krea2.yml`/`base_krea2_turbo.yml`은 기본 꺼짐을 유지한다. 남은 것: staged 트랜스포머와 LoRA를 W8A8로 켠 TPU 실행 확인, 더 많은 프롬프트·시드로 화질 확인. 2048²용 VAE 타일 디코드는 W8A8 프리셋에서는 필요 없어졌고(compile_krea2 추정 피크 21.80 GiB), bf16 트랜스포머로 2048²를 전부 상주시키려 할 때만 의미가 있다.
 
 | v6e-1 | 8스텝 디노이즈 (추정) |
 |---|---|
