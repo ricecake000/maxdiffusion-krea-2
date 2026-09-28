@@ -325,22 +325,60 @@ class Krea2QuantDenseTest(unittest.TestCase):
     expected = ((x_int @ w_int) * 2.0**-3 * w_scale).astype(np.float32)
     np.testing.assert_array_equal(np.asarray(out), expected)
 
+  def test_unflatten_output_equals_flat_output(self):
+    rng = np.random.RandomState(2)
+    x = jnp.asarray(rng.randn(2, 5, 64).astype(np.float32))
+    w = (rng.randn(64, 32) * 0.2).astype(np.float32)
+    variables = self._params(w)
+    flat = Krea2QuantDense(32, kernel_axes=("embed", "mlp"))
+    quantized = quantize_activation(x, jnp.float32)
+    expected = np.asarray(flat.apply(variables, x))
+    np.testing.assert_array_equal(np.asarray(flat.apply(variables, x, quantized)), expected)
+    for unflatten in ((4, 8), (2, 2, 8)):
+      with self.subTest(unflatten=unflatten):
+        dense = Krea2QuantDense(32, kernel_axes=("embed", "mlp"), unflatten=unflatten)
+        for args in ((x,), (x, quantized)):
+          out = dense.apply(variables, *args)
+          self.assertEqual(out.shape, (2, 5, 32))
+          self.assertEqual(out.dtype, jnp.float32)
+          np.testing.assert_array_equal(np.asarray(out), expected)
+
+  def test_empty_or_trivial_unflatten_equals_flat_output(self):
+    rng = np.random.RandomState(3)
+    for features, inputs_shape, unflatten in ((1, (2, 3), ()), (1, (2, 3), (1,)), (32, (2, 5, 64), ())):
+      with self.subTest(features=features, unflatten=unflatten):
+        x = jnp.asarray(rng.randn(*inputs_shape).astype(np.float32))
+        variables = self._params((rng.randn(inputs_shape[-1], features) * 0.2).astype(np.float32))
+        expected = np.asarray(Krea2QuantDense(features, kernel_axes=("embed", "mlp")).apply(variables, x))
+        out = np.asarray(Krea2QuantDense(features, kernel_axes=("embed", "mlp"), unflatten=unflatten).apply(variables, x))
+        self.assertEqual(out.shape, inputs_shape[:-1] + (features,))
+        np.testing.assert_array_equal(out, expected)
+
+  def test_unflatten_must_match_features(self):
+    dense = Krea2QuantDense(32, kernel_axes=("embed", "mlp"), unflatten=(4, 7))
+    variables = self._params(np.ones((16, 32), np.float32))
+    with self.assertRaisesRegex(ValueError, r"unflatten=\(4, 7\).*features=32"):
+      dense.apply(variables, jnp.ones((1, 2, 16), jnp.float32))
+
   def test_float16_rescale_does_not_overflow(self):
     # int32 accumulator 1024 * 127 * 127 = 16516096 exceeds the float16 max (65504),
     # so casting it to float16 before the rescale would give inf.
     self.assertTrue(np.isinf(np.float16(1024 * 127 * 127)))
-    dense = Krea2QuantDense(4, kernel_axes=("embed", "mlp"), dtype=jnp.float16)
-    kernel_scale = np.full((4,), 2.0**-9, np.float32)
-    variables = {"params": {"kernel": jnp.full((1024, 4), 127, jnp.int8), "kernel_scale": jnp.asarray(kernel_scale)}}
-    x = jnp.ones((1, 2, 1024), jnp.float16)
-    out = np.asarray(dense.apply(variables, x))
-    self.assertEqual(out.dtype, np.float16)
-    self.assertTrue(np.all(np.isfinite(out)))
-    # x_scale is 1/127 rounded to float16; the true product is 1024 * 127 * 2**-9 = 254.
-    x_scale = float(np.float16(1.0 / 127))
-    expected = 1024 * 127 * 127 * x_scale * 2.0**-9
-    np.testing.assert_allclose(out.astype(np.float64), expected, rtol=2**-10)
-    np.testing.assert_allclose(out.astype(np.float64), 254.0, rtol=2e-3)
+    for unflatten in (None, (2, 2)):
+      with self.subTest(unflatten=unflatten):
+        dense = Krea2QuantDense(4, kernel_axes=("embed", "mlp"), dtype=jnp.float16, unflatten=unflatten)
+        kernel_scale = np.full((4,), 2.0**-9, np.float32)
+        variables = {"params": {"kernel": jnp.full((1024, 4), 127, jnp.int8), "kernel_scale": jnp.asarray(kernel_scale)}}
+        x = jnp.ones((1, 2, 1024), jnp.float16)
+        out = np.asarray(dense.apply(variables, x))
+        self.assertEqual(out.dtype, np.float16)
+        self.assertEqual(out.shape, (1, 2, 4))
+        self.assertTrue(np.all(np.isfinite(out)))
+        # x_scale is 1/127 rounded to float16; the true product is 1024 * 127 * 2**-9 = 254.
+        x_scale = float(np.float16(1.0 / 127))
+        expected = 1024 * 127 * 127 * x_scale * 2.0**-9
+        np.testing.assert_allclose(out.astype(np.float64), expected, rtol=2**-10)
+        np.testing.assert_allclose(out.astype(np.float64), 254.0, rtol=2e-3)
 
   def test_rescale_dtype_in_lowered_hlo(self):
     # Lowering only (no bf16/f16 execution); explicit quantized_inputs keep the activation
@@ -362,6 +400,28 @@ class Krea2QuantDenseTest(unittest.TestCase):
     f16 = lowered(jnp.float16)
     self.assertEqual(multiply.findall(f16), ["f32", "f32"])
     self.assertEqual(len(re.findall(r"-> tensor<1x3x24xf16>", f16)), 1)
+
+  def test_unflatten_rescales_in_head_layout_in_lowered_hlo(self):
+    # Lowering only (no bf16 execution): the int32 accumulator is reshaped to the head layout
+    # before the rescale, so a caller's reshape to heads can fold into the matmul.
+    dtype = jnp.bfloat16
+    dense = Krea2QuantDense(32, kernel_axes=("embed", "mlp"), dtype=dtype, param_dtype=dtype, unflatten=(4, 8))
+    params = {"kernel": jax.ShapeDtypeStruct((64, 32), jnp.int8), "kernel_scale": jax.ShapeDtypeStruct((32,), dtype)}
+    x = jax.ShapeDtypeStruct((1, 3, 64), dtype)
+    quantized = (jax.ShapeDtypeStruct((1, 3, 64), jnp.int8), jax.ShapeDtypeStruct((1, 3, 1), dtype))
+    hlo = jax.jit(lambda p, x, q: dense.apply({"params": p}, x, q)).lower(params, x, quantized).as_text()
+    lines = hlo.splitlines()
+
+    def first_line(pattern):
+      return next(i for i, line in enumerate(lines) if re.search(pattern, line))
+
+    dot = re.search(r"(%\w+) = stablehlo\.dot_general .* -> tensor<1x3x32xi32>", hlo)
+    self.assertIsNotNone(dot, hlo)
+    reshape = first_line(re.escape(f"stablehlo.reshape {dot.group(1)} : (tensor<1x3x32xi32>) -> tensor<1x3x4x8xi32>"))
+    self.assertLess(reshape, first_line(r"stablehlo\.multiply"))
+    self.assertEqual(re.findall(r"stablehlo\.multiply .*: tensor<([0-9x]+\w+)>", hlo), ["1x3x4x8xbf16"] * 2)
+    self.assertRegex(hlo, r"return %\w+ : tensor<1x3x32xbf16>")
+    self.assertNotIn("tensor<1x3x32xf32>", hlo)
 
   def test_init_and_int8_dot_general(self):
     dense = Krea2QuantDense(24, kernel_axes=("embed", "mlp"), param_dtype=jnp.float32)
@@ -448,6 +508,48 @@ class QuantizedModelTreeTest(unittest.TestCase):
     self.assertEqual(set(default), set(empty))
     for path, leaf in default.items():
       self.assertEqual((leaf.shape, leaf.dtype), (empty[path].shape, empty[path].dtype))
+
+  def test_qkv_projections_rescale_in_head_layout(self):
+    inputs = _inputs()
+    model = _tiny_model(quant_targets=KREA2_QUANT_TARGETS)
+    bound = model.bind({"params": model.init(jax.random.PRNGKey(0), *inputs)["params"]})
+    layouts = {
+        "to_q": (_HEADS, _HEAD_DIM),
+        "to_k": (_KV_HEADS, _HEAD_DIM),
+        "to_v": (_KV_HEADS, _HEAD_DIM),
+        "to_gate": None,
+        "to_out": None,
+    }
+    for i in range(model.num_layers):
+      for group, names in (("attn", _ATTN_TARGETS), ("ff", _FF_TARGETS)):
+        for name in names:
+          proj = getattr(getattr(bound.blocks[i], group), name)
+          self.assertIsInstance(proj, Krea2QuantDense)
+          self.assertEqual(proj.unflatten, layouts.get(name), (i, name))
+
+  def test_head_layout_keeps_param_tree_and_output(self):
+    inputs = _inputs()
+    model = _tiny_model(quant_targets=KREA2_QUANT_TARGETS)
+    real = transformer_krea2_flax._projection
+
+    def flat_projection(*args, unflatten=None, **kwargs):
+      del unflatten
+      return real(*args, **kwargs)
+
+    tree = _flat(self._abstract(model, inputs))
+    params = quantize_transformer_params(_float_params(inputs), KREA2_QUANT_TARGETS, np.float32)
+    actual = model.apply({"params": params}, *inputs).sample
+    with mock.patch.object(transformer_krea2_flax, "_projection", flat_projection):
+      flat_tree = _flat(self._abstract(model, inputs))
+      expected = model.apply({"params": params}, *inputs).sample
+    self.assertEqual(set(tree), set(flat_tree))
+    for path, leaf in tree.items():
+      self.assertEqual((leaf.shape, leaf.dtype), (flat_tree[path].shape, flat_tree[path].dtype), path)
+    for name, features in (("to_q", _HEADS * _HEAD_DIM), ("to_k", _KV_HEADS * _HEAD_DIM), ("to_v", _KV_HEADS * _HEAD_DIM)):
+      prefix = ("blocks_0", "attn", name)
+      self.assertEqual((tree[prefix + ("kernel",)].shape, tree[prefix + ("kernel",)].dtype), ((_HIDDEN, features), jnp.int8))
+      self.assertEqual(tree[prefix + ("kernel_scale",)].shape, (features,))
+    np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
 
   def test_unknown_target_is_rejected(self):
     with self.assertRaisesRegex(ValueError, "projector"):

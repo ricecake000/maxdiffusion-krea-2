@@ -23,6 +23,7 @@ limitations under the License.
 # Only `blocks_*` projections are ever quantized; everything else stays float.
 # This module must not import `transformer_krea2_flax` (which imports it).
 
+import math
 import os
 import re
 import time
@@ -43,6 +44,8 @@ KREA2_QUANT_ATTN_TARGETS = ("to_q", "to_k", "to_v", "to_gate", "to_out")
 KREA2_QUANT_FF_TARGETS = ("gate_proj", "up_proj", "down_proj")
 KREA2_QUANT_TARGETS = KREA2_QUANT_ATTN_TARGETS + KREA2_QUANT_FF_TARGETS
 KREA2_DEFAULT_QUANT_TARGETS = ("to_q", "to_gate", "to_out", "gate_proj", "up_proj", "down_proj")
+# Bump when the traced W8A8 graph changes; it is part of the AOT cache key, so this invalidates cached executables.
+KREA2_TRANSFORMER_QUANT_REVISION = 2
 
 _BLOCK_KEY = re.compile(r"blocks_\d+")
 _GIB = 1024**3
@@ -128,6 +131,10 @@ class Krea2QuantDense(nn.Module):
   Krea 2 LoRA interceptor can build its layer from this module; `param_dtype`
   is the float dtype of `kernel_scale` (the kernel itself is always int8) and
   `precision` only matters to that LoRA layer (the integer matmul is exact).
+
+  `unflatten` is the feature layout the caller reshapes the output to (e.g.
+  `(num_heads, head_dim)`); the rescale then runs in that layout so the matmul
+  can emit it directly. The output is still `(..., features)`.
   """
 
   features: int
@@ -135,6 +142,7 @@ class Krea2QuantDense(nn.Module):
   dtype: jnp.dtype = jnp.float32
   param_dtype: jnp.dtype = jnp.float32
   precision: Optional[jax.lax.Precision] = None
+  unflatten: Optional[Tuple[int, ...]] = None
 
   @nn.compact
   def __call__(self, inputs, quantized_inputs=None):
@@ -159,8 +167,19 @@ class Krea2QuantDense(nn.Module):
     # Trace-time decision on static shapes/dtypes.
     max_acc = 127 * 127 * inputs.shape[-1]
     rescale_dtype = self.dtype if float(jnp.finfo(self.dtype).max) > max_acc else jnp.float32
+    if not self.unflatten:  # None or () (no layout)
+      out =acc.astype(rescale_dtype) * x_scale.astype(rescale_dtype) * kernel_scale.astype(rescale_dtype)
+      return out.astype(self.dtype)
+    # Same arithmetic in the caller's layout, so its reshape folds into the matmul instead of
+    # following a flat rescaled tensor; the final reshape cancels against the caller's.
+    layout = tuple(self.unflatten)
+    if math.prod(layout) != self.features:
+      raise ValueError(f"unflatten={layout} has {math.prod(layout)} elements, but features={self.features}.")
+    acc = acc.reshape(acc.shape[:-1] + layout)
+    x_scale = x_scale.reshape(x_scale.shape + (1,) * (len(layout) - 1))
+    kernel_scale = kernel_scale.reshape(layout)
     out = acc.astype(rescale_dtype) * x_scale.astype(rescale_dtype) * kernel_scale.astype(rescale_dtype)
-    return out.astype(self.dtype)
+    return out.astype(self.dtype).reshape(out.shape[: -len(layout)] + (self.features,))
 
 
 def quantize_kernel(kernel, scale_dtype):

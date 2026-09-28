@@ -194,10 +194,14 @@ def transformer_quantization_aot_meta(mode, targets) -> dict:
 
   The key is present only when quantization is on, so the fingerprint of an
   unquantized setup (and its existing cached executables) stays unchanged.
+  The value carries `KREA2_TRANSFORMER_QUANT_REVISION`, so a changed W8A8 graph
+  misses executables cached for the previous one.
   """
+  from maxdiffusion.models.krea2.transformer_quant import KREA2_TRANSFORMER_QUANT_REVISION
+
   if not mode:
     return {}
-  return {"krea2_transformer_quantization": f"{mode}:{','.join(targets)}"}
+  return {"krea2_transformer_quantization": f"{mode}:{','.join(targets)}:r{KREA2_TRANSFORMER_QUANT_REVISION}"}
 
 
 def main(argv):

@@ -130,11 +130,19 @@ def apply_explicit_lora(output, inputs, adapters=(), dtype=jnp.float32, precisio
   return output
 
 
-def _projection(features, kernel_axes, quantized, dtype, weights_dtype, precision):
-  """A bias-free block projection: `Krea2QuantDense` (W8A8) when `quantized`, else `nn.Dense`."""
+def _projection(features, kernel_axes, quantized, dtype, weights_dtype, precision, unflatten=None):
+  """A bias-free block projection: `Krea2QuantDense` (W8A8) when `quantized`, else `nn.Dense`.
+
+  `unflatten` is the caller's output layout (see `Krea2QuantDense`); `nn.Dense` ignores it.
+  """
   if quantized:
     return Krea2QuantDense(
-        features, kernel_axes=kernel_axes, dtype=dtype, param_dtype=weights_dtype, precision=precision
+        features,
+        kernel_axes=kernel_axes,
+        dtype=dtype,
+        param_dtype=weights_dtype,
+        precision=precision,
+        unflatten=unflatten,
     )
   return nn.Dense(
       features,
@@ -228,9 +236,18 @@ class Krea2Attention(nn.Module):
     proj_kwargs = dict(dtype=self.dtype, weights_dtype=self.weights_dtype, precision=self.precision)
     q_features = self.num_heads * self.head_dim
     kv_features = self.num_kv_heads * self.head_dim
-    self.to_q = _projection(q_features, ("embed", "heads"), "to_q" in self.quant_targets, **proj_kwargs)
-    self.to_k = _projection(kv_features, ("embed", "heads"), "to_k" in self.quant_targets, **proj_kwargs)
-    self.to_v = _projection(kv_features, ("embed", "heads"), "to_v" in self.quant_targets, **proj_kwargs)
+    # q/k/v are reshaped to heads right after the projection; W8A8 rescales in that layout.
+    q_layout = (self.num_heads, self.head_dim)
+    kv_layout = (self.num_kv_heads, self.head_dim)
+    self.to_q = _projection(
+        q_features, ("embed", "heads"), "to_q" in self.quant_targets, unflatten=q_layout, **proj_kwargs
+    )
+    self.to_k = _projection(
+        kv_features, ("embed", "heads"), "to_k" in self.quant_targets, unflatten=kv_layout, **proj_kwargs
+    )
+    self.to_v = _projection(
+        kv_features, ("embed", "heads"), "to_v" in self.quant_targets, unflatten=kv_layout, **proj_kwargs
+    )
     self.to_gate = _projection(q_features, ("embed", "heads"), "to_gate" in self.quant_targets, **proj_kwargs)
     self.to_out = _projection(self.dim, ("heads", "embed"), "to_out" in self.quant_targets, **proj_kwargs)
     self.norm_q = Krea2RMSNorm(self.head_dim, eps=self.eps)

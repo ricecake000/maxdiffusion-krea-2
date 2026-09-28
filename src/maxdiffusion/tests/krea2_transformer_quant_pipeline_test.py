@@ -39,6 +39,7 @@ from maxdiffusion.models.krea2.lora_util import convert_krea2_lora_to_flax
 from maxdiffusion.models.krea2.transformer_krea2_flax import Krea2Transformer2DModel
 from maxdiffusion.models.krea2.transformer_quant import (
     KREA2_DEFAULT_QUANT_TARGETS,
+    KREA2_TRANSFORMER_QUANT_REVISION,
     check_transformer_param_tree,
     quantize_transformer_params,
 )
@@ -363,14 +364,15 @@ class TransformerQuantizationAotMetaTest(unittest.TestCase):
     self.assertEqual(transformer_quantization_aot_meta("", ()), {})
     self.assertEqual(transformer_quantization_aot_meta("", ("to_q",)), {})
 
-  def test_on_records_mode_and_targets(self):
+  def test_on_records_mode_targets_and_revision(self):
+    revision = f"r{KREA2_TRANSFORMER_QUANT_REVISION}"
     self.assertEqual(
         transformer_quantization_aot_meta("w8a8", _TARGETS),
-        {"krea2_transformer_quantization": "w8a8:to_q,to_gate,to_out,gate_proj,up_proj,down_proj"},
+        {"krea2_transformer_quantization": f"w8a8:to_q,to_gate,to_out,gate_proj,up_proj,down_proj:{revision}"},
     )
     self.assertEqual(
         transformer_quantization_aot_meta("w8a8", ("to_k", "up_proj")),
-        {"krea2_transformer_quantization": "w8a8:to_k,up_proj"},
+        {"krea2_transformer_quantization": f"w8a8:to_k,up_proj:{revision}"},
     )
 
 
