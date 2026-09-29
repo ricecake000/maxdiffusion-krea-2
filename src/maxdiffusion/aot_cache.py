@@ -42,6 +42,11 @@ minus the torch interop):
     the adapter donates (``donate_argnums=(0,)``), so the donation is baked
     into the serialized executable. Fns without donation keep the original
     single-list adapter, so their on-disk executables are unchanged.
+  * ``install(..., lazy_load=True)`` starts no background loads: a
+    signature's file is deserialized on its first call instead (one
+    ``os.path.exists`` per shape, one attempt per install), so a cache
+    holding many shapes does not load all of them for a run that calls
+    only a few.
 
 Usage::
 
@@ -127,7 +132,11 @@ class _AotEntry:
     self._pending: dict[str, tuple] = {}
     self._adapters: dict[str, Any] = {}
     self._on_disk: set[str] = set()
+    # Signatures a lazy install already tried to load (hit, miss or failure).
+    self._lazy_tried: set[str] = set()
     self._lock = threading.Lock()
+    # Serializes lazy loads of this fn; never taken on the fast path.
+    self._lazy_lock = threading.Lock()
 
   def _zeros_output(self, signature: str):
     """Builds all-zero outputs matching a compiled signature's out specs.
@@ -239,6 +248,8 @@ class _AotEntry:
       # and tracers must not be recorded -- inline like a nested jit.
       return self.jitted(**dynamic, **static)
     signature = _dynamic_signature((), {**dynamic, **static})
+    if _STATE.lazy_load and signature not in self._compiled:
+      self._lazy_load(signature)
     if _STATE.warmup_only:
       # Compilation only needs avals; skip the (possibly seconds-long)
       # real execution and hand back correctly-shaped/sharded zeros so
@@ -314,26 +325,70 @@ class _AotEntry:
   def _path_for(self, signature: str) -> str:
     return os.path.join(_STATE.cache_dir, f"{self.name}-{_STATE.fingerprint}-{signature}.aotx")
 
-  def load_from_disk(self) -> None:
-    """Deserializes every on-disk executable for this fn. Never raises."""
-    pattern = os.path.join(_STATE.cache_dir, f"{self.name}-{_STATE.fingerprint}-*.aotx")
-    for path in glob.glob(pattern):
-      try:
-        with open(path, "rb") as f:
-          blob = pickle.load(f)
-        if blob["format_version"] != _FORMAT_VERSION:
-          continue
-        # Topology-pinned device order; the default reconstruction binds
-        # logical slots to the wrong physical chips and aborts in C++.
-        execution_devices = list(_STATE.mesh.devices.flatten()) if _STATE.mesh is not None else None
-        compiled = serialize_executable.deserialize_and_load(
-            blob["payload"],
-            blob["in_tree"],
-            blob["out_tree"],
-            execution_devices=execution_devices,
+  def _lazy_load(self, signature: str) -> None:
+    """Loads one signature's executable on its first call after a lazy install.
+
+    Tried at most once per install: a missing file then costs a single
+    ``os.path.exists`` and a corrupt file is not re-read on every call. The
+    flip side is that a file another process saves later in this install is
+    not picked up by this process until the next install().
+
+    ``_lazy_lock`` is held for the whole check-and-load, so concurrent first
+    calls of a signature wait for the one load instead of falling back to
+    jit (or compiling in warmup mode). It is always taken before ``_lock``;
+    install() takes only ``_lock``, so the two cannot deadlock.
+    """
+    # Generation first: if install() runs between these reads, the stale
+    # generation makes the load drop its result instead of registering an
+    # executable of the old dir/fingerprint/mesh into the new install.
+    generation = _STATE.generation
+    mesh = _STATE.mesh
+    path = self._path_for(signature)
+    with self._lazy_lock:
+      with self._lock:
+        if generation != _STATE.generation or signature in self._compiled or signature in self._lazy_tried:
+          return
+        self._lazy_tried.add(signature)
+      if os.path.exists(path):
+        self._load_path(path, generation, mesh, expected_signature=signature)
+
+  def _load_path(self, path: str, generation: int, mesh: Any, expected_signature: str | None = None) -> bool:
+    """Deserializes one on-disk executable. Returns whether it was loaded. Never raises.
+
+    ``generation`` and ``mesh`` are the install state captured by the caller
+    before the file is read; the result is registered only while that
+    install is still the current one.
+    """
+    try:
+      with open(path, "rb") as f:
+        blob = pickle.load(f)
+      if blob["format_version"] != _FORMAT_VERSION:
+        return False
+      signature = blob["dynamic_signature"]
+      if expected_signature is not None and signature != expected_signature:
+        # A renamed or copied file: registering it under the requested
+        # signature would run an executable built for other inputs.
+        max_logging.log(
+            f"[aot] {self.name}: {os.path.basename(path)} holds signature {signature}, "
+            f"expected {expected_signature}; will re-jit"
         )
-        signature = blob["dynamic_signature"]
-        with self._lock:
+        return False
+      # Topology-pinned device order; the default reconstruction binds
+      # logical slots to the wrong physical chips and aborts in C++.
+      execution_devices = list(mesh.devices.flatten()) if mesh is not None else None
+      compiled = serialize_executable.deserialize_and_load(
+          blob["payload"],
+          blob["in_tree"],
+          blob["out_tree"],
+          execution_devices=execution_devices,
+      )
+      with self._lock:
+        if generation != _STATE.generation:
+          # install() ran while this file was being read and already
+          # cleared the entry; registering now would leak into the new one.
+          stale = True
+        else:
+          stale = False
           self._compiled[signature] = compiled
           self._on_disk.add(signature)
           if "out_shapes_dtypes" in blob:
@@ -343,9 +398,24 @@ class _AotEntry:
                 [(tuple(shape), jnp.dtype(dtype)) for shape, dtype in blob["out_shapes_dtypes"]],
                 jax.tree_util.tree_leaves(compiled.output_shardings),
             )
-        max_logging.log(f"[aot] {self.name}: loaded {os.path.basename(path)} ({len(blob['payload']) / 1e6:.1f}MB)")
-      except Exception as e:  # noqa: BLE001 - fall back to jit for this shape
-        max_logging.log(f"[aot] {self.name}: load failed for {os.path.basename(path)} ({e}); will re-jit")
+      if stale:
+        max_logging.log(f"[aot] {self.name}: dropped {os.path.basename(path)}; it belongs to a previous install")
+        return False
+      max_logging.log(f"[aot] {self.name}: loaded {os.path.basename(path)} ({len(blob['payload']) / 1e6:.1f}MB)")
+      return True
+    except Exception as e:  # noqa: BLE001 - fall back to jit for this shape
+      max_logging.log(f"[aot] {self.name}: load failed for {os.path.basename(path)} ({e}); will re-jit")
+      return False
+
+  def load_from_disk(self) -> None:
+    """Deserializes every on-disk executable for this fn. Never raises."""
+    # Captured before any file is read (generation first, see _lazy_load),
+    # so a thread still running after a later install() drops its results.
+    generation = _STATE.generation
+    mesh = _STATE.mesh
+    pattern = os.path.join(_STATE.cache_dir, f"{self.name}-{_STATE.fingerprint}-*.aotx")
+    for path in glob.glob(pattern):
+      self._load_path(path, generation, mesh)
 
   def save_pending(self) -> int:
     """Lowers + serializes every recorded signature. Returns count saved."""
@@ -400,6 +470,9 @@ class _State:
     self.fingerprint = ""
     self.mesh = None
     self.warmup_only = False
+    self.lazy_load = False
+    # Bumped by every install(); loads started under an older one drop their results.
+    self.generation = 0
 
 
 _STATE = _State()
@@ -429,8 +502,16 @@ def cached_jit(fn: Callable, static_argnames: tuple = (), donate_argnames: tuple
   return entry
 
 
-def install(cache_dir: str, meta: dict[str, Any], mesh: Any) -> None:
+def install(cache_dir: str, meta: dict[str, Any], mesh: Any, lazy_load: bool = False) -> None:
   """Enables the AOT cache and starts background deserialization.
+
+  With ``lazy_load`` nothing is deserialized here; each signature's file
+  is loaded on the first call of that signature instead. Use it when the
+  cache holds many more shapes than one run calls. Every install sets the
+  mode, so a later eager install turns lazy loading off again.
+
+  Loads still running from an earlier install drop their results, but
+  ``save_pending()`` is not guarded: do not install while it runs.
 
   Args:
     cache_dir: Directory for .aotx files (created if missing).
@@ -439,6 +520,7 @@ def install(cache_dir: str, meta: dict[str, Any], mesh: Any) -> None:
       Hashed into the filename so incompatible executables never load.
     mesh: The pipeline mesh; pins device order for deserialization and
       provides the context for re-lowering at save time.
+    lazy_load: Load executables on first use instead of all at install.
   """
   if not cache_dir:
     return
@@ -446,7 +528,12 @@ def install(cache_dir: str, meta: dict[str, Any], mesh: Any) -> None:
   _STATE.cache_dir = cache_dir
   _STATE.fingerprint = hashlib.sha256(repr(sorted(meta.items())).encode()).hexdigest()[:12]
   _STATE.mesh = mesh
+  _STATE.lazy_load = bool(lazy_load)
   _STATE.enabled = True
+  # Bumped after the fields above and before the entries are cleared: a load
+  # that sees the new generation also sees the new dir/mesh, and a load that
+  # registered under the old one is wiped by the clear below.
+  _STATE.generation += 1
   for entry in _REGISTRY:
     with entry._lock:
       # Cached state belongs to the previous install's dir/fingerprint.
@@ -455,6 +542,9 @@ def install(cache_dir: str, meta: dict[str, Any], mesh: Any) -> None:
       entry._pending.clear()
       entry._adapters.clear()
       entry._on_disk.clear()
+      entry._lazy_tried.clear()
+    if lazy_load:
+      continue
     thread = threading.Thread(target=entry.load_from_disk, name=f"aot-load-{entry.name}", daemon=True)
     thread.start()
     _LOAD_THREADS.append(thread)

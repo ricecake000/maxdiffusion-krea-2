@@ -130,23 +130,29 @@ KREA2_TEXT_CONTEXT_KEYS = ("text_fusion", "txt_in")
 KREA2_PRELUDE_KEYS = ("img_in", "time_embed", "time_mod_proj")
 
 
-def compact_text_embeddings(prompt_embeds, mask, multiple):
+def compact_text_embeddings(prompt_embeds, mask, multiple, min_tokens=0):
   """Moves valid text tokens to the front of each row and truncates to a bucket.
 
   The Krea 2 template pads mid-sequence (`[prompt | PAD | suffix]`). This
   stably gathers the valid tokens of every row to the front, then truncates the
   sequence to `round_up_to_multiple(max valid count over the batch, multiple)`
   (clipped to the input length), so the returned mask is a prefix mask.
+  `min_tokens` forces a bucket of at least `round_up_to_multiple(min_tokens,
+  multiple)` (same clipping), so a precompile pass can build the executable of
+  a longer text bucket from a short prompt.
 
   Exactness: text rotary ids are all zero and the text-fusion refiner blocks
   carry no positional information, so reordering text tokens leaves every
   valid token's output unchanged; padded tokens are masked out as keys and
-  their query rows are never read (only image tokens are decoded).
+  their query rows are never read (only image tokens are decoded). The extra
+  positions of a forced bucket are ordinary padded (masked) tokens, so the
+  same argument holds for them.
 
   Args:
     prompt_embeds: `(B, S, num_text_layers, text_hidden_dim)` embeddings.
     mask: `(B, S)` validity mask (True/1 = valid).
     multiple: bucket granularity (> 0).
+    min_tokens: smallest bucket to return (>= 0; 0 = no minimum).
 
   Returns:
     `(prompt_embeds[:, :bucket], mask[:, :bucket])` with the valid tokens first.
@@ -154,10 +160,13 @@ def compact_text_embeddings(prompt_embeds, mask, multiple):
   """
   if multiple <= 0:
     raise ValueError(f"compact_text_embeddings needs a positive multiple, got {multiple}.")
+  if min_tokens < 0:
+    raise ValueError(f"compact_text_embeddings needs min_tokens >= 0, got {min_tokens}.")
   mask_np = np.asarray(mask).astype(bool)
   seq_len = mask_np.shape[1]
   max_valid = int(mask_np.sum(axis=1).max()) if mask_np.size else 0
-  bucket = min(round_up_to_multiple(max(max_valid, 1), multiple), seq_len)
+  bucket = max(round_up_to_multiple(max(max_valid, 1), multiple), round_up_to_multiple(min_tokens, multiple))
+  bucket = min(bucket, seq_len)
   order = np.argsort(~mask_np, axis=1, kind="stable")[:, :bucket]
   compact_mask = np.take_along_axis(mask_np, order, axis=1)
   index = jnp.asarray(order.astype(np.int32))[:, :, None, None]
@@ -526,7 +535,12 @@ class FlaxKrea2Pipeline:
       output_name: str = "krea2_generated_image.png",
       save_outputs: bool = True,
       do_classifier_free_guidance: Optional[bool] = None,
+      min_text_tokens: int = 0,
   ):
+    """`min_text_tokens` forces the compacted text bucket to at least this many
+    tokens (rounded up to the compaction multiple, clipped to the text length)
+    for the prompt and the negative prompt, so the precompile mode can compile
+    longer text buckets from one short prompt. No effect without compaction."""
     self._setup_jit_functions()
 
     if isinstance(prompt, str):
@@ -618,20 +632,33 @@ class FlaxKrea2Pipeline:
       compaction_multiple = self.text_compaction_multiple
       if compaction_multiple > 0:
         full_len = prompt_embeds.shape[1]
+        # Only a forced minimum is passed, so the regular call (and anything
+        # that wraps compact_text_embeddings) stays exactly as before.
+        min_kwargs = {"min_tokens": min_text_tokens} if min_text_tokens > 0 else {}
         prompt_embeds, prompt_embeds_mask = compact_text_embeddings(
-            prompt_embeds, prompt_embeds_mask, compaction_multiple
+            prompt_embeds, prompt_embeds_mask, compaction_multiple, **min_kwargs
         )
         buckets = f"prompt {prompt_embeds.shape[1]}"
         if do_classifier_free_guidance:
           negative_prompt_embeds, negative_prompt_embeds_mask = compact_text_embeddings(
-              negative_prompt_embeds, negative_prompt_embeds_mask, compaction_multiple
+              negative_prompt_embeds, negative_prompt_embeds_mask, compaction_multiple, **min_kwargs
           )
           buckets += f", negative prompt {negative_prompt_embeds.shape[1]}"
+        forced = f", forced minimum {min_text_tokens}" if min_text_tokens > 0 else ""
         max_logging.log(
-            f"Text compaction (multiple {compaction_multiple}): text length {full_len} -> {buckets} tokens"
+            f"Text compaction (multiple {compaction_multiple}{forced}): text length {full_len} -> {buckets} tokens"
         )
+      elif min_text_tokens > 0:
+        max_logging.log(
+            f"min_text_tokens={min_text_tokens} has no effect without text compaction: "
+            f"the text length is always {prompt_embeds.shape[1]}."
+        )
+      # Text lengths the denoise executables are built for (not timings): the
+      # precompile mode checks them against the bucket it asked for.
+      trace["text_tokens"] = int(prompt_embeds.shape[1])
       txt_ids_val = prepare_krea2_text_ids(batch_size, prompt_embeds.shape[1])
       if do_classifier_free_guidance:
+        trace["negative_text_tokens"] = int(negative_prompt_embeds.shape[1])
         negative_txt_ids_val = prepare_krea2_text_ids(batch_size, negative_prompt_embeds.shape[1])
 
       if offload_text_encoder:

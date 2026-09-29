@@ -15,8 +15,12 @@ limitations under the License.
 """
 
 # CPU tests for Krea 2 HBM residency options: donated staged residual stream
-# and per-phase placement of offloaded component weights.
+# and per-phase placement of offloaded component weights; text compaction and
+# the precompile -> lazy-load round trip of the AOT cache.
 
+import glob
+import os
+import tempfile
 import types
 import unittest
 from unittest import mock
@@ -27,6 +31,8 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from maxdiffusion import aot_cache, generate_krea2
+from maxdiffusion.models.krea2.resolution_presets import Krea2Resolution
 from maxdiffusion.models.krea2.transformer_krea2_flax import Krea2Transformer2DModel
 from maxdiffusion.models.krea2.util import prepare_krea2_image_ids, prepare_krea2_text_ids
 from maxdiffusion.schedulers.scheduling_flow_match_flax import FlaxFlowMatchScheduler
@@ -352,7 +358,7 @@ class Krea2OffloadCallTest(unittest.TestCase):
     self.prompt_embeds = prompt_embeds
     self.text_mask = text_mask
 
-  def _run(self, offload_components, text_mask=None, transformer=None, **config_overrides):
+  def _run(self, offload_components, text_mask=None, transformer=None, call_kwargs=None, **config_overrides):
     sharding = NamedSharding(_mesh(), P())
     shardings = {
         "transformer": jax.tree_util.tree_map(lambda _: sharding, self.host_params),
@@ -416,6 +422,7 @@ class Krea2OffloadCallTest(unittest.TestCase):
           do_classifier_free_guidance=True,
           latents=self.latents,
           save_outputs=False,
+          **(call_kwargs or {}),
       )
     return trace, seen
 
@@ -450,6 +457,58 @@ class Krea2OffloadCallTest(unittest.TestCase):
     )
     np.testing.assert_allclose(compact_seen["latents_5d"], plain_seen["latents_5d"], rtol=1e-5, atol=1e-5)
 
+  def test_compact_text_embeddings_min_tokens(self):
+    # Mid-sequence padding; the batch's largest valid count is 3 (row 1).
+    mask = np.array(
+        [
+            [True, False, False, True, False, False, False],
+            [False, True, True, False, True, False, False],
+        ]
+    )
+    embeds = jnp.arange(2 * 7, dtype=jnp.float32).reshape(2, 7, 1, 1)
+    compact = krea2_pipeline.compact_text_embeddings
+
+    def bucket(**kwargs):
+      return compact(embeds, mask, 2, **kwargs)[1].shape[1]
+
+    self.assertEqual(bucket(), 4)  # round_up(3, 2)
+    self.assertEqual(bucket(min_tokens=0), 4)
+    self.assertEqual(bucket(min_tokens=1), 4)  # below the valid count: no effect
+    self.assertEqual(bucket(min_tokens=5), 6)  # a non-multiple minimum is rounded up
+    self.assertEqual(bucket(min_tokens=6), 6)
+    self.assertEqual(bucket(min_tokens=100), 7)  # clipped to the sequence length
+
+    out_embeds, out_mask = compact(embeds, mask, 2, min_tokens=5)
+    self.assertEqual(out_embeds.shape, (2, 6, 1, 1))
+    # Prefix mask, valid tokens first in their original order, then padding.
+    np.testing.assert_array_equal(
+        np.asarray(out_mask), [[True, True, False, False, False, False], [True, True, True, False, False, False]]
+    )
+    np.testing.assert_array_equal(np.asarray(out_embeds[0, :2, 0, 0]), [0.0, 3.0])
+    np.testing.assert_array_equal(np.asarray(out_embeds[1, :3, 0, 0]), [8.0, 9.0, 11.0])
+
+    with self.assertRaisesRegex(ValueError, "min_tokens"):
+      compact(embeds, mask, 2, min_tokens=-1)
+
+  def test_forced_text_bucket_matches_compacted_call(self):
+    # A forced larger bucket only appends masked padding tokens: same image.
+    mid_padded = jnp.array([[True, False, True]])
+    buckets = []
+    real_compact = krea2_pipeline.compact_text_embeddings
+
+    def spy_compact(embeds, mask, multiple, **kwargs):
+      out = real_compact(embeds, mask, multiple, **kwargs)
+      buckets.append((kwargs.get("min_tokens", 0), out[1].shape[1]))
+      return out
+
+    config = {"krea2_text_compaction_multiple": 2, "krea2_staged_transformer": False}
+    with mock.patch.object(krea2_pipeline, "compact_text_embeddings", side_effect=spy_compact):
+      _, compact_seen = self._run((), text_mask=mid_padded, **config)
+      _, forced_seen = self._run((), text_mask=mid_padded, call_kwargs={"min_text_tokens": 3}, **config)
+    # Prompt + negative prompt (CFG); round_up(3, 2) = 4 is clipped to the text length 3.
+    self.assertEqual(buckets, [(0, 2), (0, 2), (3, 3), (3, 3)])
+    np.testing.assert_allclose(forced_seen["latents_5d"], compact_seen["latents_5d"], rtol=1e-5, atol=1e-5)
+
   def test_flash_custom_always_compacts_to_a_prefix_mask(self):
     # flash_custom needs a prefix key mask, so compaction is forced (with the
     # full length as the bucket) even when krea2_text_compaction_multiple=0.
@@ -474,6 +533,193 @@ class Krea2OffloadCallTest(unittest.TestCase):
     # Host trees are left intact for the next generation.
     self.assertIsInstance(self.host_qwen3["embed"], np.ndarray)
     self.assertTrue(all(isinstance(x, np.ndarray) for x in jax.tree_util.tree_leaves(self.host_params)))
+
+
+@aot_cache.cached_jit
+def _tiny_vae_decode(graphdef, state, rest_of_state, latents_5d):
+  """Stand-in for vae_decode_pass: a cached executable whose output depends on the latents."""
+  del graphdef, state, rest_of_state
+  return jnp.tanh(latents_5d) * 2.0
+
+
+class Krea2PrecompileRoundTripTest(unittest.TestCase):
+  """What generate_krea2.run_precompile saves is what a later lazy-loading run loads and runs.
+
+  The real pipeline with the tiny transformer; the text encoder and the VAE
+  are stubbed like in Krea2OffloadCallTest, the VAE through a cached entry.
+  """
+
+  _S_TXT = 6
+  _META = {"test": "krea2_precompile_round_trip"}
+  # 1 valid token: natural bucket 2 (multiple 2), so precompile has to force 4.
+  _SHORT_MASK = [[True, False, False, False, False, False]]
+  # 3 valid tokens (mid-sequence padding): natural bucket 4.
+  _RUN_MASK = [[True, True, False, True, False, False]]
+
+  @staticmethod
+  def _reset_aot_state():
+    """Puts the process-global AOT cache back to its never-installed state.
+
+    Other tests expect it disabled and every entry empty, whatever order they
+    run in. `_STATE.generation` is left alone: it only ever has to change.
+    """
+    aot_cache.wait_for_loads()
+    state = aot_cache._STATE
+    state.enabled = False
+    state.lazy_load = False
+    state.warmup_only = False
+    state.cache_dir = ""
+    state.fingerprint = ""
+    state.mesh = None
+    for entry in aot_cache._REGISTRY:
+      with entry._lock:
+        entry._compiled.clear()
+        entry._out_specs.clear()
+        entry._pending.clear()
+        entry._adapters.clear()
+        entry._on_disk.clear()
+        entry._lazy_tried.clear()
+
+  def setUp(self):
+    # Registered first, so the reset also runs when a later setUp step fails.
+    self.addCleanup(self._reset_aot_state)
+    self._reset_aot_state()
+    tmp = tempfile.TemporaryDirectory()
+    self.addCleanup(tmp.cleanup)
+    self.cache_dir = tmp.name
+    # nnx.split of the stub VAE: nothing to split.
+    patcher = mock.patch.object(krea2_pipeline.nnx, "split", return_value=(None, None, None))
+    patcher.start()
+    self.addCleanup(patcher.stop)
+
+    self.transformer = _tiny_transformer(in_channels=64)
+    self.latents = np.random.RandomState(0).randn(_B, _GRID_H * _GRID_W, 64).astype(np.float32)
+    self.prompt_embeds = jnp.array(np.random.RandomState(1).randn(_B, self._S_TXT, 3, 24), dtype=jnp.float32)
+    _, prompt_embeds, text_mask, img_ids, txt_ids, t_vec = _inputs()
+    params = self.transformer.init(
+        jax.random.PRNGKey(0), jnp.asarray(self.latents), prompt_embeds, t_vec, img_ids, txt_ids, text_mask
+    )["params"]
+    host_params = jax.tree_util.tree_map(np.asarray, _unbox(params))
+    sharding = NamedSharding(_mesh(), P())
+    self.params = place_params(host_params, jax.tree_util.tree_map(lambda _: sharding, host_params))
+    self.qwen3_params = {"embed": jnp.ones((4, 24), jnp.float32)}
+    # 32x32 pixels: a 2x2 grid of packed latents, like self.latents.
+    self.resolution = Krea2Resolution(image_size="1k", aspect_ratio="1:1", height=32, width=32)
+
+  def _pipeline(self, text_mask):
+    pipeline = FlaxKrea2Pipeline(
+        transformer=self.transformer,
+        vae=types.SimpleNamespace(latents_mean=[0.0] * 16, latents_std=[1.0] * 16),
+        vae_cache=None,
+        text_encoder=None,
+        tokenizer=None,
+        scheduler=FlaxFlowMatchScheduler(
+            num_train_timesteps=1000,
+            shift=1.0,
+            use_dynamic_shifting=True,
+            time_shift_type="exponential",
+        ),
+        config=_config(
+            is_distilled=True,
+            max_sequence_length=self._S_TXT,
+            krea2_text_compaction_multiple=2,
+            krea2_staged_transformer=False,
+        ),
+        mesh=_mesh(),
+    )
+    pipeline._setup_jit_functions()
+    seen = {}
+    mask = jnp.array(text_mask)
+
+    def fake_encode_prompt(prompts, qwen3_params):
+      return self.prompt_embeds, mask
+
+    def vae_decode(graphdef, state, rest_of_state, latents_5d):
+      images = _tiny_vae_decode(graphdef, state, rest_of_state, latents_5d)
+      seen["latents_5d"] = np.asarray(latents_5d)
+      seen["images"] = np.asarray(images)
+      return images
+
+    pipeline.encode_prompt = fake_encode_prompt
+    pipeline._jitted_vae_decode = vae_decode
+    return pipeline, seen
+
+  def _call_kwargs(self):
+    return {
+        "params": self.params,
+        "qwen3_params": self.qwen3_params,
+        "num_inference_steps": 2,
+        "guidance_scale": 1.5,
+        "do_classifier_free_guidance": True,
+        "latents": self.latents,
+    }
+
+  def _run(self, pipeline):
+    _, trace = pipeline(
+        "a fox",
+        height=self.resolution.height,
+        width=self.resolution.width,
+        save_outputs=False,
+        **self._call_kwargs(),
+    )
+    return trace
+
+  def _entries(self, pipeline):
+    return {
+        "transformer_step": pipeline._jitted_transformer_step,
+        "text_context": pipeline._jitted_transformer_text_context,
+        "vae_decode": _tiny_vae_decode,
+    }
+
+  def test_precompiled_executables_are_loaded_by_a_later_run(self):
+    # (1) Reference: AOT cache disabled.
+    reference_pipeline, reference_seen = self._pipeline(self._RUN_MASK)
+    reference_trace = self._run(reference_pipeline)
+    self.assertEqual((reference_trace["text_tokens"], reference_trace["negative_text_tokens"]), (4, 4))
+
+    # (2) Precompile one resolution with a bucket larger than the prompt's natural one.
+    precompile_pipeline, _ = self._pipeline(self._SHORT_MASK)
+    aot_cache.install(self.cache_dir, self._META, _mesh())
+    aot_cache.wait_for_loads()
+    plan = [(self.resolution, 4)]
+    records = generate_krea2.run_precompile(precompile_pipeline, plan, self._call_kwargs(), ["a fox"])
+    self.assertEqual(len(records), 1)
+    self.assertEqual((records[0]["text_tokens"], records[0]["negative_text_tokens"]), (4, 4))
+    self.assertEqual(records[0]["requested_text_tokens"], 4)
+    self.assertGreaterEqual(records[0]["saved"], 3)
+    written = {
+        name: glob.glob(os.path.join(self.cache_dir, f"{entry.name}-*.aotx"))
+        for name, entry in self._entries(precompile_pipeline).items()
+    }
+    for name, paths in written.items():
+      self.assertTrue(paths, f"no executable written for {name}")
+
+    # (3) A new process: fresh pipeline entries, lazy install, nothing loaded yet.
+    run_pipeline, run_seen = self._pipeline(self._RUN_MASK)
+    aot_cache.install(self.cache_dir, self._META, _mesh(), lazy_load=True)
+    entries = self._entries(run_pipeline)
+    for name, entry in entries.items():
+      self.assertEqual(entry._compiled, {}, name)
+
+    # Any jit fallback or compile would mean a cache miss.
+    def no_compile(*args, **kwargs):
+      raise AssertionError("cache miss: the run tried to jit or compile")
+
+    with (
+        mock.patch.object(aot_cache._AotEntry, "_adapter_for", side_effect=no_compile),
+        mock.patch.object(aot_cache._AotEntry, "_compile_and_record", side_effect=no_compile),
+    ):
+      run_trace = self._run(run_pipeline)
+    self.assertEqual((run_trace["text_tokens"], run_trace["negative_text_tokens"]), (4, 4))
+
+    # (4) Every executable came from disk, and the result matches the reference.
+    for name, entry in entries.items():
+      self.assertTrue(entry._compiled, name)
+      self.assertEqual(set(entry._compiled), entry._on_disk, name)
+      self.assertEqual(entry._pending, {}, name)
+      self.assertEqual(len(entry._on_disk), len(written[name]), name)
+    np.testing.assert_allclose(run_seen["latents_5d"], reference_seen["latents_5d"], rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(run_seen["images"], reference_seen["images"], rtol=1e-5, atol=1e-5)
 
 
 if __name__ == "__main__":

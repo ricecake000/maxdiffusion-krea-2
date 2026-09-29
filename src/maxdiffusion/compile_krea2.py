@@ -21,6 +21,8 @@ limitations under the License.
 #
 #   JAX_PLATFORMS=cpu python src/maxdiffusion/compile_krea2.py \
 #     src/maxdiffusion/configs/base_krea2_turbo.yml compile_topology=v6e-1 height=2048 width=2048
+#
+# Named resolutions work like in generate_krea2.py, e.g. krea2_aspect_ratio=21:9 krea2_image_size=2k.
 
 import json
 import math
@@ -39,7 +41,7 @@ from jax.experimental.topologies import get_topology_desc
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from maxdiffusion import max_logging, max_utils, pyconfig
-from maxdiffusion.generate_krea2 import build_krea2_transformer, build_qwen3_config
+from maxdiffusion.generate_krea2 import build_krea2_transformer, build_qwen3_config, resolve_generation_size
 from maxdiffusion.models.krea2.transformer_quant import describe_transformer_quantization, resolve_transformer_quantization
 
 GIB = 1024**3
@@ -473,7 +475,7 @@ def main(argv):
       + custom_overrides
   )
 
-  from maxdiffusion.models.krea2.util import KREA2_PROMPT_TEMPLATE_START_IDX, round_up_to_multiple
+  from maxdiffusion.models.krea2.util import KREA2_PROMPT_TEMPLATE_START_IDX
   from maxdiffusion.models.qwen3_flax import FlaxQwen3Model
   from maxdiffusion.models.krea2.text_encoder_quant import (
       describe_text_encoder_residency,
@@ -529,8 +531,8 @@ def main(argv):
   max_logging.log(describe_transformer_quantization(transformer_quantization, transformer_quant_targets))
 
   batch = config.batch_size
-  height = round_up_to_multiple(config.height, 16)
-  width = round_up_to_multiple(config.width, 16)
+  # Same choice as generate_krea2: the preset keys win over height/width.
+  height, width, _ = resolve_generation_size(config)
   grid_h, grid_w = height // 16, width // 16
   seq_img = grid_h * grid_w
   seq_txt = config.max_sequence_length

@@ -21,15 +21,26 @@ limitations under the License.
 #
 #   python src/maxdiffusion/generate_krea2.py src/maxdiffusion/configs/base_krea2_turbo.yml \
 #     run_name=krea2_turbo output_dir=output/ prompt="a fox in the snow"
+#
+# Named resolutions (krea2_aspect_ratio / krea2_image_size override height/width). Precompile every preset into
+# the AOT cache once (no image is generated), then generate with a ratio; the run loads only the executables it
+# calls when aot_cache_lazy_load is on (the v6e-1 preset default):
+#
+#   python src/maxdiffusion/generate_krea2.py src/maxdiffusion/configs/base_krea2_turbo_v6e1.yml \
+#     aot_cache_dir=/path/to/aot krea2_precompile=all "krea2_precompile_text_tokens=[128]"
+#
+#   python src/maxdiffusion/generate_krea2.py src/maxdiffusion/configs/base_krea2_turbo_v6e1.yml \
+#     aot_cache_dir=/path/to/aot krea2_aspect_ratio=16:9 krea2_image_size=2k prompt="a fox in the snow"
 
 import gc
+import inspect
 from concurrent.futures import ThreadPoolExecutor
 import json
 import math
 import os
 import time
 from contextlib import ExitStack
-from typing import List
+from typing import List, Tuple
 
 from absl import app
 import jax
@@ -43,6 +54,13 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from maxdiffusion import aot_cache, max_logging, max_utils, pyconfig
 from maxdiffusion.max_utils import create_device_mesh
+from maxdiffusion.models.krea2.resolution_presets import (
+    KREA2_DEFAULT_ASPECT_RATIO,
+    KREA2_DEFAULT_IMAGE_SIZE,
+    Krea2Resolution,
+    parse_krea2_precompile,
+    resolve_krea2_resolution,
+)
 
 
 def partition_prompts(prompt_str: str, batch_size: int) -> List[str]:
@@ -219,6 +237,188 @@ def flash_custom_block_selection_aot_meta(attention) -> dict:
   return {"krea2_block_selection": f"r{KREA2_BLOCK_SELECTION_REVISION}"}
 
 
+# Precompile mode's prompt: short enough for the smallest text bucket, so each
+# plan entry's forced bucket decides the compiled text length.
+KREA2_PRECOMPILE_PROMPT = "a fox in the snow"
+
+
+def _preset_key_unset(value) -> bool:
+  return value is None or (isinstance(value, str) and not value.strip())
+
+
+def resolve_generation_size(config) -> Tuple[int, int, str]:
+  """Returns `(height, width, description)` of the image to generate.
+
+  `krea2_aspect_ratio` / `krea2_image_size` win over `height` / `width`: when
+  either is set, the other takes its default (1:1 / 1k) and the size comes from
+  the preset table. Otherwise `height` / `width` are rounded up to multiples of
+  16 (VAE 8x downsampling x 2x2 latent patches), as the pipeline would.
+  """
+  from maxdiffusion.models.krea2.util import round_up_to_multiple
+
+  aspect_ratio = getattr(config, "krea2_aspect_ratio", "")
+  image_size = getattr(config, "krea2_image_size", "")
+  if _preset_key_unset(aspect_ratio) and _preset_key_unset(image_size):
+    height = round_up_to_multiple(config.height, 16)
+    width = round_up_to_multiple(config.width, 16)
+    if (height, width) != (config.height, config.width):
+      max_logging.log(
+          f"Warning: height and width must be multiples of 16; rounding up from "
+          f"{config.height}x{config.width} to {height}x{width}."
+      )
+    return height, width, f"{width}x{height} (height/width)"
+
+  resolution = resolve_krea2_resolution(
+      KREA2_DEFAULT_ASPECT_RATIO if _preset_key_unset(aspect_ratio) else aspect_ratio,
+      KREA2_DEFAULT_IMAGE_SIZE if _preset_key_unset(image_size) else image_size,
+  )
+  description = f"preset {resolution.label} -> {resolution.width}x{resolution.height}"
+  max_logging.log(f"Output resolution: {description}")
+  config_height, config_width = getattr(config, "height", None), getattr(config, "width", None)
+  if (config_height, config_width) != (resolution.height, resolution.width):
+    max_logging.log(
+        f"Ignoring height={config_height} width={config_width} from the config: "
+        "krea2_aspect_ratio / krea2_image_size set the resolution."
+    )
+  return resolution.height, resolution.width, description
+
+
+def resolve_precompile_plan(config, text_compaction_multiple) -> List[Tuple[Krea2Resolution, int]]:
+  """Every (resolution, text bucket) to compile, in order: resolutions in spec order, buckets ascending.
+
+  Buckets come from `krea2_precompile_text_tokens` (positive ints, [] means
+  [128]), rounded up to `text_compaction_multiple` and clipped to
+  `max_sequence_length` like the pipeline's compaction. Without compaction
+  (`text_compaction_multiple <= 0`) the text always has the full length, the
+  only bucket. Raises ValueError on a bad spec, a bad bucket, or a non-empty
+  spec without `aot_cache_dir` (nothing could be saved).
+  """
+  from maxdiffusion.models.krea2.util import round_up_to_multiple
+
+  spec = getattr(config, "krea2_precompile", "")
+  resolutions = parse_krea2_precompile("" if spec is None else spec)
+  if not resolutions:
+    return []
+  if not getattr(config, "aot_cache_dir", ""):
+    raise ValueError("krea2_precompile needs aot_cache_dir: the compiled executables are only kept in the AOT cache.")
+
+  raw_tokens = getattr(config, "krea2_precompile_text_tokens", None)
+  if raw_tokens is None:
+    raw_tokens = []
+  tokens = list(raw_tokens) if isinstance(raw_tokens, (list, tuple)) else [raw_tokens]
+  for value in tokens:
+    # bool is an int subclass; True would silently mean a 1-token bucket.
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+      raise ValueError(f"krea2_precompile_text_tokens entries must be positive ints, got {value!r} in {raw_tokens!r}.")
+  if not tokens:
+    tokens = [128]
+
+  max_length = int(config.max_sequence_length)
+  if text_compaction_multiple <= 0:
+    buckets = [max_length]
+  else:
+    buckets = sorted({min(round_up_to_multiple(value, text_compaction_multiple), max_length) for value in tokens})
+  return [(resolution, bucket) for resolution in resolutions for bucket in buckets]
+
+
+def run_precompile(pipeline, plan, call_kwargs, prompts) -> List[dict]:
+  """Compiles every plan entry in warmup mode and saves after each one. Returns one record per entry.
+
+  Each entry is a zero-execution warmup call at the entry's resolution with the
+  text bucket forced to at least its size. The cache is saved after every
+  entry, outside the warmup context, so a preempted VM keeps what is already
+  compiled. The forced size is only a lower bound (a longer prompt or negative
+  prompt gets a larger bucket), so the buckets the pipeline reports in its trace
+  are checked against the requested one: a mismatch, or a trace without
+  `text_tokens`, raises RuntimeError after that entry was saved and before the
+  next one starts. With classifier-free guidance (decided from `call_kwargs`
+  exactly like the pipeline does) a trace without `negative_text_tokens` raises
+  too. Records carry the actual `text_tokens` (and `negative_text_tokens` with
+  guidance) next to `requested_text_tokens`.
+  """
+  from maxdiffusion.pipelines.krea2.krea2_pipeline import FlaxKrea2Pipeline, is_classifier_free_guidance_enabled
+
+  # Same decision as FlaxKrea2Pipeline.__call__, with its defaults for absent keys.
+  call_defaults = inspect.signature(FlaxKrea2Pipeline.__call__).parameters
+  guidance = is_classifier_free_guidance_enabled(
+      call_kwargs.get("guidance_scale", call_defaults["guidance_scale"].default),
+      call_kwargs.get("do_classifier_free_guidance", call_defaults["do_classifier_free_guidance"].default),
+  )
+  records = []
+  for index, (resolution, requested) in enumerate(plan, start=1):
+    entry = f"[precompile {index}/{len(plan)}] {resolution.label} {resolution.width}x{resolution.height}"
+    # Custom latents fit only one resolution; every entry draws its own noise.
+    kwargs = {**call_kwargs, "height": resolution.height, "width": resolution.width, "latents": None}
+    t0 = time.perf_counter()
+    with aot_cache.warmup_mode():
+      _, trace = pipeline(
+          prompt=prompts,
+          output_name="krea2_precompile.png",
+          save_outputs=False,
+          min_text_tokens=requested,
+          **kwargs,
+      )
+    # Save before any check below can raise, so the compiled work is kept.
+    saved = aot_cache.save_pending()
+    seconds = time.perf_counter() - t0
+    if "text_tokens" not in trace:
+      raise RuntimeError(
+          f"{entry}: the pipeline did not report its text bucket (no 'text_tokens' in its trace), so the "
+          f"requested bucket {requested} cannot be confirmed; {saved} executable(s) were saved."
+      )
+    if guidance and "negative_text_tokens" not in trace:
+      raise RuntimeError(
+          f"{entry}: classifier-free guidance is on but the pipeline did not report the negative prompt's text "
+          f"bucket (no 'negative_text_tokens' in its trace), so the requested bucket {requested} cannot be "
+          f"confirmed; {saved} executable(s) were saved."
+      )
+    record = {
+        "label": resolution.label,
+        "height": resolution.height,
+        "width": resolution.width,
+        "image_tokens": resolution.image_tokens,
+        "text_tokens": trace["text_tokens"],
+        "requested_text_tokens": requested,
+        "seconds": seconds,
+        "saved": saved,
+    }
+    buckets = f"text {record['text_tokens']}"
+    if "negative_text_tokens" in trace:
+      record["negative_text_tokens"] = trace["negative_text_tokens"]
+      buckets += f" (negative {record['negative_text_tokens']})"
+    records.append(record)
+    max_logging.log(f"{entry} {buckets}: {seconds:.1f} s, {saved} executable(s) saved")
+    actual = {"prompt": record["text_tokens"]}
+    if "negative_text_tokens" in record:
+      # Checked whenever reported, also if guidance is off.
+      actual["negative prompt"] = record["negative_text_tokens"]
+    mismatched = {kind: tokens for kind, tokens in actual.items() if tokens != requested}
+    if mismatched:
+      found = ", ".join(f"{kind} {tokens}" for kind, tokens in mismatched.items())
+      raise RuntimeError(
+          f"{entry}: requested text bucket {requested}, but the pipeline compiled {found} (a prompt with more "
+          f"valid tokens than the bucket); {saved} executable(s) were saved, the requested bucket was not compiled."
+      )
+  return records
+
+
+def log_precompile_summary(records) -> None:
+  """Logs one line per precompile record plus the totals."""
+  max_logging.log("=" * 80)
+  max_logging.log("KREA 2 PRECOMPILE SUMMARY")
+  max_logging.log("=" * 80)
+  max_logging.log(f"{'resolution':<10} {'size':>9} {'image tok':>9} {'text tok':>8} {'seconds':>8} {'saved':>5}")
+  for record in records:
+    max_logging.log(
+        f"{record['label']:<10} {record['width']:>4}x{record['height']:<4} {record['image_tokens']:>9} "
+        f"{record['text_tokens']:>8} {record['seconds']:>8.1f} {record['saved']:>5}"
+    )
+  total_saved = sum(record["saved"] for record in records)
+  total_seconds = sum(record["seconds"] for record in records)
+  max_logging.log(f"Total: {len(records)} entries, {total_saved} executable(s) saved, {total_seconds:.1f} s")
+  max_logging.log("=" * 80)
+
+
 def main(argv):
   jax.config.update("jax_use_shardy_partitioner", True)
 
@@ -249,7 +449,6 @@ def main(argv):
       load_and_convert_krea2_weights,
       load_krea2_tokenizer,
       permute_rope_weights_to_rotate_half,
-      round_up_to_multiple,
   )
   from maxdiffusion.models.qwen3_flax import (
       FlaxQwen3Model,
@@ -280,6 +479,22 @@ def main(argv):
 
   config = pyconfig.config
   os.makedirs(config.output_dir, exist_ok=True)
+  # The resolution and the precompile plan are resolved before anything else so
+  # a bad preset name or precompile spec fails before the model loads.
+  # Height/width are multiples of 16 (VAE 8x downsampling x 2x2 latent patches),
+  # so the eval_shape dummies below match what the pipeline will actually run.
+  height, width, _ = resolve_generation_size(config)
+  # Mirrors FlaxKrea2Pipeline: flash_custom always compacts, with the full text
+  # length as the bucket when krea2_text_compaction_multiple is off.
+  text_compaction_multiple = int(getattr(config, "krea2_text_compaction_multiple", 0) or 0)
+  if config.attention == "flash_custom" and text_compaction_multiple <= 0:
+    text_compaction_multiple = int(config.max_sequence_length)
+  precompile_plan = resolve_precompile_plan(config, text_compaction_multiple)
+  if precompile_plan:
+    max_logging.log(
+        f"Precompile mode: {len(precompile_plan)} resolution/text combination(s) into {config.aot_cache_dir}; "
+        "no image is generated."
+    )
   # Offloaded components keep their host tree; the pipeline places them on
   # device only for their phase (validated by FlaxKrea2Pipeline).
   offload_components = tuple(getattr(config, "krea2_offload_components", None) or ())
@@ -389,17 +604,6 @@ def main(argv):
 
   # 6. Evaluate shapes & extract mesh shardings
   max_logging.log("Evaluating model shapes and shardings...")
-  # Height/width must be multiples of 16 (VAE 8x downsampling x 2x2 latent
-  # patches). Round up here so the eval_shape dummies match what the pipeline
-  # (which applies the same rounding) will actually run.
-  height = round_up_to_multiple(config.height, 16)
-  width = round_up_to_multiple(config.width, 16)
-  if (height, width) != (config.height, config.width):
-    max_logging.log(
-        f"Warning: height and width must be multiples of 16; rounding up from "
-        f"{config.height}x{config.width} to {height}x{width}."
-    )
-
   grid_h = height // 16
   grid_w = width // 16
   seq_len_img = grid_h * grid_w
@@ -697,6 +901,8 @@ def main(argv):
           "jax": jax.__version__,
       },
       mesh=mesh,
+      # With many cached shapes (e.g. after krea2_precompile) load only the ones this run calls.
+      lazy_load=bool(getattr(config, "aot_cache_lazy_load", False)),
   )
   aot_cache.wait_for_loads()
 
@@ -706,19 +912,19 @@ def main(argv):
     latents_to_use = np.load(config.latents_path)
     max_logging.log(f" -> Custom latents shape: {latents_to_use.shape}")
 
-  call_kwargs = dict(
-      params=params,
-      qwen3_params=qwen3_params,
-      height=height,
-      width=width,
-      num_inference_steps=config.num_inference_steps,
-      guidance_scale=config.guidance_scale,
-      do_classifier_free_guidance=config.do_classifier_free_guidance,
-      negative_prompt=config.negative_prompt,
-      batch_size=config.batch_size,
-      latents=latents_to_use,
-      output_dir=config.output_dir,
-  )
+  call_kwargs = {
+      "params": params,
+      "qwen3_params": qwen3_params,
+      "height": height,
+      "width": width,
+      "num_inference_steps": config.num_inference_steps,
+      "guidance_scale": config.guidance_scale,
+      "do_classifier_free_guidance": config.do_classifier_free_guidance,
+      "negative_prompt": config.negative_prompt,
+      "batch_size": config.batch_size,
+      "latents": latents_to_use,
+      "output_dir": config.output_dir,
+  }
 
   # Swap-in entries are only present for offloaded components.
   timed_phases = (
@@ -739,6 +945,21 @@ def main(argv):
   with ExitStack() as stack:
     for interceptor in lora_interceptors:
       stack.enter_context(nn.intercept_methods(interceptor))
+
+    if precompile_plan:
+      # Compile and save only: no warmup/timed pass, no image, no profile. The
+      # executables depend on the text bucket, not on the prompt text, so a
+      # fixed short prompt and an empty negative prompt leave the bucket to the
+      # plan entry alone (a long configured prompt would force a larger one).
+      precompile_records = run_precompile(
+          pipeline,
+          precompile_plan,
+          {**call_kwargs, "negative_prompt": ""},
+          [KREA2_PRECOMPILE_PROMPT] * config.batch_size,
+      )
+      log_precompile_summary(precompile_records)
+      max_logging.log(f"SUCCESS! Precompile complete for {len(precompile_records)} resolution/text combination(s)!")
+      return
 
     max_logging.log("Running compile warmup (zero-execution when AOT cache is enabled)...")
     with aot_cache.warmup_mode():

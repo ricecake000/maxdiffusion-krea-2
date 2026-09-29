@@ -178,6 +178,9 @@ jax_cache_dir: ''
 # Serialize per-shape TPU executables so later processes can skip tracing and
 # lowering. Keep this on persistent storage for serving.
 aot_cache_dir: ''
+# Load a cached executable when its shape is first called instead of all of them at startup. Use it
+# when the cache holds many shapes (e.g. after krea2_precompile) and a run needs only a few.
+aot_cache_lazy_load: False
 # Overlap the independent Transformer/Qwen host reads with VAE loading.
 parallel_component_loading: True
 hf_data_dir: ''
@@ -341,6 +344,18 @@ krea2_transformer_quantization: ''
 # up_proj, down_proj. to_k/to_v are small (6144 -> 1536) and stay float by default.
 # Command-line override: "krea2_transformer_quant_targets=['gate_proj','up_proj','down_proj']".
 krea2_transformer_quant_targets: ['to_q', 'to_gate', 'to_out', 'gate_proj', 'up_proj', 'down_proj']
+# Output resolution by name instead of height/width: krea2_aspect_ratio one of 1:1 5:4 4:3 3:2 16:9 21:9
+# 4:5 3:4 2:3 9:16 9:21, krea2_image_size 1k or 2k. Setting either one overrides height/width (the other
+# defaults to 1:1 / 1k). Quote the ratio in YAML: unquoted 16:9 is the integer 969.
+krea2_aspect_ratio: ''
+krea2_image_size: ''
+# Precompile mode: compile these resolutions into aot_cache_dir and exit without generating. Comma-separated
+# entries: all, a size (2k), or size@ratio (2k@16:9). One transformer executable per distinct token count and
+# text bucket, one VAE executable per resolution. krea2_precompile_text_tokens lists the text buckets to
+# compile (rounded up to krea2_text_compaction_multiple, clipped to max_sequence_length). Precompile uses a
+# fixed short prompt and no negative prompt, so the configured prompts do not change the buckets.
+krea2_precompile: ''
+krea2_precompile_text_tokens: [128]
 
 # VAE (Qwen-Image / Wan 2.1 architecture) mesh + sharding.
 # vae_spatial = -1 shards VAE spatial activations across all devices.
