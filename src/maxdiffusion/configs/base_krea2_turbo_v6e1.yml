@@ -25,8 +25,8 @@
 #   (krea2_text_embed_on_host, exact lookup). compile_krea2.py v6e-1:
 #   1024x1024 peak 17.52 GiB, 2048x2048 peak 21.30 GiB (both VAE decode) of
 #   31.25 GiB usable, so 2048x2048 also fits with everything resident.
-#   Measured on v6e-1 (8 steps, warm): 1.29 s at 1024x1024 (bf16 1.88 s) and
-#   8.22 s at 2048x2048 (bf16 with the text encoder offloaded 11.29 s).
+#   Measured on v6e-1 (8 steps, warm): 1.25 s at 1024x1024 (bf16 1.88 s) and
+#   7.96 s at 2048x2048 (bf16 with the text encoder offloaded 11.29 s).
 #   For the bf16 transformer override krea2_transformer_quantization=''; then
 #   1024x1024 peaks at 28.84 GiB and 2048x2048 needs krea2_offload_components
 #   ['text_encoder'] (peak 29.18 GiB, 3.44 GiB int8 swap per generation).
@@ -35,7 +35,11 @@
 #   (block_q stays automatic, so they hold at every resolution): measured on
 #   v6e-1 against the kernel's auto sizes ({}) 1.512 -> 1.348 ms per attention
 #   call at 1024x1024 and 8.34 -> 8.05 s denoise at 2048x2048, images
-#   bit-identical.
+#   bit-identical. The automatic block_q follows the chip's VMEM budget (v6e:
+#   4224 at 1024x1024, 3328 at 2048x2048; up to 2048 before): 1.353 -> 1.192
+#   ms per call and 7.92 -> 7.65 s denoise at 2048x2048. The kernel's error
+#   against an f32 reference is unchanged, but its last bits are not, so
+#   same-seed images differ in details (PSNR 22-24 dB).
 # - krea2_rope_layout 'rotate_half': q/k head dims are permuted at load time so
 #   RoPE works on lane-dense 64-wide halves (exact).
 # - krea2_text_compaction_multiple 128: valid prompt tokens are gathered to the
