@@ -46,6 +46,9 @@ KREA2_QUANT_TARGETS = KREA2_QUANT_ATTN_TARGETS + KREA2_QUANT_FF_TARGETS
 KREA2_DEFAULT_QUANT_TARGETS = ("to_q", "to_gate", "to_out", "gate_proj", "up_proj", "down_proj")
 # Bump when the traced W8A8 graph changes; it is part of the AOT cache key, so this invalidates cached executables.
 KREA2_TRANSFORMER_QUANT_REVISION = 2
+# Bump when `quantize_kernel` / `quantize_transformer_params` change the stored values; it is part of the
+# weight cache key (krea2_weight_cache_dir), so this invalidates cached quantized trees.
+KREA2_TRANSFORMER_WEIGHT_QUANT_REVISION = 1
 
 _BLOCK_KEY = re.compile(r"blocks_\d+")
 _GIB = 1024**3

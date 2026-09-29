@@ -31,6 +31,13 @@ limitations under the License.
 #
 #   python src/maxdiffusion/generate_krea2.py src/maxdiffusion/configs/base_krea2_turbo_v6e1.yml \
 #     aot_cache_dir=/path/to/aot krea2_aspect_ratio=16:9 krea2_image_size=2k prompt="a fox in the snow"
+#
+# Quantized-weight cache: with krea2_weight_cache_dir set, a run that misses saves the final quantized
+# transformer / text encoder host trees there, and later runs read them instead of reading and re-quantizing
+# the checkpoint (only quantized components; any LoRA adapter bypasses the transformer cache):
+#
+#   python src/maxdiffusion/generate_krea2.py src/maxdiffusion/configs/base_krea2_turbo_v6e1.yml \
+#     krea2_weight_cache_dir=/path/to/weights aot_cache_dir=/path/to/aot prompt="a fox in the snow"
 
 import gc
 import inspect
@@ -235,6 +242,75 @@ def flash_custom_block_selection_aot_meta(attention) -> dict:
   if attention != "flash_custom":
     return {}
   return {"krea2_block_selection": f"r{KREA2_BLOCK_SELECTION_REVISION}"}
+
+
+def resolve_weight_cache_dirs(config, transformer_quantization, te_quantization, lora_compile_spec) -> Tuple[str, str]:
+  """Returns `(transformer_dir, text_encoder_dir)` of `krea2_weight_cache_dir`; '' means no cache for that component.
+
+  Only quantized components are cached: the cache saves the re-quantization,
+  an unquantized tree would only copy the checkpoint. Any LoRA adapter bypasses
+  the transformer cache (its weights are merged into the tree but are not part
+  of the fingerprint); the text encoder cache does not depend on LoRA. Logs one
+  line per component that does not use the cache; nothing when the cache is off.
+  """
+  # Strip quotes so a command-line override `krea2_weight_cache_dir=''` means off.
+  cache_dir = str(getattr(config, "krea2_weight_cache_dir", "") or "").strip().strip("'\"")
+  if not cache_dir:
+    return "", ""
+  transformer_dir = text_encoder_dir = cache_dir
+  if not transformer_quantization:
+    max_logging.log("[weight cache] transformer: unquantized (krea2_transformer_quantization off), nothing to cache.")
+    transformer_dir = ""
+  elif lora_compile_spec:
+    max_logging.log("[weight cache] transformer: bypassed, LoRA adapters are merged into its tree but not in its key.")
+    transformer_dir = ""
+  if te_quantization != "int8":
+    max_logging.log("[weight cache] text_encoder: unquantized (krea2_text_encoder_quantization off), nothing to cache.")
+    text_encoder_dir = ""
+  return transformer_dir, text_encoder_dir
+
+
+def load_or_build_host_params(cache, abstract_params, build, load_trace, trace_key, extra_names=(), check_dtypes=True):
+  """Returns `(tree, extras, hit)`: the cached host tree, or `build()`'s `(tree, extras)` on a miss.
+
+  `cache` is a `WeightCacheSpec` or None (no cache: `build` runs, nothing is
+  read). On a hit `build` is not called. `load_trace[trace_key]` gets the time
+  of the cache read whenever one was attempted.
+  """
+  from maxdiffusion.models.krea2.weight_cache import load_component
+
+  if cache is not None:
+    t0 = time.perf_counter()
+    cached = load_component(
+        cache.cache_dir,
+        cache.component,
+        cache.meta,
+        abstract_params,
+        extra_names=extra_names,
+        source_files=cache.source_files,
+        check_dtypes=check_dtypes,
+    )
+    load_trace[trace_key] = time.perf_counter() - t0
+    if cached is not None:
+      tree, extras = cached
+      return tree, extras, True
+  tree, extras = build()
+  return tree, extras, False
+
+
+def save_host_params(cache, tree, load_trace, trace_key, extras=None):
+  """Saves a freshly built host tree to the cache; a no-op for `cache` None. Returns the directory or None.
+
+  `load_trace[trace_key]` gets the time of the write whenever one was attempted.
+  """
+  from maxdiffusion.models.krea2.weight_cache import save_component
+
+  if cache is None:
+    return None
+  t0 = time.perf_counter()
+  saved = save_component(cache.cache_dir, cache.component, cache.meta, tree, extras=extras, source_files=cache.source_files)
+  load_trace[trace_key] = time.perf_counter() - t0
+  return saved
 
 
 # Precompile mode's prompt: short enough for the smallest text bucket, so each
@@ -468,6 +544,12 @@ def main(argv):
       quantize_transformer_params,
       resolve_transformer_quantization,
   )
+  from maxdiffusion.models.krea2.weight_cache import (
+      WeightCacheSpec,
+      list_source_files,
+      text_encoder_weight_cache_meta,
+      transformer_weight_cache_meta,
+  )
   from maxdiffusion.models.flux.util import cast_dict_to_bfloat16_inplace
   from maxdiffusion.schedulers.scheduling_flow_match_flax import FlaxFlowMatchScheduler
   from maxdiffusion.pipelines.krea2.krea2_pipeline import FlaxKrea2Pipeline
@@ -689,6 +771,43 @@ def main(argv):
         )
     )
 
+  # 6b. Quantized-weight cache (krea2_weight_cache_dir): a hit replaces the checkpoint
+  # read, the rotate-half permutation and the quantization of that component.
+  transformer_cache_dir, text_encoder_cache_dir = resolve_weight_cache_dirs(
+      config, transformer_quantization, te_quantization, lora_compile_spec
+  )
+  transformer_cache = (
+      WeightCacheSpec(
+          transformer_cache_dir,
+          "transformer",
+          transformer_weight_cache_meta(
+              config,
+              snapshot_dir,
+              transformer_quantization,
+              transformer_quant_targets,
+              transformer.rope_layout,
+              transformer.num_attention_heads,
+              transformer.num_key_value_heads,
+              transformer.attention_head_dim,
+          ),
+          list_source_files(transformer_path),
+      )
+      if transformer_cache_dir
+      else None
+  )
+  text_encoder_cache = (
+      WeightCacheSpec(
+          text_encoder_cache_dir,
+          "text_encoder",
+          text_encoder_weight_cache_meta(
+              config, snapshot_dir, te_quantization, te_quant_tile_size, te_embed_on_host, qwen3_config.dtype
+          ),
+          list_source_files(text_encoder_path),
+      )
+      if text_encoder_cache_dir
+      else None
+  )
+
   # 7. Stream weights on host CPU, overlap the independent components, then
   # place the final trees directly into their target TPU shardings.
   max_logging.log("Streaming parameters from safetensors...")
@@ -730,19 +849,30 @@ def main(argv):
         )
         qwen3_params = flax.core.unfreeze(qwen3_params)
 
+        # Components read from the weight cache; their trees are final (permuted, quantized).
+        weight_cache_hits = set()
+
         def load_transformer_timed():
           t0 = time.perf_counter()
-          result = load_and_convert_krea2_weights(transformer_path, params, num_layers)
+          result, _, hit = load_or_build_host_params(
+              transformer_cache,
+              abstract_transformer_vars["params"],
+              lambda: (load_and_convert_krea2_weights(transformer_path, params, num_layers), None),
+              load_trace,
+              "transformer_cache_read",
+          )
+          if hit:
+            weight_cache_hits.add("transformer")
           return result, time.perf_counter() - t0
 
         # Host-side embedding table (krea2_text_embed_on_host), filled by load_qwen_timed.
         text_embedding = []
 
-        def load_qwen_timed():
-          t0 = time.perf_counter()
+        def build_qwen_host_params():
           result = load_and_convert_qwen3_weights(
               text_encoder_path, qwen3_params, qwen3_config, key_prefix="model.language_model."
           )
+          # Bump KREA2_TEXT_ENCODER_WEIGHT_BUILD_REVISION (weight_cache.py) when this changes the values.
           if config.weights_dtype == jnp.bfloat16:
             max_logging.log("Normalizing Qwen3 dtypes (BF16 weights, FP32 norms; matching dtypes are reused)...")
             cast_dict_to_bfloat16_inplace(result, exclude_keywords=("norm",))
@@ -754,10 +884,33 @@ def main(argv):
                 result, abstract_qwen3_vars["params"], scale_dtype=qwen3_config.dtype, device=cpu_device
             )
             load_trace["qwen_quantize"] = time.perf_counter() - t_quant
+          extras = None
           if te_embed_on_host:
             t_embed = time.perf_counter()
-            text_embedding.append(load_qwen3_embedding_table(text_encoder_path, key_prefix="model.language_model."))
+            table = load_qwen3_embedding_table(text_encoder_path, key_prefix="model.language_model.")
+            extras = {"embedding_table": table}
             load_trace["qwen_embedding_table"] = time.perf_counter() - t_embed
+          return result, extras
+
+        def load_qwen_timed():
+          t0 = time.perf_counter()
+          # The cached scales have the compute dtype, the abstract tree's may not: floating
+          # leaves only need a floating dtype, the others (int8 qvalues) their exact dtype.
+          result, extras, hit = load_or_build_host_params(
+              text_encoder_cache,
+              abstract_qwen3_vars["params"],
+              build_qwen_host_params,
+              load_trace,
+              "qwen_cache_read",
+              extra_names=("embedding_table",) if te_embed_on_host else (),
+              check_dtypes=False,
+          )
+          if hit:
+            weight_cache_hits.add("text_encoder")
+          else:
+            save_host_params(text_encoder_cache, result, load_trace, "qwen_cache_write", extras=extras)
+          if te_embed_on_host:
+            text_embedding.append(extras["embedding_table"])
           return result, time.perf_counter() - t0
 
         if parallel_loading:
@@ -773,32 +926,39 @@ def main(argv):
           params, load_trace["transformer_host"] = load_transformer_timed()
           qwen3_params, load_trace["qwen_host"] = load_qwen_timed()
 
-        # load_and_convert_krea2_weights zero-fills the lora-* leaves it
-        # doesn't recognize, so write the real adapter tensors afterwards.
-        t0 = time.perf_counter()
-        params = insert_lora_params(params, lora_flat_params)
-        params = apply_diff_updates(params, lora_diff_updates)
-        load_trace["lora_apply"] = time.perf_counter() - t0
-
-        # rotate_half RoPE needs q/k head dims reordered. Runs after the LoRA
-        # up kernels and diff updates are in the tree so they are permuted too.
-        if transformer.rope_layout == "rotate_half":
-          t0 = time.perf_counter()
-          params = permute_rope_weights_to_rotate_half(
-              params,
-              num_heads=transformer.num_attention_heads,
-              num_kv_heads=transformer.num_key_value_heads,
-              head_dim=transformer.attention_head_dim,
-          )
-          load_trace["rope_permute"] = time.perf_counter() - t0
-
-        # W8A8: quantize the final float kernels (LoRA subtrees and the rotate-half
-        # permutation included), then check the tree against the runtime model's.
-        if transformer_quantization:
-          t0 = time.perf_counter()
-          params = quantize_transformer_params(params, transformer_quant_targets, scale_dtype=config.weights_dtype)
+        if "transformer" in weight_cache_hits:
+          # Already permuted and quantized (permuting again would corrupt it); no
+          # LoRA (it bypasses the cache). Only check it against the runtime model.
           check_transformer_param_tree(params, abstract_transformer_vars["params"])
-          load_trace["transformer_quantize"] = time.perf_counter() - t0
+        else:
+          # load_and_convert_krea2_weights zero-fills the lora-* leaves it
+          # doesn't recognize, so write the real adapter tensors afterwards.
+          t0 = time.perf_counter()
+          params = insert_lora_params(params, lora_flat_params)
+          params = apply_diff_updates(params, lora_diff_updates)
+          load_trace["lora_apply"] = time.perf_counter() - t0
+
+          # rotate_half RoPE needs q/k head dims reordered. Runs after the LoRA
+          # up kernels and diff updates are in the tree so they are permuted too.
+          if transformer.rope_layout == "rotate_half":
+            t0 = time.perf_counter()
+            params = permute_rope_weights_to_rotate_half(
+                params,
+                num_heads=transformer.num_attention_heads,
+                num_kv_heads=transformer.num_key_value_heads,
+                head_dim=transformer.attention_head_dim,
+            )
+            load_trace["rope_permute"] = time.perf_counter() - t0
+
+          # W8A8: quantize the final float kernels (LoRA subtrees and the rotate-half
+          # permutation included), then check the tree against the runtime model's.
+          if transformer_quantization:
+            t0 = time.perf_counter()
+            params = quantize_transformer_params(params, transformer_quant_targets, scale_dtype=config.weights_dtype)
+            check_transformer_param_tree(params, abstract_transformer_vars["params"])
+            load_trace["transformer_quantize"] = time.perf_counter() - t0
+
+          save_host_params(transformer_cache, params, load_trace, "transformer_cache_write")
 
         params = flax.core.freeze(params)
         qwen3_params = flax.core.freeze(qwen3_params)

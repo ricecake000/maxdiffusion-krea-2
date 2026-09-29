@@ -130,6 +130,11 @@ def prepare_krea2_image_ids(batch_size: int, grid_height: int, grid_width: int):
   return jnp.tile(image_ids[None, ...], (batch_size, 1, 1))
 
 
+# Bump when `permute_rope_weights_to_rotate_half` changes the permuted values; it is part of the weight
+# cache key (krea2_weight_cache_dir), so this invalidates cached permuted trees.
+KREA2_ROPE_PERMUTATION_REVISION = 1
+
+
 def rotate_half_permutation(head_dim: int) -> np.ndarray:
   """Per-head index map `new = old[perm]` from interleaved to rotate-half order:
   `new[i] = old[2i]` and `new[i + head_dim/2] = old[2i + 1]` for i in [0, head_dim/2)."""
@@ -224,6 +229,7 @@ def _pop_weight(pt_state_dict, *candidate_keys):
   raise KeyError(f"None of the candidate keys {candidate_keys} found in the Krea 2 checkpoint.")
 
 
+# Bump KREA2_TRANSFORMER_WEIGHT_BUILD_REVISION (weight_cache.py) when this changes the produced values.
 def load_and_convert_krea2_weights(safetensors_path: str, params: dict, num_layers: int) -> dict:
   """Loads Krea 2 transformer weights from a diffusers-format (sharded) safetensors
   directory and maps them into the Flax `Krea2Transformer2DModel` parameter tree.

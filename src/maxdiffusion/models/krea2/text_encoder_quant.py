@@ -36,6 +36,9 @@ from maxdiffusion import max_logging
 
 TEXT_ENCODER_QUANT_MODULE_PATH = r"layers_\d+/(self_attn/(q_proj|k_proj|v_proj|o_proj)|mlp/(gate_proj|up_proj|down_proj))"
 TEXT_ENCODER_QUANTIZATION_MODES = ("", "int8")
+# Bump when `quantize_text_encoder_params` changes the stored values; it is part of the weight cache key
+# (krea2_weight_cache_dir), so this invalidates cached quantized trees.
+KREA2_TEXT_ENCODER_WEIGHT_QUANT_REVISION = 1
 
 _GIB = 1024**3
 

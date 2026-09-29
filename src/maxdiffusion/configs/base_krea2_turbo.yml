@@ -178,6 +178,11 @@ jax_cache_dir: ''
 # Serialize per-shape TPU executables so later processes can skip tracing and
 # lowering. Keep this on persistent storage for serving.
 aot_cache_dir: ''
+# Host cache of the final quantized weight trees (int8 transformer and text encoder, plus the host embedding
+# table). A run that misses saves them, later runs read them instead of reading and re-quantizing the
+# checkpoint. Only quantized components are cached; any LoRA adapter bypasses the transformer cache. Needs
+# ~17 GiB for the v6e-1 preset. Empty means off.
+krea2_weight_cache_dir: ''
 # Load a cached executable when its shape is first called instead of all of them at startup. Use it
 # when the cache holds many shapes (e.g. after krea2_precompile) and a run needs only a few.
 aot_cache_lazy_load: False

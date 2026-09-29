@@ -659,6 +659,7 @@ class NNXFlaxQwen3Model(nnx.Module):
 # -----------------------------------------------------------------------------
 
 
+# Bump KREA2_TEXT_ENCODER_WEIGHT_BUILD_REVISION (models/krea2/weight_cache.py) when this changes the produced values.
 def load_and_convert_qwen3_weights(
     safetensors_path: str, jax_params: dict, config: FlaxQwen3Config, key_prefix: str = "model."
 ) -> dict:
@@ -692,6 +693,7 @@ def _detect_qwen3_key_prefix(torch_weights, key_prefix: str) -> str:
   return key_prefix
 
 
+# Bump KREA2_TEXT_ENCODER_WEIGHT_BUILD_REVISION (models/krea2/weight_cache.py) when this changes the produced values.
 def load_qwen3_embedding_table(safetensors_path: str, key_prefix: str = "model.") -> np.ndarray:
   """Reads only the token-embedding table `(vocab_size, hidden_size)` as a bf16 host array.
 

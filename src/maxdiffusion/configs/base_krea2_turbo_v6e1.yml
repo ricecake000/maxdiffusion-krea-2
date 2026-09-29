@@ -58,6 +58,14 @@
 #   5:4, 16:9 and 21:9 are approximations that share one 4032-token (2k: 16128)
 #   transformer executable, so there are 4 token counts per size. Not yet run on
 #   a TPU; compile_krea2.py v6e-1 estimates the 3072x1344 peak at 21.36 GiB.
+# - Quantized-weight cache (krea2_weight_cache_dir, off by default): the first
+#   run saves the final int8 transformer (12.56 GiB) and text encoder (3.44 GiB
+#   plus the 0.72 GiB host embedding table) trees there, later runs read them
+#   instead of reading the bf16 checkpoint and re-quantizing it (~4 s + ~12.5 s).
+#   The key covers the model snapshot, dtypes, quantization settings and code
+#   revisions; any LoRA adapter bypasses the transformer cache. Not yet run on
+#   a TPU, the load-time gain is unmeasured:
+#     generate_krea2.py <this file> krea2_weight_cache_dir=<dir> aot_cache_dir=<dir> prompt=...
 
 # This sentinel is a reminder to choose a real run name.
 run_name: 'krea2_turbo_v6e1'
@@ -225,6 +233,11 @@ jax_cache_dir: ''
 # Serialize per-shape TPU executables so later processes can skip tracing and
 # lowering. Keep this on persistent storage for serving.
 aot_cache_dir: ''
+# Host cache of the final quantized weight trees (int8 transformer and text encoder, plus the host embedding
+# table). A run that misses saves them, later runs read them instead of reading and re-quantizing the
+# checkpoint. Only quantized components are cached; any LoRA adapter bypasses the transformer cache. Needs
+# ~17 GiB for the v6e-1 preset. Empty means off.
+krea2_weight_cache_dir: ''
 # Load a cached executable when its shape is first called instead of all of them at startup. On
 # here because a precompiled cache holds ~30 shapes and one run calls only a few.
 aot_cache_lazy_load: True
