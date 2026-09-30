@@ -17,7 +17,8 @@ limitations under the License.
 # CPU tests for the Krea 2 quantized-weight cache (krea2_weight_cache_dir): the
 # on-disk round trip, the quantized text encoder and W8A8 transformer trees
 # (bit-identical leaves and forward outputs), fingerprints, misses, saving and
-# the generate_krea2 helpers around it (float32 activations throughout).
+# the generate_krea2 helpers around it, including the build-only mode
+# (float32 activations throughout).
 
 import collections
 import importlib.metadata
@@ -35,18 +36,28 @@ import numpy as np
 import yaml
 from flax import linen as nn
 
-from maxdiffusion.generate_krea2 import load_or_build_host_params, resolve_weight_cache_dirs, save_host_params
+from maxdiffusion.generate_krea2 import (
+    check_weight_cache_saves,
+    load_or_build_host_params,
+    log_weight_cache_build_summary,
+    resolve_weight_cache_build_only,
+    resolve_weight_cache_dirs,
+    save_host_params,
+    select_weight_cache_builds,
+)
 from maxdiffusion.models.krea2 import weight_cache
 from maxdiffusion.models.krea2.text_encoder_quant import (
     KREA2_TEXT_ENCODER_WEIGHT_QUANT_REVISION,
     quantize_text_encoder_model,
     quantize_text_encoder_params,
+    resolve_text_encoder_quantization,
 )
 from maxdiffusion.models.krea2.transformer_quant import (
     KREA2_DEFAULT_QUANT_TARGETS,
     KREA2_TRANSFORMER_WEIGHT_QUANT_REVISION,
     check_transformer_param_tree,
     quantize_transformer_params,
+    resolve_transformer_quantization,
 )
 from maxdiffusion.models.krea2.util import KREA2_ROPE_PERMUTATION_REVISION, permute_rope_weights_to_rotate_half
 from maxdiffusion.models.krea2.weight_cache import (
@@ -55,6 +66,7 @@ from maxdiffusion.models.krea2.weight_cache import (
     KREA2_WEIGHT_CACHE_FORMAT,
     WeightCacheSpec,
     component_dir,
+    component_is_valid,
     list_source_files,
     load_component,
     save_component,
@@ -781,6 +793,351 @@ class GenerateWeightCacheHelpersTest(_CacheTestCase):
     self.assertEqual([name.split("-")[0] for name in os.listdir(self.cache_dir)], ["text_encoder"])
 
 
+class ComponentIsValidTest(_CacheTestCase):
+  """component_is_valid: every check of load_component, but never a read."""
+
+  def setUp(self):
+    super().setUp()
+    self.tree = _mixed_tree()
+    self.abstract = _abstract(self.tree)
+    self.source_files = [["model.safetensors", 123]]
+    self.dir = save_component(
+        self.cache_dir,
+        "transformer",
+        _META,
+        self.tree,
+        extras={"table": np.ones(3, np.float32)},
+        source_files=self.source_files,
+    )
+    self.assertIsNotNone(self.dir)
+
+  def check(self, abstract=None, **kwargs):
+    kwargs.setdefault("extra_names", ("table",))
+    kwargs.setdefault("source_files", self.source_files)
+    with (
+        mock.patch.object(weight_cache, "_read_arrays", side_effect=AssertionError("component_is_valid must not read")),
+        mock.patch.object(weight_cache.max_logging, "log") as log,
+    ):
+      valid = component_is_valid(
+          self.cache_dir, "transformer", _META, self.abstract if abstract is None else abstract, **kwargs
+      )
+    return valid, _log_lines(log)
+
+  def assert_invalid(self, reason, abstract=None, **kwargs):
+    valid, lines = self.check(abstract, **kwargs)
+    self.assertFalse(valid)
+    self.assertEqual(len(lines), 1, lines)
+    self.assertIn("miss", lines[0])
+    self.assertIn(reason, lines[0])
+
+  def test_saved_tree_is_valid(self):
+    valid, lines = self.check()
+    self.assertTrue(valid)
+    self.assertEqual(len(lines), 1, lines)
+    self.assertIn(f"{self.dir} is already complete", lines[0])
+    # Boxed and frozen abstract trees are accepted like in load_component.
+    self.assertTrue(self.check(flax.core.freeze(self.abstract))[0])
+
+  def test_no_source_files_trusts_the_cache(self):
+    valid, lines = self.check(source_files=None)
+    self.assertTrue(valid)
+    self.assertEqual(len(lines), 1, lines)
+    self.assertIn("trusted", lines[0])
+
+  def test_no_directory(self):
+    os.rename(self.dir, self.dir + "-renamed")
+    self.assert_invalid("no cache directory")
+
+  def test_truncated_weights(self):
+    path = os.path.join(self.dir, "weights.bin")
+    os.truncate(path, os.path.getsize(path) - 1)
+    self.assert_invalid("weights.bin has")
+
+  def test_stored_meta_differs(self):
+    with open(os.path.join(self.dir, "meta.json"), encoding="utf-8") as f:
+      header = json.load(f)
+    header["meta"]["model"] = "other/model"
+    with open(os.path.join(self.dir, "meta.json"), "w", encoding="utf-8") as f:
+      json.dump(header, f)
+    self.assert_invalid("fingerprint inputs differ")
+
+  def test_shape_mismatch(self):
+    self.assert_invalid("shape", abstract={**self.abstract, "bias": jax.ShapeDtypeStruct((34,), np.float32)})
+
+  def test_dtype_mismatch(self):
+    abstract = {**self.abstract, "bias": jax.ShapeDtypeStruct((33,), jnp.bfloat16)}
+    self.assert_invalid("dtype", abstract=abstract)
+    self.assertTrue(self.check(abstract, check_dtypes=False)[0])
+
+  def test_missing_extra(self):
+    self.assert_invalid("no extra array 'other'", extra_names=("table", "other"))
+
+  @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root ignores file permissions")
+  def test_unopenable_weights(self):
+    path = os.path.join(self.dir, "weights.bin")
+    os.chmod(path, 0o000)
+    try:
+      self.assert_invalid("unreadable weights.bin")
+    finally:
+      os.chmod(path, 0o600)
+
+  def test_failed_checkpoint_scan(self):
+    self.assert_invalid("source checkpoint changed", source_files=[["<unreadable>", None]])
+
+  def test_resource_errors_are_a_miss(self):
+    for name, reason in (("_stored_leaves", "header read failed"), ("_match_leaves", "index check failed")):
+      with self.subTest(name), mock.patch.object(weight_cache, name, side_effect=MemoryError()):
+        self.assert_invalid(reason)
+
+
+class GenerateWeightCacheBuildOnlyTest(_CacheTestCase):
+  """The helpers generate_krea2.main uses in krea2_weight_cache_build_only mode, in main's order."""
+
+  def setUp(self):
+    super().setUp()
+    self.transformer_tree = _mixed_tree(seed=0)
+    self.text_encoder_tree = _mixed_tree(seed=1)
+    self.table = np.arange(6, dtype=np.float32)
+    self.specs = {
+        "transformer": WeightCacheSpec(self.cache_dir, "transformer", _META, [["t.safetensors", 1]]),
+        "text_encoder": WeightCacheSpec(self.cache_dir, "text_encoder", _META, [["q.safetensors", 2]]),
+    }
+
+  def _config(self, **keys):
+    # Both components quantized and no LoRA adapter (no lora_config at all): both are cacheable.
+    return types.SimpleNamespace(
+        **{
+            "krea2_weight_cache_dir": self.cache_dir,
+            "krea2_weight_cache_build_only": True,
+            "krea2_precompile": "",
+            "krea2_transformer_quantization": "w8a8",
+            "krea2_text_encoder_quantization": "int8",
+            **keys,
+        }
+    )
+
+  @staticmethod
+  def _lora_config(*paths):
+    return {"lora_model_name_or_path": list(paths), "weight_name": [], "adapter_name": [], "scale": [], "from_pt": []}
+
+  def _checks(self, specs):
+    # As main passes them: the text encoder with its embedding table and relaxed dtypes.
+    return {
+        "transformer": (specs["transformer"], _abstract(self.transformer_tree), (), True),
+        "text_encoder": (specs["text_encoder"], _abstract(self.text_encoder_tree), ("embedding_table",), False),
+    }
+
+  def _run(self, specs, builds_fns=None):
+    """select -> build and save each missing component -> check the saves -> summary, like main.
+
+    Returns `(builds, saved, build mocks, [weight cache] lines, all log lines)`.
+    """
+    trace = {}
+    saved = {}
+    results = {
+        "transformer": (self.transformer_tree, None),
+        "text_encoder": (self.text_encoder_tree, {"embedding_table": self.table}),
+    }
+    builds_fns = builds_fns or {component: mock.Mock(return_value=result) for component, result in results.items()}
+    # One max_logging module serves weight_cache and generate_krea2.
+    with (
+        mock.patch.object(weight_cache, "_read_arrays", side_effect=AssertionError("build-only mode must not read")),
+        mock.patch.object(weight_cache.max_logging, "log") as log,
+    ):
+      builds = select_weight_cache_builds(self._checks(specs), trace)
+      # main loads the text encoder in its thread and saves it there, the transformer after it.
+      for component, trace_key in (("text_encoder", "qwen"), ("transformer", "transformer")):
+        if component not in builds:
+          continue
+        tree, extras, hit = load_or_build_host_params(None, None, builds_fns[component], trace, f"{trace_key}_cache_read")
+        self.assertFalse(hit)
+        saved[component] = save_host_params(specs[component], tree, trace, f"{trace_key}_cache_write", extras=extras)
+      check_weight_cache_saves(builds, saved)
+      log_weight_cache_build_summary(specs, builds, saved, trace, 1.0)
+    return builds, saved, builds_fns, _log_lines(log), [call.args[0] for call in log.call_args_list]
+
+  def test_key_off(self):
+    with mock.patch("maxdiffusion.generate_krea2.max_logging.log") as log:
+      for config in (
+          types.SimpleNamespace(),
+          self._config(krea2_weight_cache_build_only=False),
+          # Off, so neither the missing cache directory nor the precompile spec matter.
+          self._config(krea2_weight_cache_build_only=False, krea2_weight_cache_dir="", krea2_precompile="all"),
+      ):
+        self.assertFalse(resolve_weight_cache_build_only(config))
+    log.assert_not_called()
+    # A normal run builds nothing in this mode's sense; its failed saves stay warnings.
+    check_weight_cache_saves((), {"transformer": None, "text_encoder": None})
+
+  def test_key_on_logs_one_line(self):
+    with mock.patch("maxdiffusion.generate_krea2.max_logging.log") as log:
+      self.assertTrue(resolve_weight_cache_build_only(self._config()))
+      self.assertTrue(resolve_weight_cache_build_only(self._config(krea2_precompile=None)))
+    self.assertEqual(len(log.call_args_list), 2)
+    self.assertIn("no image is generated", log.call_args.args[0])
+
+  def test_needs_a_cache_dir(self):
+    for cache_dir in ("", "''", None):
+      with self.subTest(cache_dir=cache_dir), self.assertRaisesRegex(ValueError, "needs krea2_weight_cache_dir"):
+        resolve_weight_cache_build_only(self._config(krea2_weight_cache_dir=cache_dir))
+
+  def test_excludes_precompile(self):
+    for spec in ("all", "1k", "2k@16:9"):
+      with self.subTest(spec=spec), self.assertRaisesRegex(ValueError, "exclude each other"):
+        resolve_weight_cache_build_only(self._config(krea2_precompile=spec))
+
+  def test_nothing_to_build(self):
+    # The late check in main, after the models were built (defence in depth).
+    with self.assertRaisesRegex(ValueError, "nothing to build"):
+      select_weight_cache_builds(self._checks({"transformer": None, "text_encoder": None}), {})
+
+  def test_nothing_to_build_is_decided_from_the_config(self):
+    lora = self._lora_config("/path/to/adapter.safetensors")
+    with mock.patch("maxdiffusion.generate_krea2.max_logging.log") as log:
+      for keys in (
+          {"krea2_transformer_quantization": "", "krea2_text_encoder_quantization": ""},
+          {"krea2_transformer_quantization": "''", "krea2_text_encoder_quantization": None},
+          {"krea2_text_encoder_quantization": "", "lora_config": lora},
+      ):
+        with self.subTest(keys=keys), self.assertRaisesRegex(ValueError, "nothing to build") as raised:
+          resolve_weight_cache_build_only(self._config(**keys))
+        # Both reasons are named.
+        message = str(raised.exception)
+        self.assertIn("krea2_text_encoder_quantization off", message)
+        self.assertIn("LoRA" if "lora_config" in keys else "krea2_transformer_quantization off", message)
+    log.assert_not_called()
+    with mock.patch("maxdiffusion.generate_krea2.max_logging.log"):
+      for keys in (
+          # Only the text encoder is quantized, with or without an adapter.
+          {"krea2_transformer_quantization": ""},
+          {"lora_config": lora},
+          # Only the transformer, without an adapter (an empty lora_config means none).
+          {"krea2_text_encoder_quantization": "", "lora_config": self._lora_config()},
+          {"krea2_text_encoder_quantization": "", "lora_config": None},
+      ):
+        with self.subTest(keys=keys):
+          self.assertTrue(resolve_weight_cache_build_only(self._config(**keys)))
+
+  def test_early_decision_agrees_with_resolve_weight_cache_dirs(self):
+    for transformer_mode in ("w8a8", ""):
+      for te_mode in ("int8", ""):
+        for adapter in (False, True):
+          config = self._config(
+              krea2_transformer_quantization=transformer_mode,
+              krea2_text_encoder_quantization=te_mode,
+              lora_config=self._lora_config(*(["/path/to/adapter.safetensors"] if adapter else [])),
+          )
+          with self.subTest(transformer=transformer_mode, text_encoder=te_mode, adapter=adapter):
+            # maybe_load_krea2_lora returns one compile spec entry per configured adapter.
+            with mock.patch("maxdiffusion.generate_krea2.max_logging.log") as log:
+              dirs = resolve_weight_cache_dirs(
+                  config,
+                  resolve_transformer_quantization(config)[0],
+                  resolve_text_encoder_quantization(config)[0],
+                  (("adapter", 1.0),) if adapter else (),
+              )
+            later_reasons = [line.split(": ", 1)[1].rstrip(".") for line in _log_lines(log)]
+            if any(dirs):
+              with mock.patch("maxdiffusion.generate_krea2.max_logging.log"):
+                self.assertTrue(resolve_weight_cache_build_only(config))
+            else:
+              with self.assertRaisesRegex(ValueError, "nothing to build") as raised:
+                resolve_weight_cache_build_only(config)
+              # The same reasons as the [weight cache] lines of the later decision.
+              self.assertEqual(len(later_reasons), 2, later_reasons)
+              for reason in later_reasons:
+                self.assertIn(reason, str(raised.exception))
+
+  def test_key_off_resolves_no_quantization(self):
+    with (
+        mock.patch(
+            "maxdiffusion.models.krea2.transformer_quant.resolve_transformer_quantization",
+            side_effect=AssertionError("the normal path must not resolve the quantization here"),
+        ),
+        mock.patch(
+            "maxdiffusion.models.krea2.text_encoder_quant.resolve_text_encoder_quantization",
+            side_effect=AssertionError("the normal path must not resolve the quantization here"),
+        ),
+    ):
+      for config in (
+          types.SimpleNamespace(),
+          self._config(krea2_weight_cache_build_only=False, krea2_transformer_quantization=""),
+      ):
+        self.assertFalse(resolve_weight_cache_build_only(config))
+
+  def test_missing_components_are_built_once_and_saved(self):
+    builds, saved, builds_fns, lines, log = self._run(self.specs)
+    self.assertEqual(builds, ("transformer", "text_encoder"))
+    for component in builds:
+      builds_fns[component].assert_called_once_with()
+      self.assertEqual(saved[component], component_dir(self.cache_dir, component, _META))
+    self.assertEqual(sum("no cache directory" in line for line in lines), 2, lines)
+    summary = [line for line in log if "built and saved" in line]
+    self.assertEqual([line.split()[0] for line in summary], ["transformer", "text_encoder"])
+    self.assertIn("Load breakdown", "\n".join(log))
+    self.assertIn("SUCCESS! Weight cache build complete: 2 component(s) built, 0 already complete", log[-1])
+    # A second build-only run finds both complete: nothing is read or built.
+    never = {name: mock.Mock(side_effect=AssertionError(f"{name} must not be built")) for name in self.specs}
+    builds, saved, _, lines, log = self._run(self.specs, never)
+    self.assertEqual((builds, saved), ((), {}))
+    self.assertEqual(sum("already complete" in line for line in lines), 2, lines)
+    self.assertIn("0 component(s) built, 2 already complete", log[-1])
+
+  def test_complete_component_is_neither_read_nor_built(self):
+    save_component(
+        self.cache_dir,
+        "text_encoder",
+        _META,
+        self.text_encoder_tree,
+        extras={"embedding_table": self.table},
+        source_files=self.specs["text_encoder"].source_files,
+    )
+    fns = {
+        "transformer": mock.Mock(return_value=(self.transformer_tree, None)),
+        "text_encoder": mock.Mock(side_effect=AssertionError("the complete text encoder must not be built")),
+    }
+    builds, saved, _, _, log = self._run(self.specs, fns)
+    self.assertEqual(builds, ("transformer",))
+    fns["transformer"].assert_called_once_with()
+    self.assertEqual(set(saved), {"transformer"})
+    self.assertTrue(any(line.startswith("text_encoder") and "already complete" in line for line in log), log)
+    self.assertTrue(any(line.startswith("transformer") and "built and saved" in line for line in log), log)
+
+  def test_component_without_a_spec_is_not_loaded(self):
+    # A LoRA adapter bypasses the transformer cache: its 24 GiB tree is not read at all.
+    specs = {**self.specs, "transformer": None}
+    fns = {
+        "transformer": mock.Mock(side_effect=AssertionError("the uncached transformer must not be loaded")),
+        "text_encoder": mock.Mock(return_value=(self.text_encoder_tree, {"embedding_table": self.table})),
+    }
+    builds, saved, _, lines, log = self._run(specs, fns)
+    self.assertEqual(builds, ("text_encoder",))
+    self.assertEqual(set(saved), {"text_encoder"})
+    self.assertFalse(any(line.startswith("[weight cache] transformer") for line in lines), lines)
+    self.assertFalse(any(line.startswith("transformer") for line in log), log)
+    self.assertEqual(os.listdir(self.cache_dir), [os.path.basename(saved["text_encoder"])])
+
+  def test_failed_save_raises_after_both_were_attempted(self):
+    real_save = weight_cache.save_component
+
+    def save(cache_dir, component, *args, **kwargs):
+      if component == "text_encoder":
+        return None  # like a full disk: save_component logged a warning
+      return real_save(cache_dir, component, *args, **kwargs)
+
+    with (
+        mock.patch.object(weight_cache, "save_component", side_effect=save),
+        self.assertRaisesRegex(RuntimeError, "could not save text_encoder to") as raised,
+    ):
+      self._run(self.specs)
+    self.assertNotIn("transformer", str(raised.exception))
+    # The transformer, built after the failed text encoder save, was still saved.
+    with mock.patch.object(weight_cache.max_logging, "log"):
+      self.assertTrue(component_is_valid(self.cache_dir, "transformer", _META, _abstract(self.transformer_tree)))
+    with self.assertRaisesRegex(RuntimeError, "could not save transformer, text_encoder to"):
+      check_weight_cache_saves(("transformer", "text_encoder"), {"transformer": None})
+
+
 class WeightCacheMetaTest(unittest.TestCase):
 
   def setUp(self):
@@ -829,7 +1186,9 @@ class WeightCacheMetaTest(unittest.TestCase):
   def test_configs_define_the_key_off(self):
     for name in ("base_krea2.yml", "base_krea2_turbo.yml", "base_krea2_turbo_v6e1.yml"):
       with open(os.path.join(_CONFIG_DIR, name), encoding="utf-8") as f:
-        self.assertEqual(yaml.safe_load(f)["krea2_weight_cache_dir"], "", name)
+        config = yaml.safe_load(f)
+      self.assertEqual(config["krea2_weight_cache_dir"], "", name)
+      self.assertIs(config["krea2_weight_cache_build_only"], False, name)
 
 
 if __name__ == "__main__":

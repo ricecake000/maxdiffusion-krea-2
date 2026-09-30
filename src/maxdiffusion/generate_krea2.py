@@ -38,6 +38,13 @@ limitations under the License.
 #
 #   python src/maxdiffusion/generate_krea2.py src/maxdiffusion/configs/base_krea2_turbo_v6e1.yml \
 #     krea2_weight_cache_dir=/path/to/weights aot_cache_dir=/path/to/aot prompt="a fox in the snow"
+#
+# Build the weight cache only (krea2_weight_cache_build_only): reads and quantizes the checkpoint on the host,
+# saves the missing components and exits before device placement, so it needs no accelerator (e.g. a CPU VM).
+# A machine without a TPU has no JAX distributed coordinator, hence skip_jax_distributed_system=True:
+#
+#   JAX_PLATFORMS=cpu python src/maxdiffusion/generate_krea2.py src/maxdiffusion/configs/base_krea2_turbo_v6e1.yml \
+#     skip_jax_distributed_system=True krea2_weight_cache_dir=/path/to/weights krea2_weight_cache_build_only=True
 
 import gc
 import inspect
@@ -244,6 +251,24 @@ def flash_custom_block_selection_aot_meta(attention) -> dict:
   return {"krea2_block_selection": f"r{KREA2_BLOCK_SELECTION_REVISION}"}
 
 
+def _weight_cache_dir(config) -> str:
+  # Strip quotes so a command-line override `krea2_weight_cache_dir=''` means off.
+  return str(getattr(config, "krea2_weight_cache_dir", "") or "").strip().strip("'\"")
+
+
+def _weight_cache_bypass_reasons(transformer_quantization, te_quantization, lora_configured) -> dict:
+  """Maps each component to why it does not use the weight cache, '' when it does."""
+  transformer_reason = ""
+  if not transformer_quantization:
+    transformer_reason = "unquantized (krea2_transformer_quantization off), nothing to cache."
+  elif lora_configured:
+    transformer_reason = "bypassed, LoRA adapters are merged into its tree but not in its key."
+  text_encoder_reason = ""
+  if te_quantization != "int8":
+    text_encoder_reason = "unquantized (krea2_text_encoder_quantization off), nothing to cache."
+  return {"transformer": transformer_reason, "text_encoder": text_encoder_reason}
+
+
 def resolve_weight_cache_dirs(config, transformer_quantization, te_quantization, lora_compile_spec) -> Tuple[str, str]:
   """Returns `(transformer_dir, text_encoder_dir)` of `krea2_weight_cache_dir`; '' means no cache for that component.
 
@@ -253,21 +278,14 @@ def resolve_weight_cache_dirs(config, transformer_quantization, te_quantization,
   of the fingerprint); the text encoder cache does not depend on LoRA. Logs one
   line per component that does not use the cache; nothing when the cache is off.
   """
-  # Strip quotes so a command-line override `krea2_weight_cache_dir=''` means off.
-  cache_dir = str(getattr(config, "krea2_weight_cache_dir", "") or "").strip().strip("'\"")
+  cache_dir = _weight_cache_dir(config)
   if not cache_dir:
     return "", ""
-  transformer_dir = text_encoder_dir = cache_dir
-  if not transformer_quantization:
-    max_logging.log("[weight cache] transformer: unquantized (krea2_transformer_quantization off), nothing to cache.")
-    transformer_dir = ""
-  elif lora_compile_spec:
-    max_logging.log("[weight cache] transformer: bypassed, LoRA adapters are merged into its tree but not in its key.")
-    transformer_dir = ""
-  if te_quantization != "int8":
-    max_logging.log("[weight cache] text_encoder: unquantized (krea2_text_encoder_quantization off), nothing to cache.")
-    text_encoder_dir = ""
-  return transformer_dir, text_encoder_dir
+  reasons = _weight_cache_bypass_reasons(transformer_quantization, te_quantization, bool(lora_compile_spec))
+  for component, reason in reasons.items():
+    if reason:
+      max_logging.log(f"[weight cache] {component}: {reason}")
+  return tuple("" if reasons[component] else cache_dir for component in ("transformer", "text_encoder"))
 
 
 def load_or_build_host_params(cache, abstract_params, build, load_trace, trace_key, extra_names=(), check_dtypes=True):
@@ -311,6 +329,140 @@ def save_host_params(cache, tree, load_trace, trace_key, extras=None):
   saved = save_component(cache.cache_dir, cache.component, cache.meta, tree, extras=extras, source_files=cache.source_files)
   load_trace[trace_key] = time.perf_counter() - t0
   return saved
+
+
+# Build-only mode's load_trace stages per component: the validity check, or the build and the write
+# (qwen_host includes the text encoder's quantization, embedding table and write).
+_WEIGHT_CACHE_CHECK_STAGES = {"transformer": "transformer_cache_check", "text_encoder": "qwen_cache_check"}
+_WEIGHT_CACHE_BUILD_STAGES = {
+    "transformer": ("transformer_host", "lora_apply", "rope_permute", "transformer_quantize", "transformer_cache_write"),
+    "text_encoder": ("qwen_host",),
+}
+
+
+def resolve_weight_cache_build_only(config) -> bool:
+  """Whether `krea2_weight_cache_build_only` is on; validates it before anything is loaded.
+
+  Build-only mode saves the missing weight cache components and exits before
+  device placement. Raises ValueError without `krea2_weight_cache_dir`,
+  together with `krea2_precompile` (the two modes exclude each other) or when
+  no component would use the cache (decided from the config alone, as
+  `resolve_weight_cache_dirs` decides it later, so nothing is downloaded or
+  built first). Logs one line when on, nothing when off.
+  """
+  if not getattr(config, "krea2_weight_cache_build_only", False):
+    return False
+  if not _weight_cache_dir(config):
+    raise ValueError("krea2_weight_cache_build_only needs krea2_weight_cache_dir: the built trees are only kept there.")
+  spec = getattr(config, "krea2_precompile", "")
+  if parse_krea2_precompile("" if spec is None else spec):
+    raise ValueError(
+        "krea2_weight_cache_build_only and krea2_precompile exclude each other: build-only mode exits before "
+        "anything is compiled."
+    )
+  from maxdiffusion.models.krea2.text_encoder_quant import resolve_text_encoder_quantization
+  from maxdiffusion.models.krea2.transformer_quant import resolve_transformer_quantization
+
+  # Configured adapters, as maybe_load_krea2_lora reads them (it returns a compile spec per adapter).
+  lora_config = getattr(config, "lora_config", None) or {}
+  lora_configured = len(lora_config.get("lora_model_name_or_path") or ()) > 0
+  reasons = _weight_cache_bypass_reasons(
+      resolve_transformer_quantization(config)[0], resolve_text_encoder_quantization(config)[0], lora_configured
+  )
+  if all(reasons.values()):
+    raise ValueError(
+        "krea2_weight_cache_build_only: nothing to build, no component would use the weight cache: "
+        + "; ".join(f"{component}: {reason.rstrip('.')}" for component, reason in reasons.items())
+        + "."
+    )
+  max_logging.log(
+      f"Weight cache build-only mode: saving the missing components to {_weight_cache_dir(config)}; "
+      "no image is generated."
+  )
+  return True
+
+
+def select_weight_cache_builds(checks, load_trace) -> Tuple[str, ...]:
+  """Build-only mode: the components whose cache must be built, in `checks` order.
+
+  `checks` maps a component to `(cache, abstract_params, extra_names,
+  check_dtypes)` as main reads it. A component with `cache` None (not cached,
+  see `resolve_weight_cache_dirs`) is skipped, one whose cache is already
+  complete (`component_is_valid`, which never reads the arrays) too;
+  `load_trace` gets the time of each check. Raises ValueError when no
+  component has a cache.
+  """
+  from maxdiffusion.models.krea2.weight_cache import component_is_valid
+
+  if all(cache is None for cache, _, _, _ in checks.values()):
+    raise ValueError(
+        "krea2_weight_cache_build_only: nothing to build, no component uses the weight cache "
+        "(see the [weight cache] lines above)."
+    )
+  builds = []
+  for component, (cache, abstract_params, extra_names, check_dtypes) in checks.items():
+    if cache is None:
+      continue
+    t0 = time.perf_counter()
+    valid = component_is_valid(
+        cache.cache_dir,
+        cache.component,
+        cache.meta,
+        abstract_params,
+        extra_names=extra_names,
+        source_files=cache.source_files,
+        check_dtypes=check_dtypes,
+    )
+    load_trace[_WEIGHT_CACHE_CHECK_STAGES[component]] = time.perf_counter() - t0
+    if not valid:
+      builds.append(component)
+  return tuple(builds)
+
+
+def check_weight_cache_saves(builds, saved) -> None:
+  """Build-only mode: raises RuntimeError naming each built component whose save failed.
+
+  `saved` maps a component to `save_host_params`' result (None when nothing
+  was written). In a normal run a failed save stays a warning.
+  """
+  failed = [component for component in builds if not saved.get(component)]
+  if failed:
+    raise RuntimeError(
+        f"krea2_weight_cache_build_only: could not save {', '.join(failed)} to the weight cache "
+        "(see the [weight cache] warnings above)."
+    )
+
+
+def log_weight_cache_build_summary(caches, builds, saved, load_trace, load_time) -> None:
+  """Logs one line per cached component (built and saved / already complete) plus the load timing."""
+  from maxdiffusion.models.krea2.weight_cache import component_dir, weights_nbytes
+
+  max_logging.log("=" * 80)
+  max_logging.log("KREA 2 WEIGHT CACHE BUILD SUMMARY")
+  max_logging.log("=" * 80)
+  for component, cache in caches.items():
+    if cache is None:
+      continue
+    if component in builds:
+      status, directory = "built and saved", saved[component]
+      stages = _WEIGHT_CACHE_BUILD_STAGES[component]
+    else:
+      status, directory = "already complete", component_dir(cache.cache_dir, cache.component, cache.meta)
+      stages = (_WEIGHT_CACHE_CHECK_STAGES[component],)
+    nbytes = weights_nbytes(directory)
+    size = f"{nbytes / 1024**3:.2f} GiB" if nbytes is not None else "? GiB"
+    seconds = sum(load_trace.get(stage, 0.0) for stage in stages)
+    max_logging.log(f"{component:<12} {status:<16} {size:>10} {seconds:>7.1f} s  {directory}")
+  max_logging.log(f" -> [TIMING] Total Weight Cache Build: {load_time:.2f} seconds")
+  max_logging.log(
+      " -> [TIMING] Load breakdown: "
+      + ", ".join(f"{stage}={seconds:.2f}s" for stage, seconds in load_trace.items())
+  )
+  max_logging.log("=" * 80)
+  max_logging.log(
+      f"SUCCESS! Weight cache build complete: {len(builds)} component(s) built, "
+      f"{sum(cache is not None for cache in caches.values()) - len(builds)} already complete!"
+  )
 
 
 # Precompile mode's prompt: short enough for the smallest text bucket, so each
@@ -571,6 +723,8 @@ def main(argv):
   text_compaction_multiple = int(getattr(config, "krea2_text_compaction_multiple", 0) or 0)
   if config.attention == "flash_custom" and text_compaction_multiple <= 0:
     text_compaction_multiple = int(config.max_sequence_length)
+  # Before the precompile plan: its aot_cache_dir error would hide that the two modes exclude each other.
+  build_only = resolve_weight_cache_build_only(config)
   precompile_plan = resolve_precompile_plan(config, text_compaction_multiple)
   if precompile_plan:
     max_logging.log(
@@ -815,6 +969,22 @@ def main(argv):
   load_trace = {}
   parallel_loading = getattr(config, "parallel_component_loading", True)
   rngs = nnx.Rngs(jax.random.key(config.seed if config.seed is not None else 0))
+  qwen_extra_names = ("embedding_table",) if te_embed_on_host else ()
+  # Build-only mode loads only the components whose cache is missing: a complete
+  # one is not read, one without a cache (nothing it could save) not loaded.
+  weight_cache_builds = ()
+  if build_only:
+    weight_cache_builds = select_weight_cache_builds(
+        {
+            "transformer": (transformer_cache, abstract_transformer_vars["params"], (), True),
+            "text_encoder": (text_encoder_cache, abstract_qwen3_vars["params"], qwen_extra_names, False),
+        },
+        load_trace,
+    )
+  load_transformer = not build_only or "transformer" in weight_cache_builds
+  load_text_encoder = not build_only or "text_encoder" in weight_cache_builds
+  # save_host_params' result per component; a failed save fails build-only mode.
+  weight_cache_saved = {}
 
   def load_vae_timed():
     t0 = time.perf_counter()
@@ -824,7 +994,8 @@ def main(argv):
   # VAE is small and independent. Hide it behind the much larger Transformer
   # and Qwen host reads, but wait before the main device transfer so PCIe/ICI
   # traffic does not contend.
-  common_executor = ThreadPoolExecutor(max_workers=1) if parallel_loading else None
+  # Build-only mode never loads the VAE.
+  common_executor = ThreadPoolExecutor(max_workers=1) if parallel_loading and not build_only else None
   vae_future = common_executor.submit(load_vae_timed) if common_executor is not None else None
 
   try:
@@ -854,8 +1025,9 @@ def main(argv):
 
         def load_transformer_timed():
           t0 = time.perf_counter()
+          # Build-only mode builds without a read: the cache was just found incomplete.
           result, _, hit = load_or_build_host_params(
-              transformer_cache,
+              None if build_only else transformer_cache,
               abstract_transformer_vars["params"],
               lambda: (load_and_convert_krea2_weights(transformer_path, params, num_layers), None),
               load_trace,
@@ -897,23 +1069,25 @@ def main(argv):
           # The cached scales have the compute dtype, the abstract tree's may not: floating
           # leaves only need a floating dtype, the others (int8 qvalues) their exact dtype.
           result, extras, hit = load_or_build_host_params(
-              text_encoder_cache,
+              None if build_only else text_encoder_cache,
               abstract_qwen3_vars["params"],
               build_qwen_host_params,
               load_trace,
               "qwen_cache_read",
-              extra_names=("embedding_table",) if te_embed_on_host else (),
+              extra_names=qwen_extra_names,
               check_dtypes=False,
           )
           if hit:
             weight_cache_hits.add("text_encoder")
           else:
-            save_host_params(text_encoder_cache, result, load_trace, "qwen_cache_write", extras=extras)
+            weight_cache_saved["text_encoder"] = save_host_params(
+                text_encoder_cache, result, load_trace, "qwen_cache_write", extras=extras
+            )
           if te_embed_on_host:
             text_embedding.append(extras["embedding_table"])
           return result, time.perf_counter() - t0
 
-        if parallel_loading:
+        if parallel_loading and load_transformer and load_text_encoder:
           with ThreadPoolExecutor(max_workers=2) as weight_executor:
             transformer_future = weight_executor.submit(load_transformer_timed)
             qwen_future = weight_executor.submit(load_qwen_timed)
@@ -923,14 +1097,16 @@ def main(argv):
             # float kernels that quantize_transformer_params replaces) until main returns.
             del transformer_future, qwen_future
         else:
-          params, load_trace["transformer_host"] = load_transformer_timed()
-          qwen3_params, load_trace["qwen_host"] = load_qwen_timed()
+          if load_transformer:
+            params, load_trace["transformer_host"] = load_transformer_timed()
+          if load_text_encoder:
+            qwen3_params, load_trace["qwen_host"] = load_qwen_timed()
 
         if "transformer" in weight_cache_hits:
           # Already permuted and quantized (permuting again would corrupt it); no
           # LoRA (it bypasses the cache). Only check it against the runtime model.
           check_transformer_param_tree(params, abstract_transformer_vars["params"])
-        else:
+        elif load_transformer:
           # load_and_convert_krea2_weights zero-fills the lora-* leaves it
           # doesn't recognize, so write the real adapter tensors afterwards.
           t0 = time.perf_counter()
@@ -958,7 +1134,21 @@ def main(argv):
             check_transformer_param_tree(params, abstract_transformer_vars["params"])
             load_trace["transformer_quantize"] = time.perf_counter() - t0
 
-          save_host_params(transformer_cache, params, load_trace, "transformer_cache_write")
+          weight_cache_saved["transformer"] = save_host_params(
+              transformer_cache, params, load_trace, "transformer_cache_write"
+          )
+
+        if build_only:
+          # Both components were attempted; no tokenizer, pipeline, device placement or generation.
+          check_weight_cache_saves(weight_cache_builds, weight_cache_saved)
+          log_weight_cache_build_summary(
+              {"transformer": transformer_cache, "text_encoder": text_encoder_cache},
+              weight_cache_builds,
+              weight_cache_saved,
+              load_trace,
+              time.time() - t_load_start,
+          )
+          return
 
         params = flax.core.freeze(params)
         qwen3_params = flax.core.freeze(qwen3_params)

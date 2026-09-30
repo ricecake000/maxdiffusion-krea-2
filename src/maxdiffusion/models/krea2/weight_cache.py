@@ -382,6 +382,23 @@ def _fsync_directory(path) -> None:
     os.close(fd)
 
 
+def _weights_open_error(directory) -> Optional[str]:
+  """None when the `weights.bin` of `directory` can be opened for reading, else the reason."""
+  try:
+    os.close(os.open(os.path.join(directory, _WEIGHTS_FILE), os.O_RDONLY))
+  except OSError as exc:
+    return f"unreadable {_WEIGHTS_FILE} ({exc!r})"
+  return None
+
+
+def weights_nbytes(directory) -> Optional[int]:
+  """Size of the `weights.bin` of a component directory; None when it cannot be read."""
+  try:
+    return os.path.getsize(os.path.join(directory, _WEIGHTS_FILE))
+  except OSError:
+    return None
+
+
 def save_component(cache_dir, component, meta, tree, extras=None, source_files=None) -> Optional[str]:
   """Writes `tree` (and the named `extras` arrays) as `<cache_dir>/<component>-<fp>`.
 
@@ -409,11 +426,7 @@ def save_component(cache_dir, component, meta, tree, extras=None, source_files=N
       if (_layout_signature(header["index"]), _layout_signature(header.get("extras") or [])) != signature:
         return False
       # A weights file that cannot be opened misses on every load: replace it.
-      try:
-        os.close(os.open(os.path.join(final_dir, _WEIGHTS_FILE), os.O_RDONLY))
-      except OSError:
-        return False
-      return True
+      return _weights_open_error(final_dir) is None
 
     os.makedirs(cache_dir, exist_ok=True)
     if existing_is_valid():
@@ -548,6 +561,64 @@ def _read_arrays(weights_path, entries, arrays, num_workers) -> None:
     os.close(fd)
 
 
+def _matching_entries(cache_dir, component, meta, abstract_tree, extra_names, source_files, check_dtypes):
+  """The checks of `load_component` short of allocating and reading the arrays.
+
+  Returns `(directory, entries, treedef, reason)`: `entries` are the stored
+  index entries of the abstract tree's leaves (in flattening order) followed by
+  those of the extras, or None with the miss `reason`; `directory` is None when
+  even the fingerprint failed. Resource problems are a miss, errors in
+  `abstract_tree` raise.
+  """
+  directory = None
+  try:
+    directory = component_dir(cache_dir, component, meta)
+    header, reason = _read_header(directory, component, meta, source_files)
+  except _RESOURCE_ERRORS as exc:
+    header, reason = None, f"header read failed ({exc!r})"
+  if header is None:
+    return directory, None, None, reason
+
+  # Not protected: an error in the caller's abstract tree is a programming error.
+  abstract = flax.core.unfreeze(nn.unbox(abstract_tree))
+  leaves, treedef = jax.tree_util.tree_flatten_with_path(abstract)
+  expected = [(jax.tree_util.keystr(path), leaf) for path, leaf in leaves]
+
+  try:
+    entries, reason = _match_leaves(header, expected, extra_names, check_dtypes)
+  except _RESOURCE_ERRORS as exc:
+    entries, reason = None, f"index check failed ({exc!r})"
+  return directory, entries, treedef, reason
+
+
+def _log_miss(component, location, reason) -> None:
+  max_logging.log(f"[weight cache] {component}: miss at {location}: {reason}.")
+
+
+def component_is_valid(
+    cache_dir, component, meta, abstract_tree, extra_names=(), source_files=None, check_dtypes=True
+) -> bool:
+  """Whether `load_component` with these arguments would hit, without reading the arrays.
+
+  Runs every check of `load_component` short of allocating and reading the
+  arrays (header, canonical layout, paths, shapes, dtypes, extras) and checks
+  that `weights.bin` can be opened for reading. Logs one line (`already
+  complete` or the miss reason) and never raises for a bad or missing cache;
+  errors in `abstract_tree` raise.
+  """
+  directory, entries, _, reason = _matching_entries(
+      cache_dir, component, meta, abstract_tree, extra_names, source_files, check_dtypes
+  )
+  if entries is not None:
+    reason = _weights_open_error(directory)
+  if reason is not None:
+    _log_miss(component, directory or cache_dir, reason)
+    return False
+  trusted = "; no checkpoint files to compare, trusted without them" if source_files is None else ""
+  max_logging.log(f"[weight cache] {component}: {directory} is already complete{trusted}.")
+  return True
+
+
 def load_component(
     cache_dir, component, meta, abstract_tree, extra_names=(), source_files=None, check_dtypes=True, num_workers=None
 ) -> Optional[Tuple[object, dict]]:
@@ -576,28 +647,13 @@ def load_component(
   with the reason and returns None. Errors in `abstract_tree` itself raise.
   """
   start = time.perf_counter()
-  directory = None
+  directory, entries, treedef, reason = _matching_entries(
+      cache_dir, component, meta, abstract_tree, extra_names, source_files, check_dtypes
+  )
 
   def miss(reason):  # returns None
-    max_logging.log(f"[weight cache] {component}: miss at {directory or cache_dir}: {reason}.")
+    _log_miss(component, directory or cache_dir, reason)
 
-  try:
-    directory = component_dir(cache_dir, component, meta)
-    header, reason = _read_header(directory, component, meta, source_files)
-  except _RESOURCE_ERRORS as exc:
-    header, reason = None, f"header read failed ({exc!r})"
-  if header is None:
-    return miss(reason)
-
-  # Not protected: an error in the caller's abstract tree is a programming error.
-  abstract = flax.core.unfreeze(nn.unbox(abstract_tree))
-  leaves, treedef = jax.tree_util.tree_flatten_with_path(abstract)
-  expected = [(jax.tree_util.keystr(path), leaf) for path, leaf in leaves]
-
-  try:
-    entries, reason = _match_leaves(header, expected, extra_names, check_dtypes)
-  except _RESOURCE_ERRORS as exc:
-    entries, reason = None, f"index check failed ({exc!r})"
   if entries is None:
     return miss(reason)
   try:
@@ -608,9 +664,10 @@ def load_component(
     _read_arrays(os.path.join(directory, _WEIGHTS_FILE), entries, arrays, num_workers)
   except (*_RESOURCE_ERRORS, _ShortRead) as exc:
     return miss(f"read failed ({exc!r})")
+  num_leaves = len(entries) - len(extra_names)
   try:
-    tree = jax.tree_util.tree_unflatten(treedef, arrays[: len(expected)])
-    extras = dict(zip(extra_names, arrays[len(expected) :]))
+    tree = jax.tree_util.tree_unflatten(treedef, arrays[:num_leaves])
+    extras = dict(zip(extra_names, arrays[num_leaves:]))
   except (*_RESOURCE_ERRORS, ValueError, TypeError, OverflowError) as exc:
     return miss(f"tree reconstruction failed ({exc!r})")
 

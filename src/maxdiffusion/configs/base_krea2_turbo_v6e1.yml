@@ -63,9 +63,15 @@
 #   plus the 0.72 GiB host embedding table) trees there, later runs read them
 #   instead of reading the bf16 checkpoint and re-quantizing it (~4 s + ~12.5 s).
 #   The key covers the model snapshot, dtypes, quantization settings and code
-#   revisions; any LoRA adapter bypasses the transformer cache. Not yet run on
-#   a TPU, the load-time gain is unmeasured:
+#   revisions; any LoRA adapter bypasses the transformer cache. Measured on
+#   v6e-1 (1024x1024): load 72.0 s without the cache, 4.48 s on a hit (warm
+#   page cache), images bit-identical:
 #     generate_krea2.py <this file> krea2_weight_cache_dir=<dir> aot_cache_dir=<dir> prompt=...
+#   krea2_weight_cache_build_only=True only builds the cache and exits; it needs
+#   no accelerator, so far run only in CPU tests. On a CPU VM (no TPU, so no JAX
+#   distributed coordinator):
+#     JAX_PLATFORMS=cpu generate_krea2.py <this file> skip_jax_distributed_system=True \
+#       krea2_weight_cache_dir=<dir> krea2_weight_cache_build_only=True
 
 # This sentinel is a reminder to choose a real run name.
 run_name: 'krea2_turbo_v6e1'
@@ -238,6 +244,11 @@ aot_cache_dir: ''
 # checkpoint. Only quantized components are cached; any LoRA adapter bypasses the transformer cache. Needs
 # ~17 GiB for the v6e-1 preset. Empty means off.
 krea2_weight_cache_dir: ''
+# Only build krea2_weight_cache_dir: read and quantize the checkpoint on the host, save the components whose
+# cache is missing (complete ones are not read) and exit without generating an image. Needs no accelerator
+# (e.g. a CPU VM with JAX_PLATFORMS=cpu plus skip_jax_distributed_system=True, as a machine without a TPU
+# has no JAX distributed coordinator); excludes krea2_precompile.
+krea2_weight_cache_build_only: False
 # Load a cached executable when its shape is first called instead of all of them at startup. On
 # here because a precompiled cache holds ~30 shapes and one run calls only a few.
 aot_cache_lazy_load: True

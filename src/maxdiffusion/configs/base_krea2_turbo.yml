@@ -183,6 +183,11 @@ aot_cache_dir: ''
 # checkpoint. Only quantized components are cached; any LoRA adapter bypasses the transformer cache. Needs
 # ~17 GiB for the v6e-1 preset. Empty means off.
 krea2_weight_cache_dir: ''
+# Only build krea2_weight_cache_dir: read and quantize the checkpoint on the host, save the components whose
+# cache is missing (complete ones are not read) and exit without generating an image. Needs no accelerator
+# (e.g. a CPU VM with JAX_PLATFORMS=cpu plus skip_jax_distributed_system=True, as a machine without a TPU
+# has no JAX distributed coordinator); excludes krea2_precompile.
+krea2_weight_cache_build_only: False
 # Load a cached executable when its shape is first called instead of all of them at startup. Use it
 # when the cache holds many shapes (e.g. after krea2_precompile) and a run needs only a few.
 aot_cache_lazy_load: False
