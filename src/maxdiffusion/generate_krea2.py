@@ -242,13 +242,16 @@ def flash_custom_block_selection_aot_meta(attention) -> dict:
   `flash_block_sizes` in the meta only records the configured sizes, not the
   automatic choice, so the value carries `KREA2_BLOCK_SELECTION_REVISION` and a
   changed choice misses executables cached for the previous one. Other kernels
-  keep their fingerprint.
+  keep their fingerprint. A "+budget" suffix marks `AUTO_BLOCK_Q_BUDGET_EXTENSION`
+  on, since the kernel's block choice differs with it while the revision does not,
+  so executables compiled with it on must not be reused after it is switched off.
   """
-  from maxdiffusion.kernels.krea2_attention import KREA2_BLOCK_SELECTION_REVISION
+  from maxdiffusion.kernels.krea2_attention import AUTO_BLOCK_Q_BUDGET_EXTENSION, KREA2_BLOCK_SELECTION_REVISION
 
   if attention != "flash_custom":
     return {}
-  return {"krea2_block_selection": f"r{KREA2_BLOCK_SELECTION_REVISION}"}
+  suffix = "+budget" if AUTO_BLOCK_Q_BUDGET_EXTENSION else ""
+  return {"krea2_block_selection": f"r{KREA2_BLOCK_SELECTION_REVISION}{suffix}"}
 
 
 def _weight_cache_dir(config) -> str:

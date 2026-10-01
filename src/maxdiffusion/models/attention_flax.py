@@ -1835,9 +1835,10 @@ def krea2_custom_flash_kernel(q, k, v, context):
     valid_kv_len = jnp.broadcast_to(valid_kv_len, (batch,))
 
   user_sizes = _read_custom_block_sizes(context["flash_block_sizes"])
-  # The automatic block_q depends on the chip's VMEM budget and the operand
-  # dtype it was calibrated for (all of q/k/v must have it); topology-desc
-  # devices of a cross-compile report the target chip here too.
+  # block_q is the kernel's automatic choice (at most 2048, padded rows plus a
+  # per-block overhead). The device kind and operand dtype only matter for the
+  # VMEM-budget extension, which is off (topology-desc devices of a
+  # cross-compile report the target chip here too).
   block_sizes = krea2_kernel.select_krea2_block_sizes(
       q_seq_len,
       user=user_sizes,

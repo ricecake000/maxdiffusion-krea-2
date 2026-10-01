@@ -23,6 +23,7 @@ import re
 import types
 import unittest
 from contextlib import ExitStack
+from unittest import mock
 
 import flax
 import jax
@@ -38,6 +39,7 @@ from maxdiffusion.generate_krea2 import (
     flash_custom_block_selection_aot_meta,
     transformer_quantization_aot_meta,
 )
+from maxdiffusion.kernels import krea2_attention
 from maxdiffusion.kernels.krea2_attention import KREA2_BLOCK_SELECTION_REVISION
 from maxdiffusion.loaders.krea2_lora_pipeline import Krea2LoraLoaderMixin, insert_lora_params, make_lora_compile_spec
 from maxdiffusion.models.krea2.lora_util import convert_krea2_lora_to_flax
@@ -393,6 +395,13 @@ class FlashCustomBlockSelectionAotMetaTest(unittest.TestCase):
         flash_custom_block_selection_aot_meta("flash_custom"),
         {"krea2_block_selection": f"r{KREA2_BLOCK_SELECTION_REVISION}"},
     )
+    self.assertEqual(flash_custom_block_selection_aot_meta("flash_custom"), {"krea2_block_selection": "r3"})
+
+  def test_flash_custom_records_budget_extension(self):
+    # Executables compiled with the budget extension on must miss once it is switched off.
+    with mock.patch.object(krea2_attention, "AUTO_BLOCK_Q_BUDGET_EXTENSION", True):
+      self.assertEqual(flash_custom_block_selection_aot_meta("flash_custom"), {"krea2_block_selection": "r3+budget"})
+      self.assertEqual(flash_custom_block_selection_aot_meta("flash"), {})
 
 
 if __name__ == "__main__":

@@ -25,8 +25,9 @@
 #   (krea2_text_embed_on_host, exact lookup). compile_krea2.py v6e-1:
 #   1024x1024 peak 17.52 GiB, 2048x2048 peak 21.30 GiB (both VAE decode) of
 #   31.25 GiB usable, so 2048x2048 also fits with everything resident.
-#   Measured on v6e-1 (8 steps, warm): 1.25 s at 1024x1024 (bf16 1.88 s) and
-#   7.96 s at 2048x2048 (bf16 with the text encoder offloaded 11.29 s).
+#   Measured on v6e-1 (8 steps, warm): 1.29 s at 1024x1024 (bf16 1.88 s) and
+#   8.24 s at 2048x2048 (bf16 with the text encoder offloaded 11.29 s).
+#   Non-square presets (2026-09-30, block_q 2048): 2k@16:9 7.41 s, 1k@4:3 1.14 s.
 #   For the bf16 transformer override krea2_transformer_quantization=''; then
 #   1024x1024 peaks at 28.84 GiB and 2048x2048 needs krea2_offload_components
 #   ['text_encoder'] (peak 29.18 GiB, 3.44 GiB int8 swap per generation).
@@ -35,11 +36,12 @@
 #   (block_q stays automatic, so they hold at every resolution): measured on
 #   v6e-1 against the kernel's auto sizes ({}) 1.512 -> 1.348 ms per attention
 #   call at 1024x1024 and 8.34 -> 8.05 s denoise at 2048x2048, images
-#   bit-identical. The automatic block_q follows the chip's VMEM budget (v6e:
-#   4224 at 1024x1024, 3328 at 2048x2048; up to 2048 before): 1.353 -> 1.192
-#   ms per call and 7.92 -> 7.65 s denoise at 2048x2048. The kernel's error
-#   against an f32 reference is unchanged, but its last bits are not, so
-#   same-seed images differ in details (PSNR 22-24 dB).
+#   bit-identical. The automatic block_q is capped at 2048 (kernel revision 3)
+#   and charges ~200 query rows per q block (so 2k@4:3 gets 1792, not 512).
+#   The VMEM-budget extension (4224 / 3328 at the squares, 1.25 s / 7.96 s) is
+#   off: with these kv sizes it picks block_q 4096 at the aspect presets'
+#   sequence lengths, 3x slower in the kernel (2k@16:9 17.98 s vs 7.41 s with
+#   2048, 1k@4:3 1.81 s vs 1.14 s; measured 2026-09-30).
 # - krea2_rope_layout 'rotate_half': q/k head dims are permuted at load time so
 #   RoPE works on lane-dense 64-wide halves (exact).
 # - krea2_text_compaction_multiple 128: valid prompt tokens are gathered to the
@@ -56,8 +58,10 @@
 #   Width x height (portrait 4:5 3:4 2:3 9:16 9:21 swaps them; 2k doubles both):
 #     1k: 1:1 1024x1024, 5:4 1152x896, 4:3 1152x864, 3:2 1248x832, 16:9 1344x768, 21:9 1536x672
 #   5:4, 16:9 and 21:9 are approximations that share one 4032-token (2k: 16128)
-#   transformer executable, so there are 4 token counts per size. Not yet run on
-#   a TPU; compile_krea2.py v6e-1 estimates the 3072x1344 peak at 21.36 GiB.
+#   transformer executable, so there are 4 token counts per size. Run on v6e-1
+#   2026-09-30 (precompile of all 22 in 14 min); with the older automatic
+#   block_q 1k@2:3 1.21 s, 2k@3:4 7.50 s, 2k@21:9 as slow as 2k@16:9 (fixed
+#   numbers above). compile_krea2.py v6e-1 estimates the 3072x1344 peak at 21.36 GiB.
 # - Quantized-weight cache (krea2_weight_cache_dir, off by default): the first
 #   run saves the final int8 transformer (12.56 GiB) and text encoder (3.44 GiB
 #   plus the 0.72 GiB host embedding table) trees there, later runs read them

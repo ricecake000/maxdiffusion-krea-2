@@ -33,12 +33,13 @@ scalar prefetch and batch is a grid axis (not a vmap) so the kernel can read
 them. Only kv blocks that can contain invalid positions pay for the mask.
 
 Every q block re-reads all k/v blocks from HBM, so fewer, larger q blocks are
-faster. The automatic block_q minimizes padded query waste over multiples of 128
-in [512, max], where max is 2048 unless the chip has a calibrated VMEM budget
-(`_VMEM_BUDGET_BYTES`, keyed by device_kind, calibrated for bfloat16 q/k/v):
-there it grows to the largest block_q whose `_estimated_vmem_bytes` fits the
-budget (up to 8192), since the compile fails once the kernel exceeds Mosaic's
-default scoped VMEM limit. Other operand dtypes keep max at 2048.
+faster. The automatic block_q is the multiple of 128 in [512, 2048] minimizing
+padded query rows plus ~200 rows of per-block overhead. A VMEM-budget
+extension (block_q up to 8192, bounded by the calibrated per-chip budgets in
+`_VMEM_BUDGET_BYTES` for bfloat16 q/k/v) exists behind
+`AUTO_BLOCK_Q_BUDGET_EXTENSION` and is off: with block_kv 2048 it picks
+block_q 4096 at the aspect presets' sequence lengths (4016, 16256, 16352),
+which is about 3x slower in the kernel on a TPU v6e-1.
 """
 
 import dataclasses
@@ -64,12 +65,26 @@ _DEFAULT_BLOCK_KV = 1024
 _DEFAULT_BLOCK_KV_COMPUTE = 512
 _DEFAULT_BLOCK_KV_COMPUTE_IN = 256
 _BLOCK_Q_MIN = 512
+# Per-q-block cost of the automatic block_q choice, in query rows. Calibrated on
+# v6e-1 (kv 2048/1024/256): one fewer q block saved ~250 rows at seq 4224, ~180
+# at 16512 and ~295 at 4608, i.e. roughly 200-300 rows per block; 200 is the
+# conservative end.
+_BLOCK_Q_OVERHEAD_ROWS = 200
 _BLOCK_Q_BASE_MAX = 2048  # always allowed: the range before the VMEM budget
 _BLOCK_Q_ABS_MAX = 8192  # never picked automatically above this
 
+# The VMEM-budget extension of the automatic block_q is off since 2026-10-01
+# (block selection revision 3): with block_kv 2048 it picks block_q values that
+# are 3x slower at the aspect presets' sequence lengths (seq 4016 / 16256 /
+# 16352 -> 4096; measured on v6e-1). The budget code stays for an explicit
+# opt-in (`max_auto_block_q(..., budget_extension=True)`).
+AUTO_BLOCK_Q_BUDGET_EXTENSION = False
+
 # Bumped whenever the automatic block-size choice changes, so AOT caches keyed
-# on it miss executables compiled with the previous choice.
-KREA2_BLOCK_SELECTION_REVISION = 2
+# on it miss executables compiled with the previous choice (the AOT meta appends
+# "+budget" when AUTO_BLOCK_Q_BUDGET_EXTENSION is on).
+# 3: budget extension off, per-block overhead term in the automatic choice.
+KREA2_BLOCK_SELECTION_REVISION = 3
 
 # Budget for `_estimated_vmem_bytes` per device kind, ~8 % under the smallest
 # estimate that failed to compile. Compile-only calibration with bfloat16
@@ -138,15 +153,24 @@ def max_auto_block_q(
     block_kv_compute_in: int,
     vmem_limit_bytes=None,
     dtype=None,
+    *,
+    budget_extension: bool | None = None,
 ) -> int:
   """Largest block_q the automatic choice may use for these kv block sizes.
 
-  Returns `_BLOCK_Q_BASE_MAX` for chips without a calibrated budget, when the
-  user sets `vmem_limit_bytes`, when block_kv_compute_in < 256 or when the q/k/v
-  `dtype` is not bfloat16 (not calibrated; None means bfloat16). Otherwise the
-  largest multiple of 128 in [_BLOCK_Q_BASE_MAX, _BLOCK_Q_ABS_MAX] whose
-  estimate fits the chip's budget, never below the base.
+  Returns `_BLOCK_Q_BASE_MAX` (2048) unless the VMEM-budget extension is on:
+  `budget_extension` True / False switches it for this call, None follows
+  `AUTO_BLOCK_Q_BUDGET_EXTENSION` (off). With the extension on it still returns
+  `_BLOCK_Q_BASE_MAX` for chips without a calibrated budget, when the user sets
+  `vmem_limit_bytes`, when block_kv_compute_in < 256 or when the q/k/v `dtype`
+  is not bfloat16 (not calibrated; None means bfloat16). Otherwise the largest
+  multiple of 128 in [_BLOCK_Q_BASE_MAX, _BLOCK_Q_ABS_MAX] whose estimate fits
+  the chip's budget, never below the base.
   """
+  if budget_extension is None:
+    budget_extension = AUTO_BLOCK_Q_BUDGET_EXTENSION
+  if not budget_extension:
+    return _BLOCK_Q_BASE_MAX
   budget = _VMEM_BUDGET_BYTES.get(device_kind)
   bf16 = dtype is None or jnp.dtype(dtype) == jnp.bfloat16
   if budget is None or vmem_limit_bytes is not None or block_kv_compute_in < 256 or not bf16:
@@ -161,13 +185,14 @@ def max_auto_block_q(
 
 
 def _default_block_q(seq_len: int, max_block_q: int = _BLOCK_Q_BASE_MAX) -> int:
-  """Picks block_q minimizing padded query waste, preferring larger blocks on ties."""
+  """Picks block_q minimizing padded query rows plus a per-block overhead, preferring larger blocks on ties."""
   cap = padded_len(max(seq_len, 1), NUM_LANES)
   candidates = [bq for bq in range(_BLOCK_Q_MIN, max_block_q + 1, NUM_LANES) if bq <= cap] or [cap]
   best = None
   for bq in candidates:
-    waste = padded_len(seq_len, bq) - seq_len
-    key = (waste, -bq)
+    num_blocks = (seq_len + bq - 1) // bq
+    cost = padded_len(seq_len, bq) + _BLOCK_Q_OVERHEAD_ROWS * num_blocks
+    key = (cost, -bq)
     if best is None or key < best[0]:
       best = (key, bq)
   return best[1]
@@ -183,15 +208,18 @@ def select_krea2_block_sizes(seq_len: int, user=None, device_kind=None, dtype=No
       defaults; missing or None fields fall back to the defaults. A non-None
       vmem_limit_bytes keeps the automatic block_q at most 2048.
     device_kind: `device_kind` of the chip the kernel runs on (e.g.
-      'TPU v6 lite'); None or an uncalibrated chip keeps block_q at most 2048.
+      'TPU v6 lite'); only used by the VMEM-budget extension, where None or an
+      uncalibrated chip keeps block_q at most 2048.
     dtype: dtype of q/k/v. None means bfloat16, the dtype the VMEM budget is
       calibrated for; any other dtype keeps block_q at most 2048.
 
   Returns:
     A validated Krea2BlockSizes. Default block_q is the multiple of 128 in
     [512, max_auto_block_q(...)] (capped at seq_len rounded up to 128)
-    minimizing the padded waste ceil(seq_len / bq) * bq - seq_len, larger bq
-    winning ties.
+    minimizing the padded rows ceil(seq_len / bq) * bq plus
+    `_BLOCK_Q_OVERHEAD_ROWS` (200) rows per q block, larger bq winning ties.
+    The maximum is 2048 unless the VMEM-budget extension
+    (`AUTO_BLOCK_Q_BUDGET_EXTENSION`, off by default) is switched on.
   """
   block_kv = _user_block_value(user, "block_kv") or _DEFAULT_BLOCK_KV
   block_kv_compute = _user_block_value(user, "block_kv_compute")
