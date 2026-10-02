@@ -75,6 +75,11 @@
 #     generate_krea2.py <this file> krea2_weight_cache_dir=<dir> aot_cache_dir=<dir> prompt=...
 #   A hit opens no transformer/text_encoder safetensors: a node with only the
 #   configs, tokenizer and VAE can use a pulled cache; a miss there is a RuntimeError.
+#   Measured on a fresh v6e-1 VM 2026-10-02 (slim model 0.51 GiB, cache 16.7 GiB
+#   and executables pulled from GCS): setup 45 s instead of ~3 min 40 s, cache
+#   pull 104 s, load 4.5 s (the pull leaves the page cache warm: 0.8-1.1 s per
+#   component, no cold read), process start to image 40 s, images bit-identical
+#   to the full-checkpoint runs at 1k@1:1, 1k@4:3 and 2k@16:9.
 #   krea2_weight_cache_build_only=True only builds the cache and exits; it needs
 #   no accelerator, so far run only in CPU tests. On a CPU VM (no TPU, so no JAX
 #   distributed coordinator):
