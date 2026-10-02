@@ -27,7 +27,8 @@
 #   31.25 GiB usable, so 2048x2048 also fits with everything resident.
 #   Measured on v6e-1 (8 steps, warm): 1.29 s at 1024x1024 (bf16 1.88 s) and
 #   8.24 s at 2048x2048 (bf16 with the text encoder offloaded 11.29 s).
-#   Non-square presets (2026-09-30, block_q 2048): 2k@16:9 7.41 s, 1k@4:3 1.14 s.
+#   Non-square presets (block_q 2048): 2k@16:9 7.41 s, 1k@4:3 1.14 s (2026-09-30,
+#   reproduced by the automatic choice 2026-10-02); 2k@4:3 7.08 s with block_q 1792.
 #   For the bf16 transformer override krea2_transformer_quantization=''; then
 #   1024x1024 peaks at 28.84 GiB and 2048x2048 needs krea2_offload_components
 #   ['text_encoder'] (peak 29.18 GiB, 3.44 GiB int8 swap per generation).
@@ -37,7 +38,8 @@
 #   v6e-1 against the kernel's auto sizes ({}) 1.512 -> 1.348 ms per attention
 #   call at 1024x1024 and 8.34 -> 8.05 s denoise at 2048x2048, images
 #   bit-identical. The automatic block_q is capped at 2048 (kernel revision 3)
-#   and charges ~200 query rows per q block (so 2k@4:3 gets 1792, not 512).
+#   and charges ~200 query rows per q block (so 2k@4:3 gets 1792, not 512;
+#   measured 2026-10-02: 7.08 s denoise, 7.50 s with 3968 on 2026-09-30).
 #   The VMEM-budget extension (4224 / 3328 at the squares, 1.25 s / 7.96 s) is
 #   off: with these kv sizes it picks block_q 4096 at the aspect presets'
 #   sequence lengths, 3x slower in the kernel (2k@16:9 17.98 s vs 7.41 s with
