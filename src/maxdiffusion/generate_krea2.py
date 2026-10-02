@@ -34,7 +34,9 @@ limitations under the License.
 #
 # Quantized-weight cache: with krea2_weight_cache_dir set, a run that misses saves the final quantized
 # transformer / text encoder host trees there, and later runs read them instead of reading and re-quantizing
-# the checkpoint (only quantized components; any LoRA adapter bypasses the transformer cache):
+# the checkpoint (only quantized components; any LoRA adapter bypasses the transformer cache). A hit never opens
+# the checkpoint's safetensors, so a machine with only the configs, tokenizer and VAE can generate from the
+# cache; a miss there is a RuntimeError:
 #
 #   python src/maxdiffusion/generate_krea2.py src/maxdiffusion/configs/base_krea2_turbo_v6e1.yml \
 #     krea2_weight_cache_dir=/path/to/weights aot_cache_dir=/path/to/aot prompt="a fox in the snow"
@@ -296,7 +298,8 @@ def load_or_build_host_params(cache, abstract_params, build, load_trace, trace_k
 
   `cache` is a `WeightCacheSpec` or None (no cache: `build` runs, nothing is
   read). On a hit `build` is not called. `load_trace[trace_key]` gets the time
-  of the cache read whenever one was attempted.
+  of the cache read whenever one was attempted. A miss with `cache.source_files`
+  None (no checkpoint safetensors to build from) raises RuntimeError.
   """
   from maxdiffusion.models.krea2.weight_cache import load_component
 
@@ -315,6 +318,12 @@ def load_or_build_host_params(cache, abstract_params, build, load_trace, trace_k
     if cached is not None:
       tree, extras = cached
       return tree, extras, True
+    if cache.source_files is None:
+      raise RuntimeError(
+          f"[weight cache] {cache.component}: miss at {cache.cache_dir}, and this machine has no "
+          f"*.safetensors of the {cache.component} to build it from (see the miss reason above); pull a "
+          f"cache built for this configuration or download the checkpoint"
+      )
   tree, extras = build()
   return tree, extras, False
 

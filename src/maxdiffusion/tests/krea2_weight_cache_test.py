@@ -771,13 +771,43 @@ class GenerateWeightCacheHelpersTest(_CacheTestCase):
     self.assert_bit_identical(extras["embedding_table"], table)
     self.assertEqual(set(trace), {"qwen_cache_read"})
 
+  def test_miss_without_checkpoint_raises(self):
+    tree = _mixed_tree()
+    spec = WeightCacheSpec(self.cache_dir, "text_encoder", _META, None)
+    build = mock.Mock(side_effect=AssertionError("there is no checkpoint to build from"))
+    trace = {}
+    with mock.patch.object(weight_cache.max_logging, "log"):
+      with self.assertRaisesRegex(RuntimeError, r"no \*\.safetensors"):
+        load_or_build_host_params(spec, _abstract(tree), build, trace, "qwen_cache_read")
+    build.assert_not_called()
+    self.assertEqual(set(trace), {"qwen_cache_read"})
+
+  def test_hit_without_checkpoint_is_trusted(self):
+    # A cache built next to the checkpoint, read on a machine without it.
+    tree = _mixed_tree()
+    built = WeightCacheSpec(self.cache_dir, "transformer", _META, [["model.safetensors", 1]])
+    with mock.patch.object(weight_cache.max_logging, "log"):
+      self.assertIsNotNone(save_host_params(built, tree, {}, "transformer_cache_write"))
+    spec = built._replace(source_files=None)
+    build = mock.Mock(side_effect=AssertionError("the build must not run on a hit"))
+    trace = {}
+    with mock.patch.object(weight_cache.max_logging, "log") as log:
+      got, _, hit = load_or_build_host_params(spec, _abstract(tree), build, trace, "transformer_cache_read")
+    build.assert_not_called()
+    self.assertTrue(hit)
+    self.assert_bit_identical(got, tree)
+    self.assertTrue(any("trusted" in line for line in _log_lines(log)))
+    self.assertEqual(set(trace), {"transformer_cache_read"})
+
   def test_lora_bypasses_only_the_transformer_cache(self):
     transformer_dir, text_encoder_dir = resolve_weight_cache_dirs(
         self._config(self.cache_dir), "w8a8", "int8", (("adapter", 1.0),)
     )
+    # A miss builds only with the checkpoint present.
+    files = [["model.safetensors", 1]]
     specs = {
-        "transformer": WeightCacheSpec(transformer_dir, "transformer", _META, None) if transformer_dir else None,
-        "text_encoder": WeightCacheSpec(text_encoder_dir, "text_encoder", _META, None) if text_encoder_dir else None,
+        "transformer": WeightCacheSpec(transformer_dir, "transformer", _META, files) if transformer_dir else None,
+        "text_encoder": WeightCacheSpec(text_encoder_dir, "text_encoder", _META, files) if text_encoder_dir else None,
     }
     self.assertIsNone(specs["transformer"])
     trace = {}
