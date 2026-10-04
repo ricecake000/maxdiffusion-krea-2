@@ -222,3 +222,33 @@ v6e-1 실측(2026-10-03, 같은 래퍼·같은 block_q, 커널 호출당): seq 4
 VMEM: hybrid의 QKᵀ 스크래치는 `4 · block_kv_compute · bq` 바이트(2048 × 1664면 13.6 MB)라 flash보다 VMEM을 훨씬 많이 쓴다. 자동 block_q는 `_estimated_hybrid_vmem_bytes`(명시적 스크래치 + 이중 버퍼 q/out/k/v 블록 + q 레인당 2048 바이트의 컴파일러 임시값)를 칩 기본 scoped VMEM 한도(v6e 32 MiB, v5e 16 MiB; 사용자 `vmem_limit_bytes`가 있으면 그 값) × 0.86 예산과 비교해 상한을 정한다. 교차 컴파일 보정점(block_kv 2048, 성공 최대 / 실패 최소 block_q): v6e block_kv_compute 2048: 2176 / 2304, 1024: 3328 / 3456; v5e 2048: 1024 / 1152, 1024: 1536 / 1664; v5e에 `vmem_limit_bytes` 32 MiB를 주면 v6e와 같은 2176 / 2304. 그래서 v6e 기본 크기에서는 상한(2048)이 걸리지 않아 모든 프리셋 시퀀스에서 flash와 같은 block_q(1408 / 1664 등)를 고르고, v5e에서 hybrid를 강제하면 block_kv_compute 2048로 896, 1024로 1408까지로 제한된다(보정상 한 단계 보수적). 512도 들어가지 않으면 줄일 크기를 알려 주는 `ValueError`다. 사용자가 block_q를 직접 주면 제한하지 않는다(컴파일이 판단).
 
 선택 규칙(`KREA2_BLOCK_SELECTION_REVISION` 4): `krea2_attention_kernel`(기본 `auto`; `flash` / `hybrid` 강제, 빈 문자열은 `auto`, 그 밖의 값은 모델 로드 전 시작 시 오류)이 `CustomFlashBlockSizes.kernel`로 커널에 전달된다. `auto`는 장치 종류가 `TPU v6 lite`일 때만 hybrid, 그 밖(v5e, 알 수 없는 장치, CPU)은 flash다. kv 블록 크기 기본값은 (변형, 칩) 표 `_DEFAULT_KV_BLOCKS`에서 오고 필드마다 `flash_block_sizes`로 덮어쓸 수 있다: flash 기본 1024/512/256, flash on v6e 2048/1024/256(이전 v6e-1 프리셋 값), hybrid 2048/2048/1024/256/256. 그래서 v6e-1 프리셋은 `flash_block_sizes: {}`이고, `krea2_attention_kernel=flash`로 강제해도 v6e 튜닝 크기를 그대로 쓴다. flash 변형에 `block_kv_pv` / `block_q_strip`을 주면 오류다. flash 경로의 코드와 출력은 바뀌지 않았다(CPU interpret 모드에서 비트 단위 동일 확인). AOT 캐시 메타에는 `krea2_block_selection: r4`, `krea2_attention_kernel: <선택>`, 래퍼가 보는 칩 종류(`krea2_attention_device_kind`, 트랜스포머 메시에서 같은 헬퍼로 구함; AbstractMesh는 `abstract_device`로)와 그 칩에서 결정된 변형(`krea2_attention_kernel_variant`)이 들어간다. 그래서 revision 3 실행 파일은 적중하지 않고, 같은 설정·메시 모양이라도 v6e(auto → hybrid)와 v5e(auto → flash)의 핑거프린트가 다르다.
+
+### 6.6 어텐션 글루 융합: q/k norm + RoPE + 패딩을 Pallas 한 패스로 (2026-10-04)
+
+근거: hybrid 커널(6.5) 이후의 v6e-1 xprof 프로파일(2026-10-04, W8A8 + hybrid, Turbo 8 스텝, 이미지당 장치 self time)은 1024² 1176.8 ms = matmul 52.6 %, 어텐션 커널 21.5 %(호출당 1.129 ms), 활성화 양자화 7.2 %, RoPE/norm 글루 6.8 %, 어텐션 글루 4.3 %, VAE 5.1 %였고, 2048² 7385 ms = 어텐션 커널 47.8 %(호출당 15.77 ms), matmul 31.9 %, 활성화 양자화 5.3 %, RoPE/norm 7.5 %, 어텐션 글루 3.6 %, VAE 3.4 %였다. 글루(활성화 양자화 + RoPE/norm + 어텐션 글루)는 16~18 %이고 모두 HBM 바운드다. 가장 큰 덩어리는 `flash_custom` + `rotate_half` 경로의 q/k 후처리로, XLA가 텐서마다 세 융합으로 나눴다: (1) norm_q가 f32 정규화 중간값을 `(B, H, L, 128)` 전치 형태로 HBM에 쓰고, (2) RoPE 융합이 64-wide bf16 두 반쪽을 따로 내보내 128-lane 타일의 절반이 빈 채로 읽고 쓰며, (3) concat + 스케일 + 블록 크기 패딩이 전체를 다시 읽고 쓴다. 블록·스텝당 q 경로는 약 0.35 ms(1024²) / 2.5 ms(2048²)로, 이상적 read+write 약 0.07 / 0.25 ms의 5~10배였다. 별도로 어텐션 입력의 W8A8 양자화가 같은 내용의 융합 두 개로 두 번 계산됐다(to_q/to_gate용 하나, to_k/to_v용 7-D bitcast 형태 하나; 블록·스텝당 0.07 / 0.28 ms).
+
+jnp 재작성은 도움이 되지 않았다: 전폭 cos/sin 표로 RoPE를 한 식으로 쓰고 파트너를 concat 또는 roll로 만든 두 버전 모두, 교차 컴파일 HLO에서 XLA가 여전히 64-lane 반쪽 스왑을 융합하지 못하고 정규화 값과 두 반쪽을 HBM에 materialize했다. 그래서 Pallas 커널로 갔다.
+
+커널 `kernels/krea2_qk_prep.py`(`krea2_qk_prep`, 텐서마다 한 번 읽고 한 번 쓴다):
+
+- 입력은 head-major `(B, H, L, D)` 투영이다. 호출 측의 `(B, L, H, D)` → `(B, H, L, D)` 전치는 비용이 없다: XLA가 W8A8 matmul 결과 `(L, H, D)`를 레이아웃 {2,0,1}로 쓰고, 이는 (8, 128) 타일링에서 row-major `(H, L, D)`와 같은 바이트다. `(B, L, H*D)`로 읽으면 relayout 복사가 두 번 생긴다.
+- 그리드 `(B, 행 블록, 헤드 블록)`, 블록 `(heads_per_block ≤ 4, block_rows ≤ 1024, D)`. 헤드가 가장 안쪽이라 `(block_rows, D)` cos/sin 블록이 행 블록 동안 VMEM에 남는다. 출력은 `(B, H, padded_len, D)`이고 L 이후 행은 iota 마스크로 0을 쓴다. 전치와 어텐션 블록 크기로의 패딩이 블록 맵으로 해결되어 추가 패스가 없다.
+- 수학은 헤드마다 f32: `normed = x · rsqrt(mean(x²) + eps) · (1 + w)`, `out = normed · cos2 + pltpu.roll(normed, D/2) · sin2`(전폭 표 `[cos, cos]`, `[−sin, sin]`). q는 softmax 스케일을 f32에서 곱하고(스케일 폴딩), 마지막에 bf16 캐스트 한 번이다. 기존 경로는 norm 뒤와 RoPE 뒤에 bf16으로 캐스트하고 스케일을 bf16 결과에 곱했으므로 반올림이 다르다.
+- 어텐션 래퍼는 raw head-major 투영과 norm 가중치·표를 `AttentionOp.apply_attention`의 새 `extra_context`로 받아 래퍼 안에서 prep 커널을 부른다.
+
+중복 양자화: `transformer_krea2_flax.py`에서 공유 `quantize_activation(hidden_states)` 결과를 `jax.lax.optimization_barrier`로 감싸 to_q/k/v/gate가 materialize된 `(x_q, scale)` 하나를 쓰게 했다. 장벽이 없으면 XLA가 피연산자 형태별(to_q/to_gate vs to_k/to_v)로 양자화를 생산자 융합에 따로 넣어 두 번 계산한다.
+
+HLO 감사(노트북 v6e-1 교차 컴파일, `compile_krea2.py <프리셋> compile_hlo_dir=<dir>`로 실행 파일마다 최적화 HLO 덤프): 블록당 q 경로 HBM 트래픽 1024² 573.6 → 118.0 MB(이상적 read+write의 1.04배), 2048² 2523 → 437 MB. 어텐션 입력 int8 양자화 융합 2 → 1. 블록당 글루 트래픽 합 1.72 → 1.11 GB(1024²), 6.41 → 3.73 GB(2048²). `compile_krea2.py` HBM 피크 17.52 / 21.30 GiB는 그대로다.
+
+v6e-1 실측(스팟, 2026-10-04 11:06~11:26 UTC, 코드 051518b, 이전 측정과 같은 프롬프트·시드, Turbo 8 스텝, W8A8 + hybrid): 시간 측정 디노이즈 1024² 1.12 → 1.05 s(−6.2 %), 2048² 7.11 → 6.49 s(−8.7 %). 워밍된 전체 패스(인코드 + 디노이즈 + VAE) 1024² 1.28 → 1.17 s, 2048² 7.49 → 6.81 s. xprof 이미지당 장치 self time: 1024² 1176.8 → 1106.5 ms — RoPE/norm 융합 80.5 ms와 어텐션 글루 51.1 → 27.5 ms 대신 prep 커널 호출 38.5 ms(448회 = 블록·스텝마다 q와 k, 블록·스텝당 0.17 ms). 2048² 7385 → 6740 ms — 글루 550.4 + 262.5 → 2.1 + 100.8 ms, prep 커널 114.8 ms. matmul, 어텐션 커널(호출당 1.129 ms at 1024², 15.77 ms at 2048²), 활성화 양자화, VAE는 잡음 범위에서 같다.
+
+이미지: 이전 코드와 비트 단위로 같지 않다(PSNR 1024² 14.6 dB — 같은 장면이지만 구도가 바뀌었다; 2048² 22.8 dB). 화질은 같고 아티팩트는 없다(메인 세션 판정, 사용자는 아직 보지 않았다). 새 코드의 두 실행(b, bprof)은 비트 단위로 같다(결정적). 원인은 위의 반올림 차이(f32 한 번 캐스트, f32 스케일)이며, 8 스텝 디노이즈에서 작은 차이가 구도 차이로 커질 수 있다.
+
+AOT: 캐시 메타에 `krea2_attention_glue: r1`(`KREA2_ATTENTION_GLUE_REVISION`, `generate_krea2.attention_glue_aot_meta`)이 들어간다. flash_custom + rotate_half이거나 to_q/k/v/gate 중 하나라도 W8A8인 설정에만 붙고, 그 밖 설정의 핑거프린트와 캐시된 실행 파일은 그대로다. 그래서 버킷 `aot/`의 revision 4 실행 파일은 이 프리셋에서 적중하지 않으며, 사전 컴파일(`pc`)과 업로드(`aotup`)는 아직 다시 돌리지 않았다(검증 세션은 단계마다 세션 안에서 컴파일했다).
+
+남은 것(프로파일 기준 추정, 모두 미구현):
+
+- G3 미리 전치한 int8 가중치: 스텝마다 s8 가중치 레이아웃 복사(to_q 6144×6144 {0,1} → {1,0}, to_k/to_v)가 블록·스텝당 0.094 / 0.1 ms, 1024²에서 약 1.8 %. 가중치 캐시 리비전 변경과 캐시 재빌드가 필요하다.
+- G4 어텐션 커널이 `(B, L, H*D)`를 바로 쓰기: 지금은 `(B, H, D, L)` 출력 뒤 전치 복사가 블록·스텝당 0.097 / 0.38 ms, 약 1.5 %.
+- E 정적 활성화 스케일: 동적 absmax 양자화 패스(예: down_proj 입력 양자화 블록·스텝당 0.142 ms, HBM 피크 속도)를 없앤다. 약 5~8 %, 보정 데이터가 필요하고 화질 위험이 있다.
+- 이전부터 보류된 항목: hybrid용 block_q 재조정(자동 규칙은 아직 flash 기준), v5e에서 hybrid 미측정, 2k 4:3의 고정 block_q 512 / 2048 미측정, block_kv 1024 + VMEM 예산 확장, staged / LoRA + W8A8의 TPU 검증.

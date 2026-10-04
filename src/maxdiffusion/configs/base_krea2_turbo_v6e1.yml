@@ -65,7 +65,16 @@
 #   the attention-input W8A8 quantization is computed once for to_q/k/v/gate
 #   (attention glue revision 1, 2026-10-04: compile-only audit of the v6e-1 HLO,
 #   per-block glue traffic 1.72 -> 1.11 GB at 1024x1024 and 6.41 -> 3.73 GB at
-#   2048x2048, same peaks; not yet measured on chip).
+#   2048x2048, same peaks). End to end on v6e-1 (2026-10-04, timed denoise
+#   against the previous code): 1024x1024 1.12 -> 1.05 s (-6.2 %), 2048x2048
+#   7.11 -> 6.49 s (-8.7 %); whole warmed pass (encode + denoise + VAE) 1.28 ->
+#   1.17 s and 7.49 -> 6.81 s. xprof device time per image 1176.8 -> 1106.5 ms
+#   at 1024x1024 (RoPE/norm fusions 80.5 ms and attention glue 51.1 -> 27.5 ms
+#   replaced by 38.5 ms of prep kernel calls) and 7385 -> 6740 ms at 2048x2048
+#   (glue 550.4 + 262.5 -> 2.1 + 100.8 ms, prep kernels 114.8 ms); matmuls,
+#   attention kernel, activation quantization and VAE unchanged. Images not
+#   bit-identical (PSNR 14.6 dB at 1024x1024, same scene with a changed
+#   composition; 22.8 dB at 2048x2048), same quality, deterministic run to run.
 # - krea2_text_compaction_multiple 128: valid prompt tokens are gathered to the
 #   front and the text is truncated to a 128-token bucket (exact); typical
 #   prompts use 128 instead of 512 text tokens.
@@ -74,7 +83,9 @@
 # - Named resolutions (krea2_aspect_ratio + krea2_image_size, override
 #   height/width). Precompile every preset into the AOT cache once (no image,
 #   saved after each entry), then generate; aot_cache_lazy_load loads only the
-#   executables a run calls:
+#   executables a run calls. The key carries the attention glue revision
+#   (krea2_attention_glue=r1 since 2026-10-04), so executables precompiled by
+#   older code miss for this preset; precompile again after such a change:
 #     generate_krea2.py <this file> aot_cache_dir=<dir> krea2_precompile=all "krea2_precompile_text_tokens=[128]"
 #     generate_krea2.py <this file> aot_cache_dir=<dir> krea2_aspect_ratio=16:9 krea2_image_size=2k prompt=...
 #   Width x height (portrait 4:5 3:4 2:3 9:16 9:21 swaps them; 2k doubles both):
