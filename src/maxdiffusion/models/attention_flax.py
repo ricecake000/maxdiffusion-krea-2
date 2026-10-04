@@ -37,6 +37,7 @@ from maxdiffusion.max_utils import safe_getattr
 
 from ..kernels import custom_splash_attention as custom_splash
 from ..kernels import krea2_attention as krea2_kernel
+from ..kernels import krea2_qk_prep
 from . import quantizations
 from .modeling_flax_utils import get_activation
 
@@ -1833,11 +1834,19 @@ def krea2_custom_flash_kernel(q, k, v, context):
   sequence as [image | text] with the text padding at the tail. A mask with
   holes is silently treated as its valid-token count.
 
+  `context["krea2_qk_prep"]` (optional, from Krea2Attention with rotate_half
+  RoPE): q and k are then the RAW projections, (B, H, L, D) or (B, L, H*D), and
+  this wrapper runs their norm, rotate-half RoPE, the q scale and the padding
+  to the block sizes in one Pallas pass each (`kernels/krea2_qk_prep.py`). The
+  dict holds "q_norm_weight" / "k_norm_weight" ((D,) zero-centered RMSNorm
+  weights), "eps" and the (L, D/2) rotate_half tables "cos" / "sin".
+
   Returns (B, L, Hq*D) like the other registered kernels.
   """
   heads = context["heads"]
   dim_head = context["dim_head"]
   mesh = context["mesh"]
+  qk_prep = context.get("krea2_qk_prep")
 
   query, _ = _reshape_data_for_flash(q, heads)
   num_kv_heads = k.shape[1] if k.ndim == 4 else k.shape[-1] // dim_head
@@ -1847,8 +1856,9 @@ def krea2_custom_flash_kernel(q, k, v, context):
   batch, _, q_seq_len, _ = query.shape
   kv_seq_len = key.shape[2]
 
-  # The kernel uses exp2, so fold softmax scale and log2(e) into q.
-  query = query * jnp.asarray(context["scale"] * LOG2E, dtype=query.dtype)
+  if qk_prep is None:
+    # The kernel uses exp2, so fold softmax scale and log2(e) into q.
+    query = query * jnp.asarray(context["scale"] * LOG2E, dtype=query.dtype)
 
   attention_mask = context["attention_mask"]
   if attention_mask is None:
@@ -1872,12 +1882,18 @@ def krea2_custom_flash_kernel(q, k, v, context):
   )
   vmem_limit_bytes = user_sizes["vmem_limit_bytes"]
 
-  q_pad = krea2_kernel.padded_len(q_seq_len, block_sizes.block_q) - q_seq_len
-  kv_pad = krea2_kernel.padded_len(kv_seq_len, block_sizes.block_kv) - kv_seq_len
-  if q_pad:
-    query = jnp.pad(query, ((0, 0), (0, 0), (0, q_pad), (0, 0)))
+  q_padded_len = krea2_kernel.padded_len(q_seq_len, block_sizes.block_q)
+  kv_padded_len = krea2_kernel.padded_len(kv_seq_len, block_sizes.block_kv)
+  q_pad = q_padded_len - q_seq_len
+  kv_pad = kv_padded_len - kv_seq_len
+  if qk_prep is None:
+    if q_pad:
+      query = jnp.pad(query, ((0, 0), (0, 0), (0, q_pad), (0, 0)))
+    if kv_pad:
+      key = jnp.pad(key, ((0, 0), (0, 0), (0, kv_pad), (0, 0)))
+  elif q_seq_len != kv_seq_len:
+    raise ValueError(f"krea2_qk_prep needs self-attention lengths, got q {q_seq_len} and kv {kv_seq_len}")
   if kv_pad:
-    key = jnp.pad(key, ((0, 0), (0, 0), (0, kv_pad), (0, 0)))
     value = jnp.pad(value, ((0, 0), (0, 0), (0, kv_pad), (0, 0)))
 
   attention = krea2_kernel.make_krea2_attention(
@@ -1889,7 +1905,25 @@ def krea2_custom_flash_kernel(q, k, v, context):
       interpret=krea2_kernel.INTERPRET,
   )
 
-  def local_attention(q_local, k_local, v_local, valid_local):
+  def prep(x_local, weight, cos2, sin2, padded_len, scale):
+    """Local raw (b, h, L, D) projection -> normed, rotated, zero-padded (b, h, padded_len, D)."""
+    return krea2_qk_prep.krea2_qk_prep(
+        x_local,
+        weight,
+        cos2,
+        sin2,
+        eps=qk_prep["eps"],
+        padded_len=padded_len,
+        scale=scale,
+        interpret=krea2_kernel.INTERPRET,
+    )
+
+  def local_attention(q_local, k_local, v_local, valid_local, *prep_args):
+    if prep_args:
+      q_weight, k_weight, cos2, sin2 = prep_args
+      # The kernel uses exp2: softmax scale and log2(e) are folded into q, in float32 before the cast.
+      q_local = prep(q_local, q_weight, cos2, sin2, q_padded_len, context["scale"] * LOG2E)
+      k_local = prep(k_local, k_weight, cos2, sin2, kv_padded_len, None)
     assert q_local.shape[1] % k_local.shape[1] == 0, (
         f"local q heads {q_local.shape[1]} must be a multiple of local kv heads {k_local.shape[1]}; "
         "shard q and kv heads over the same mesh axis."
@@ -1901,14 +1935,21 @@ def krea2_custom_flash_kernel(q, k, v, context):
   kv_axis_names = nn.logical_to_mesh_axes(context["axis_names_kv"])
   _krea2_reject_sharded_sequence(mesh, q_axis_names, kv_axis_names)
   valid_axis_names = jax.sharding.PartitionSpec(q_axis_names[0])
+  in_specs = (q_axis_names, kv_axis_names, kv_axis_names, valid_axis_names)
+  prep_args = ()
+  if qk_prep is not None:
+    # The raw (B, H, L, D) q/k shard like the prepared ones; weights and tables are replicated.
+    in_specs += (jax.sharding.PartitionSpec(),) * 4
+    cos2, sin2 = krea2_qk_prep.rotate_half_full_tables(qk_prep["cos"], qk_prep["sin"])
+    prep_args = (qk_prep["q_norm_weight"], qk_prep["k_norm_weight"], cos2, sin2)
   mapped_attention = jax.shard_map(
       local_attention,
       mesh=mesh,
-      in_specs=(q_axis_names, kv_axis_names, kv_axis_names, valid_axis_names),
+      in_specs=in_specs,
       out_specs=q_axis_names,
       check_vma=False,
   )
-  out = mapped_attention(query, key, value, valid_kv_len)  # (B, Hq, L, D)
+  out = mapped_attention(query, key, value, valid_kv_len, *prep_args)  # (B, Hq, L, D)
   return _reshape_heads_to_head_dim(out)
 
 
@@ -1942,8 +1983,14 @@ def _apply_attention(
     use_experimental_scheduler: bool = False,
     ulysses_shards: int = -1,
     ulysses_attention_chunks: int = 1,
+    extra_context: Optional[Dict[str, Any]] = None,
 ):
-  """Routes to different attention kernels using a module-level registry."""
+  """Routes to different attention kernels using a module-level registry.
+
+  `extra_context` entries are added to the kernel's context; they are
+  kernel-specific (e.g. flash_custom's "krea2_qk_prep"), so a call with
+  `extra_context` that falls back to dot_product raises instead of dropping them.
+  """
 
   _check_attention_inputs(query, key, value)
   seq_len_idx = 1
@@ -1989,7 +2036,15 @@ def _apply_attention(
       "dpa_layer": dpa_layer,
   }
 
+  if extra_context:
+    context.update(extra_context)
+
   if attention_kernel == "dot_product" or use_memory_efficient_attention or not can_use_flash_attention:
+    if extra_context:
+      raise ValueError(
+          f"extra_context {sorted(extra_context)} is for the {attention_kernel} kernel, but the call falls back "
+          "to dot_product, which ignores it."
+      )
     return KERNEL_REGISTRY["dot_product"](query, key, value, context)
 
   # Module-level Registry lookup
@@ -2269,7 +2324,10 @@ class NNXAttentionOp(nnx.Module):
     self.mask_padding_tokens = mask_padding_tokens
     self.residual_checkpoint_name = residual_checkpoint_name
 
-  def apply_attention(self, query: Array, key: Array, value: Array, attention_mask: Array = None):
+  def apply_attention(
+      self, query: Array, key: Array, value: Array, attention_mask: Array = None, extra_context: Optional[dict] = None
+  ):
+    """`extra_context`: kernel-specific context entries (see `_apply_attention`)."""
     return _apply_attention(
         query=query,
         key=key,
@@ -2295,6 +2353,7 @@ class NNXAttentionOp(nnx.Module):
         use_experimental_scheduler=self.use_experimental_scheduler if hasattr(self, "use_experimental_scheduler") else False,
         ulysses_shards=(self.ulysses_shards if hasattr(self, "ulysses_shards") else -1),
         ulysses_attention_chunks=(self.ulysses_attention_chunks if hasattr(self, "ulysses_attention_chunks") else 1),
+        extra_context=extra_context,
     )
 
 
@@ -2343,7 +2402,10 @@ class AttentionOp(nn.Module):
       variables = {}
       self.dpa_layer = functools.partial(dpa_layer.apply, variables)
 
-  def apply_attention(self, query: Array, key: Array, value: Array, attention_mask: Array = None):
+  def apply_attention(
+      self, query: Array, key: Array, value: Array, attention_mask: Array = None, extra_context: Optional[dict] = None
+  ):
+    """`extra_context`: kernel-specific context entries (see `_apply_attention`)."""
     return _apply_attention(
         query=query,
         key=key,
@@ -2368,6 +2430,7 @@ class AttentionOp(nn.Module):
         use_experimental_scheduler=self.use_experimental_scheduler,
         ulysses_shards=self.ulysses_shards,
         ulysses_attention_chunks=self.ulysses_attention_chunks,
+        extra_context=extra_context,
     )
 
 

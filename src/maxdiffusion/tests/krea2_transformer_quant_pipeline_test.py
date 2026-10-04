@@ -38,6 +38,7 @@ from jax.sharding import PartitionSpec as P
 
 from maxdiffusion import max_utils
 from maxdiffusion.generate_krea2 import (
+    attention_glue_aot_meta,
     build_krea2_transformer,
     flash_custom_block_selection_aot_meta,
     krea2_flash_block_sizes,
@@ -50,7 +51,7 @@ from maxdiffusion.models import attention_flax
 from maxdiffusion.kernels.krea2_attention import KREA2_BLOCK_SELECTION_REVISION
 from maxdiffusion.loaders.krea2_lora_pipeline import Krea2LoraLoaderMixin, insert_lora_params, make_lora_compile_spec
 from maxdiffusion.models.krea2.lora_util import convert_krea2_lora_to_flax
-from maxdiffusion.models.krea2.transformer_krea2_flax import Krea2Transformer2DModel
+from maxdiffusion.models.krea2.transformer_krea2_flax import KREA2_ATTENTION_GLUE_REVISION, Krea2Transformer2DModel
 from maxdiffusion.models.krea2.transformer_quant import (
     KREA2_DEFAULT_QUANT_TARGETS,
     KREA2_TRANSFORMER_QUANT_REVISION,
@@ -388,6 +389,25 @@ class TransformerQuantizationAotMetaTest(unittest.TestCase):
         transformer_quantization_aot_meta("w8a8", ("to_k", "up_proj")),
         {"krea2_transformer_quantization": f"w8a8:to_k,up_proj:{revision}"},
     )
+
+
+class AttentionGlueAotMetaTest(unittest.TestCase):
+
+  def test_unchanged_glue_adds_no_key(self):
+    # Setups whose traced graph the glue revision does not touch keep their AOT cache fingerprint.
+    self.assertEqual(attention_glue_aot_meta("flash_custom", "interleaved", "", ()), {})
+    self.assertEqual(attention_glue_aot_meta("dot_product", "rotate_half", "", ()), {})
+    self.assertEqual(attention_glue_aot_meta("flash", "rotate_half", "w8a8", ("gate_proj", "to_out")), {})
+    self.assertEqual(attention_glue_aot_meta("flash_custom", "interleaved", "", ("to_q",)), {})
+
+  def test_changed_glue_records_the_revision(self):
+    expected = {"krea2_attention_glue": f"r{KREA2_ATTENTION_GLUE_REVISION}"}
+    self.assertEqual(KREA2_ATTENTION_GLUE_REVISION, 1)
+    # The v6e-1 preset: flash_custom + rotate_half + W8A8 on the attention projections.
+    self.assertEqual(attention_glue_aot_meta("flash_custom", "rotate_half", "w8a8", _TARGETS), expected)
+    self.assertEqual(attention_glue_aot_meta("flash_custom", "rotate_half", "", ()), expected)
+    for target in ("to_q", "to_k", "to_v", "to_gate"):
+      self.assertEqual(attention_glue_aot_meta("dot_product", "interleaved", "w8a8", (target,)), expected)
 
 
 _V6E, _V5E = "TPU v6 lite", "TPU v5 lite"

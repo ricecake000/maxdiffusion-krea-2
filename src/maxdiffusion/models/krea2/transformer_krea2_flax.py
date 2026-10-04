@@ -16,6 +16,10 @@ limitations under the License.
 
 # JAX/Flax implementation of the Krea 2 (K2) single-stream MMDiT.
 # Mirrors the diffusers reference implementation `Krea2Transformer2DModel`.
+# With attention 'flash_custom' and rope_layout 'rotate_half', Krea2Attention
+# hands the raw q/k projections to the attention wrapper, which runs the q/k
+# norm, RoPE, the q softmax scale and the padding in one Pallas pass per tensor
+# (kernels/krea2_qk_prep.py; float32 math with a single final cast).
 
 import math
 from typing import Optional, Tuple
@@ -33,6 +37,12 @@ from ..attention_flax import AttentionOp, apply_rope
 from .transformer_quant import Krea2QuantDense, normalize_quant_targets, quantize_activation
 
 ROPE_LAYOUTS = ("interleaved", "rotate_half")
+# Bump when the traced attention glue changes; it is part of the AOT cache key
+# (generate_krea2.attention_glue_aot_meta), so this invalidates cached executables.
+# 1: flash_custom + rotate_half runs q/k norm, RoPE, the q scale and the padding
+#    in one Pallas pass per tensor (kernels/krea2_qk_prep.py); W8A8 projections
+#    share one materialized attention-input quantization (optimization barrier).
+KREA2_ATTENTION_GLUE_REVISION = 1
 
 
 def _validate_rope_layout(layout):
@@ -105,13 +115,16 @@ class Krea2RMSNorm(nn.Module):
   dim: int
   eps: float = 1e-5
 
-  @nn.compact
+  def setup(self):
+    # setup (not compact): Krea2Attention hands `weight` to the fused q/k
+    # post-processing kernel without calling this module.
+    self.weight = self.param("weight", nn.initializers.zeros, (self.dim,), jnp.float32)
+
   def __call__(self, x):
-    weight = self.param("weight", nn.initializers.zeros, (self.dim,), jnp.float32)
     x_f32 = x.astype(jnp.float32)
     variance = jnp.mean(jnp.square(x_f32), axis=-1, keepdims=True)
     normed = x_f32 * jax.lax.rsqrt(variance + self.eps)
-    return (normed * (1.0 + weight)).astype(x.dtype)
+    return (normed * (1.0 + self.weight)).astype(x.dtype)
 
 
 def apply_explicit_lora(output, inputs, adapters=(), dtype=jnp.float32, precision=None):
@@ -297,7 +310,10 @@ class Krea2Attention(nn.Module):
 
     quantized_hidden = None
     if any(name in self.quant_targets for name in ("to_q", "to_k", "to_v", "to_gate")):
-      quantized_hidden = quantize_activation(hidden_states, self.dtype)
+      # The barrier makes the projections share one materialized (x_q, scale):
+      # without it XLA fuses the quantization into a separate producer per
+      # operand form (to_q/to_gate vs to_k/to_v), quantizing the input twice.
+      quantized_hidden = jax.lax.optimization_barrier(quantize_activation(hidden_states, self.dtype))
 
     def project(name):
       out = _apply_projection(getattr(self, name), hidden_states, quantized_hidden)
@@ -308,6 +324,37 @@ class Krea2Attention(nn.Module):
     value = project("to_v").reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim)
     gate = project("to_gate")
 
+    mask = None
+    if attention_mask is not None:
+      mask = attention_mask.astype(jnp.int32)
+
+    use_rope = self.use_rope and image_rotary_emb is not None
+    use_custom_kernel = self.attention_kernel == "flash_custom"
+    use_custom_path = use_custom_kernel and seq_len >= self.flash_min_seq_length
+    if use_custom_path and use_rope and self.rope_layout == "rotate_half":
+      # q/k go to the flash_custom wrapper un-normed: it runs norm_q/norm_k,
+      # RoPE, the softmax scale (q) and the padding to its block sizes in one
+      # Pallas pass per tensor (kernels/krea2_qk_prep.py), which reads the
+      # projection once and writes the kernel operand once; done here in jnp,
+      # XLA splits it into three HBM-bound fusions per tensor on TPU. The
+      # (B, H, L, D) transposes are free: XLA writes the projections head-major.
+      cos, sin = image_rotary_emb
+      qk_prep = {
+          "q_norm_weight": self.norm_q.weight,
+          "k_norm_weight": self.norm_k.weight,
+          "eps": self.norm_q.eps,
+          "cos": cos,
+          "sin": sin,
+      }
+      attn_output = self.attention_op.apply_attention(
+          jnp.transpose(query, (0, 2, 1, 3)),
+          jnp.transpose(key, (0, 2, 1, 3)),
+          jnp.transpose(value, (0, 2, 1, 3)),
+          attention_mask=mask,
+          extra_context={"krea2_qk_prep": qk_prep},
+      )
+      return self._gated_output_projection(attn_output, gate, lora_params)
+
     query = self.norm_q(query)
     key = self.norm_k(key)
 
@@ -316,7 +363,7 @@ class Krea2Attention(nn.Module):
     key = jnp.transpose(key, (0, 2, 1, 3))
     value = jnp.transpose(value, (0, 2, 1, 3))
 
-    if self.use_rope and image_rotary_emb is not None:
+    if use_rope:
       if self.rope_layout == "rotate_half":
         cos, sin = image_rotary_emb
         query = apply_rope_rotate_half(query, cos, sin)
@@ -324,12 +371,7 @@ class Krea2Attention(nn.Module):
       else:
         query, key = apply_rope(query, key, image_rotary_emb)
 
-    mask = None
-    if attention_mask is not None:
-      mask = attention_mask.astype(jnp.int32)
-
-    use_custom_kernel = self.attention_kernel == "flash_custom"
-    if use_custom_kernel and seq_len >= self.flash_min_seq_length:
+    if use_custom_path:
       # The Krea 2 kernel takes 4-D (B, H, L, D) queries and un-expanded GQA
       # (B, H_kv, L, D) keys/values, unscaled; the mask must be a prefix
       # key-validity mask ([image | text] with tail-padded, compacted text).

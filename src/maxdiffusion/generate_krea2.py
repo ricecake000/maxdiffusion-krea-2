@@ -270,6 +270,25 @@ def transformer_quantization_aot_meta(mode, targets) -> dict:
   return {"krea2_transformer_quantization": f"{mode}:{','.join(targets)}:r{KREA2_TRANSFORMER_QUANT_REVISION}"}
 
 
+def attention_glue_aot_meta(attention, rope_layout, transformer_quantization, quant_targets) -> dict:
+  """AOT cache meta entry for the Krea 2 attention glue; empty where the glue graph is unchanged.
+
+  The key carries `KREA2_ATTENTION_GLUE_REVISION` for setups whose traced graph
+  it changes: flash_custom with rotate_half RoPE (the fused q/k prep kernel) or
+  W8A8 on any of to_q/to_k/to_v/to_gate (the shared attention-input
+  quantization). Other setups keep their fingerprint (and cached executables).
+  """
+  from maxdiffusion.models.krea2.transformer_krea2_flax import KREA2_ATTENTION_GLUE_REVISION
+
+  fused_qk_prep = attention == "flash_custom" and rope_layout == "rotate_half"
+  shared_quantization = bool(transformer_quantization) and any(
+      name in (quant_targets or ()) for name in ("to_q", "to_k", "to_v", "to_gate")
+  )
+  if not (fused_qk_prep or shared_quantization):
+    return {}
+  return {"krea2_attention_glue": f"r{KREA2_ATTENTION_GLUE_REVISION}"}
+
+
 def flash_custom_block_selection_aot_meta(attention, kernel_choice="auto", device_kind=None) -> dict:
   """AOT cache meta entries for the flash_custom kernel and block sizes; empty for other kernels.
 
@@ -1321,6 +1340,10 @@ def main(argv):
           "krea2_rope_layout": transformer.rope_layout,
           # Conditional key: with quantization off the meta (and fingerprint) matches older caches.
           **transformer_quantization_aot_meta(transformer_quantization, transformer_quant_targets),
+          # Conditional key: only setups whose traced attention glue changed miss older caches.
+          **attention_glue_aot_meta(
+              config.attention, transformer.rope_layout, transformer_quantization, transformer_quant_targets
+          ),
           # Conditional keys: only flash_custom picks its kernel variant and block sizes per chip.
           **flash_custom_block_selection_aot_meta(
               config.attention, attention_kernel_choice, krea2_mesh_device_kind(transformer.mesh)

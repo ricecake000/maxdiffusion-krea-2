@@ -26,6 +26,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from maxdiffusion.kernels.krea2_qk_prep import qk_prep_reference
 from maxdiffusion.models.attention_flax import AttentionOp
 from maxdiffusion.models.krea2.transformer_krea2_flax import (
     Krea2Attention,
@@ -187,12 +188,22 @@ class Krea2AttentionTest(unittest.TestCase):
 
   def test_flash_custom_receives_4d_unexpanded_gqa_after_rope(self):
     """flash_custom contract: (B, H, L, D) q and (B, H_kv, L, D) k/v, unscaled,
-    after RoPE, with the int32 key mask; returns (B, L, H*D)."""
+    with the int32 key mask; returns (B, L, H*D). Interleaved RoPE: q/k after
+    norm and RoPE. rotate_half: RAW q/k plus the "krea2_qk_prep" context (norm
+    weights, eps, half tables) the wrapper's fused prep kernel applies."""
     seen = {}
     head_dim, heads, kv_heads = 8, 4, 2
 
-    def fake_apply_attention(module, query, key, value, attention_mask=None):
-      seen.update(query=query.shape, key=key.shape, value=value.shape, mask=attention_mask)
+    def fake_apply_attention(module, query, key, value, attention_mask=None, extra_context=None):
+      seen.update(query=query.shape, key=key.shape, value=value.shape, mask=attention_mask, extra=extra_context)
+      if extra_context:
+        prep = extra_context["krea2_qk_prep"]
+
+        def prepare(x, weight):
+          return qk_prep_reference(jnp.swapaxes(x, 1, 2), weight, prep["eps"], prep["cos"], prep["sin"])
+
+        query = prepare(query, prep["q_norm_weight"])
+        key = prepare(key, prep["k_norm_weight"])
       # Reference attention in the kernel's own terms: expand GQA, scale, softmax.
       repeats = query.shape[1] // key.shape[1]
       k = jnp.repeat(key, repeats, axis=1).astype(jnp.float32)
@@ -232,6 +243,14 @@ class Krea2AttentionTest(unittest.TestCase):
       self.assertEqual(seen["value"], (2, kv_heads, 6, head_dim))
       self.assertEqual(seen["mask"].dtype, jnp.int32)
       np.testing.assert_array_equal(np.asarray(seen["mask"]), np.asarray(mask).astype(np.int32))
+      if layout == "rotate_half":
+        prep = seen["extra"]["krea2_qk_prep"]
+        self.assertEqual(sorted(prep), ["cos", "eps", "k_norm_weight", "q_norm_weight", "sin"])
+        np.testing.assert_array_equal(np.asarray(prep["q_norm_weight"]), np.asarray(params["norm_q"]["weight"]))
+        np.testing.assert_array_equal(np.asarray(prep["k_norm_weight"]), np.asarray(params["norm_k"]["weight"]))
+        self.assertEqual(prep["cos"].shape, (6, head_dim // 2))
+      else:
+        self.assertIsNone(seen["extra"])
       np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), rtol=1e-5, atol=1e-5)
 
 

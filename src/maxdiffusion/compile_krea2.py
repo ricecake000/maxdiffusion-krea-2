@@ -23,6 +23,10 @@ limitations under the License.
 #     src/maxdiffusion/configs/base_krea2_turbo.yml compile_topology=v6e-1 height=2048 width=2048
 #
 # Named resolutions work like in generate_krea2.py, e.g. krea2_aspect_ratio=21:9 krea2_image_size=2k.
+#
+# compile_hlo_dir=<dir> additionally writes every compiled executable's optimized
+# HLO (compiled.as_text()) to <dir>/<executable name>.txt, for offline audits of
+# the fusions XLA chose (e.g. transformer_step.txt for the denoising step).
 
 import json
 import math
@@ -288,13 +292,22 @@ def xla_flops(compiled):
   return cost.get("flops")
 
 
-def compile_executable(name, entry, param_args, activation_args, calls):
-  """Lowers and compiles one cached_jit entry; returns (record, abstract outputs)."""
+def compile_executable(name, entry, param_args, activation_args, calls, hlo_dir=""):
+  """Lowers and compiles one cached_jit entry; returns (record, abstract outputs).
+
+  hlo_dir: if non-empty, the optimized HLO of the executable is written to <hlo_dir>/<name>.txt.
+  """
   max_logging.log(f"Compiling {name}...")
   t0 = time.perf_counter()
   lowered = entry.jitted.lower(*param_args, *activation_args)
   compiled = lowered.compile()
   compile_s = time.perf_counter() - t0
+  if hlo_dir:
+    os.makedirs(hlo_dir, exist_ok=True)
+    hlo_path = os.path.join(hlo_dir, f"{name}.txt")
+    with open(hlo_path, "w") as f:
+      f.write(compiled.as_text())
+    max_logging.log(f" -> {name} HLO written to {hlo_path}")
   outputs = jax.tree_util.tree_map(
       lambda info, sharding: sds(info.shape, info.dtype, sharding), lowered.out_info, compiled.output_shardings
   )
@@ -511,6 +524,7 @@ def main(argv):
     )
   offload = tuple(c for c in OFFLOADABLE_COMPONENTS if c in offload)
   donate_hidden_states = bool(getattr(config, "krea2_staged_donate_hidden_states", True))
+  hlo_dir = getattr(config, "compile_hlo_dir", "") or ""
   topology_name, host_bounds, hbm_gib, peak_tflops = resolve_topology(topology)
   num_slices = max(int(config.compile_topology_num_slices), 1)
   devices = get_topology_desc(
@@ -658,7 +672,7 @@ def main(argv):
       text_inputs = text_ids
     qwen3_args = (text_inputs, text_ids, text_ids)
     qwen3_record, prompt_embeds = compile_executable(
-        "qwen3_forward", pipeline._jitted_qwen3_forward, (q_params,), qwen3_args, cfg_passes
+        "qwen3_forward", pipeline._jitted_qwen3_forward, (q_params,), qwen3_args, cfg_passes, hlo_dir=hlo_dir
     )
     records.append(qwen3_record)
 
@@ -670,6 +684,7 @@ def main(argv):
         ({k: t_params[k] for k in KREA2_TEXT_CONTEXT_KEYS},),
         text_context_args,
         cfg_passes,
+        hlo_dir=hlo_dir,
     )
     records.append(text_context_record)
 
@@ -701,6 +716,7 @@ def main(argv):
           (prelude_params,),
           step_inputs,
           steps * cfg_passes,
+          hlo_dir=hlo_dir,
       )
       records.append(record)
       transformer_runs.append((record, step_inputs, prelude_out))
@@ -712,6 +728,7 @@ def main(argv):
           (t_params["blocks_0"], {}),
           block_args,
           num_layers * steps * cfg_passes,
+          hlo_dir=hlo_dir,
       )
       # Async dispatch runs the Python block loop ahead of the device, so every
       # block's output buffer is allocated before the earlier blocks finish: a
@@ -729,12 +746,18 @@ def main(argv):
           (t_params["final_layer"],),
           final_args,
           steps * cfg_passes,
+          hlo_dir=hlo_dir,
       )
       records.append(record)
       transformer_runs.append((record, final_args, noise_pred))
     else:
       record, noise_pred = compile_executable(
-          "transformer_step", pipeline._jitted_transformer_step, (t_params,), step_inputs, steps * cfg_passes
+          "transformer_step",
+          pipeline._jitted_transformer_step,
+          (t_params,),
+          step_inputs,
+          steps * cfg_passes,
+          hlo_dir=hlo_dir,
       )
       records.append(record)
       transformer_runs.append((record, step_inputs, noise_pred))
@@ -783,7 +806,12 @@ def main(argv):
   with vae_mesh, nn_partitioning.axis_rules(pipeline.vae_logical_axis_rules):
     latents_5d = sds((batch, 16, 1, height // 8, width // 8), config.activations_dtype, NamedSharding(vae_mesh, P()))
     record, images = compile_executable(
-        "vae_decode", pipeline._jitted_vae_decode, (vae_graphdef, vae_state, vae_rest), (latents_5d,), 1
+        "vae_decode",
+        pipeline._jitted_vae_decode,
+        (vae_graphdef, vae_state, vae_rest),
+        (latents_5d,),
+        1,
+        hlo_dir=hlo_dir,
     )
     records.append(record)
     add_retained(record, vae_live, (latents_5d,), images)

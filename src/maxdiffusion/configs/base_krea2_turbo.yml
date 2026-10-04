@@ -301,6 +301,7 @@ quantization_local_shard_count: -1
 use_qwix_quantization: False
 compile_topology: "" # Target TPU topology for compile_krea2.py AOT memory estimation, e.g. v6e-4.
 compile_topology_num_slices: -1 # Number of target slices, set to a positive integer.
+compile_hlo_dir: "" # compile_krea2.py only: if set, writes each compiled executable's optimized HLO to <dir>/<executable>.txt.
 
 # ML Diagnostics settings
 enable_ml_diagnostics: False

@@ -58,7 +58,14 @@
 #   presets' sequence lengths, 3x slower in the kernel (2k@16:9 17.98 s vs
 #   7.41 s with 2048, 1k@4:3 1.81 s vs 1.14 s; measured 2026-09-30).
 # - krea2_rope_layout 'rotate_half': q/k head dims are permuted at load time so
-#   RoPE works on lane-dense 64-wide halves (exact).
+#   RoPE works on lane-dense 64-wide halves (exact). With flash_custom the q/k
+#   norm, RoPE, the q softmax scale and the padding to the kernel's block sizes
+#   run as one Pallas pass per tensor (kernels/krea2_qk_prep.py; float32 math,
+#   one cast at the end instead of bf16 casts after the norm and after RoPE);
+#   the attention-input W8A8 quantization is computed once for to_q/k/v/gate
+#   (attention glue revision 1, 2026-10-04: compile-only audit of the v6e-1 HLO,
+#   per-block glue traffic 1.72 -> 1.11 GB at 1024x1024 and 6.41 -> 3.73 GB at
+#   2048x2048, same peaks; not yet measured on chip).
 # - krea2_text_compaction_multiple 128: valid prompt tokens are gathered to the
 #   front and the text is truncated to a 128-token bucket (exact); typical
 #   prompts use 128 instead of 512 text tokens.
@@ -389,6 +396,7 @@ quantization_local_shard_count: -1
 use_qwix_quantization: False
 compile_topology: "" # Target TPU topology for compile_krea2.py AOT memory estimation, e.g. v6e-4.
 compile_topology_num_slices: -1 # Number of target slices, set to a positive integer.
+compile_hlo_dir: "" # compile_krea2.py only: if set, writes each compiled executable's optimized HLO to <dir>/<executable>.txt.
 
 # ML Diagnostics settings
 enable_ml_diagnostics: False
