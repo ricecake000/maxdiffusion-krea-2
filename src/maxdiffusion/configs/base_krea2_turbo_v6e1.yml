@@ -75,6 +75,13 @@
 #   attention kernel, activation quantization and VAE unchanged. Images not
 #   bit-identical (PSNR 14.6 dB at 1024x1024, same scene with a changed
 #   composition; 22.8 dB at 2048x2048), same quality, deterministic run to run.
+#   Attention glue revision 2 (2026-10-04): the hybrid kernel reads v as the flat
+#   unpadded (B, L, Hkv*D) projection and writes (B, L, Hq*D) itself, and the
+#   to_q/to_k int8 kernels are stored transposed (weight quant revision 2), so the
+#   block step has no v pad, no attention output copy and no s8 weight copy.
+#   v6e-1 timed denoise against glue revision 1: 1024x1024 1.049 -> 0.952 s
+#   (-9.2 %), 2048x2048 6.493 -> 6.475 s (-0.3 %: the transposed to_q matmul got
+#   slower there, 0.809 -> 1.173 ms per call); images bit-identical.
 # - krea2_text_compaction_multiple 128: valid prompt tokens are gathered to the
 #   front and the text is truncated to a 128-token bucket (exact); typical
 #   prompts use 128 instead of 512 text tokens.

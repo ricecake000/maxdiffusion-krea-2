@@ -248,7 +248,30 @@ AOT: 캐시 메타에 `krea2_attention_glue: r1`(`KREA2_ATTENTION_GLUE_REVISION`
 
 남은 것(프로파일 기준 추정, 모두 미구현):
 
-- G3 미리 전치한 int8 가중치: 스텝마다 s8 가중치 레이아웃 복사(to_q 6144×6144 {0,1} → {1,0}, to_k/to_v)가 블록·스텝당 0.094 / 0.1 ms, 1024²에서 약 1.8 %. 가중치 캐시 리비전 변경과 캐시 재빌드가 필요하다.
-- G4 어텐션 커널이 `(B, L, H*D)`를 바로 쓰기: 지금은 `(B, H, D, L)` 출력 뒤 전치 복사가 블록·스텝당 0.097 / 0.38 ms, 약 1.5 %.
+- G3 미리 전치한 int8 가중치, G4 어텐션 커널이 `(B, L, H*D)`를 바로 쓰기: 6.7에서 구현했다.
 - E 정적 활성화 스케일: 동적 absmax 양자화 패스(예: down_proj 입력 양자화 블록·스텝당 0.142 ms, HBM 피크 속도)를 없앤다. 약 5~8 %, 보정 데이터가 필요하고 화질 위험이 있다.
 - 이전부터 보류된 항목: hybrid용 block_q 재조정(자동 규칙은 아직 flash 기준), v5e에서 hybrid 미측정, 2k 4:3의 고정 block_q 512 / 2048 미측정, block_kv 1024 + VMEM 예산 확장, staged / LoRA + W8A8의 TPU 검증.
+
+### 6.7 마지막 레이아웃 복사 제거: 어텐션 직접 I/O + 전치 저장 int8 q/k 가중치 (2026-10-04)
+
+근거: 6.6 이후 최적화 HLO 감사(v6e-1 교차 컴파일)에서 블록·스텝마다 어텐션 커널 주변에 relayout 패스 네 종류가 남아 있었다. (1) 커널의 `(B, Hq, 128, L)` 출력을 to_gate/to_out 앞에서 `(B, L, Hq*D)`로 바꾸는 전치 복사(1024² 113 MB, 2048² 415 MB), (2) v를 block_kv 배수로 맞추는 head-major pad(33 / 109 MB), (3) to_q/to_k/to_v의 스텝마다 s8 가중치 레이아웃 복사(75.5 + 2 × 18.9 MB). (3)은 이 matmul들이 head-major 출력을 내므로 XLA가 가중치를 `(features, in)` row-major로 원하는데 파라미터가 `(in, features)`로 저장되어 있어서 생겼다.
+
+변경(986d122):
+
+- 커널 I/O 레이아웃(`krea2_attention.kernel_io_layout`): hybrid 변형은 v를 모델 투영 그대로인 패딩 없는 `(B, L, Hkv*128)`로 읽고(BlockSpec `(None, bkv, 128)`, kv 헤드 h // g = 마지막 축의 lane 블록 h // g, 마지막 kv 블록은 부분 블록이며 커널은 유효 행만 읽는다), 출력도 `(B, L, Hq*128)`로 바로 쓴다(BlockSpec `(None, bq, 128)`, (헤드, q 블록)마다 정규화된 타일을 XLU로 한 번 전치, 마지막 q 블록은 마스크된 쓰기). flash 변형(v5e)은 head-major 그대로다. flash_custom 래퍼는 레이아웃에 따라 갈라진다(v / 출력의 평평한 shard_map 스펙, v pad 없음, 출력 복사 없음).
+- direct 레이아웃에서는 to_v의 head 레이아웃 rescale(`unflatten`)을 뺐다. 남겨 두면 XLA가 to_v를 head-major로 내고 다시 평평하게 복사한다. 값은 같다.
+- `Krea2QuantDense.transposed_kernel`: to_q/to_k(`KREA2_TRANSPOSED_KERNEL_TARGETS`)의 int8 커널을 `(features, in)`으로 저장한다. `quantize_transformer_params`가 호스트에서 양자화와 rotate-half 순열 뒤에 전치한다. int8 × int8 → int32는 정확하므로 값이 같다.
+- 리비전: `KREA2_ATTENTION_GLUE_REVISION` 2, `KREA2_TRANSFORMER_QUANT_REVISION` 3(AOT 키; 커널 레이아웃이 모든 traced 그래프에 들어가므로 이제 모든 flash_custom 설정이 글루 키를 갖는다), `KREA2_TRANSFORMER_WEIGHT_QUANT_REVISION` 2(가중치 캐시 키; to_q/to_k 저장 레이아웃이 바뀌었다).
+
+HLO 감사(노트북): 블록당 s8 가중치 복사 3 → 0, 어텐션 출력 복사 1 → 0, v pad 없음, 블록당 글루 트래픽 1105.8 → 846.3 MB(1024²), 3729 → 3092 MB(2048²). HBM 피크 17.52 / 21.30 GiB는 그대로다.
+
+v6e-1 실측(스팟 us-east1-d, 2026-10-04 15:42~16:18 UTC, 코드 986d122, 6.6과 같은 프롬프트·시드, Turbo 8 스텝, W8A8 + hybrid; CPU VM에서 다시 만든 가중치 캐시 적중, 로드 4.4 s): 시간 측정 디노이즈 1024² 1.049 → 0.952 s(−9.2 %), 2048² 6.493 → 6.475 s(−0.3 %). 워밍된 전체 패스 1024² 1.17 → 1.07 s, 2048² 6.81 → 6.79 s. xprof 이미지당 장치 self time:
+
+- 1024² 1106.6 → 1009.8 ms(−8.7 %): 어텐션 글루 27.5 → 0.1 ms, to_q 레이아웃 복사 11.6 → 0 ms, 파라미터 data-formatting 복사 10.6 → 0.2 ms. 예상(약 3.5~4 %)보다 컸던 부분은 matmul이다: W8A8 matmul 합 615.3 → 578.3 ms, 호출당 up_proj 0.746 → 0.708, gate_proj 0.521 → 0.484, to_gate/to_out/to_q 약 −7 %(to_k/to_v는 약 +10 %, 합 2 ms). 원인은 분석하지 않았다. 어텐션 커널 그룹(prep 커널 포함) 291.5 → 270.0 ms.
+- 2048² 6739.4 → 6723.5 ms(−0.2 %): 글루와 복사는 1024²처럼 사라졌지만(어텐션 글루 100.8 → 0.5 ms, 복사 −21.6 ms), 전치 저장된 to_q의 matmul이 호출당 0.809 → 1.173 ms로 느려져(+81.7 ms) 이득을 거의 다 먹었다. 어텐션 커널 그룹도 3647.9 → 3683.9 ms(+1 %; 출력 타일 전치 또는 v lane 블록 DMA로 추정, 미확인).
+
+이미지: 6.6(051518b)과 비트 단위로 같다(1024², 2048², 프로파일 실행 모두 sha256 동일).
+
+AOT: 버킷 `aot/`는 이 프리셋에서 적중하지 않는다(글루 r2, quant r3). 검증 세션은 사전 컴파일(`pc`) 도중 선점되어 `pc` / `aotup`은 아직 다시 돌리지 않았다. 버킷 `wcache/`는 새 리비전으로 다시 만들었다(transformer-98775c7d427d).
+
+남은 것: 2048²에서 전치 저장 to_q matmul의 회귀(+81.7 ms, 약 1.2 %). to_q만 전치하지 않으면 2048²는 약 70 ms 이득이지만 1024²에서는 레이아웃 복사 11.6 ms가 돌아온다. 2048² to_q 융합의 HLO(타일링, rescale 위치)를 보고 정하는 것이 순서다.
