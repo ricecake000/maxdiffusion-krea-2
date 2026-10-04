@@ -334,6 +334,15 @@ krea2_offload_components: []
 # 'flash' / 'hybrid' force a variant (hybrid needs more VMEM: on v5e its
 # automatic block_q is capped lower). '' means 'auto'; other values fail at startup.
 krea2_attention_kernel: 'auto'
+# Scoped-VMEM limit (KiB) of the executables that run the DiT blocks (the
+# monolithic transformer_step or the staged transformer_block; not the text
+# encoder, text context or VAE), passed to XLA as the per-program compile option
+# xla_tpu_scoped_vmem_limit_kib on a TPU only (never on CPU). 0 = the compiler's
+# default (32 MiB on v6e); otherwise an int in [16384, 131072]. A larger limit
+# lets fusions use bigger tiles but leaves less of the 128 MiB VMEM to MSA
+# placements (see base_krea2_turbo_v6e1.yml). Command-line override:
+# krea2_transformer_scoped_vmem_limit_kib=65536.
+krea2_transformer_scoped_vmem_limit_kib: 0
 # RoPE layout of the DiT blocks: "interleaved" (checkpoint order, rotates
 # (2i, 2i+1) pairs) or "rotate_half" (q/k head dims are permuted at load time so
 # RoPE rotates the two 64-lane halves; identical outputs, cheaper on TPU).

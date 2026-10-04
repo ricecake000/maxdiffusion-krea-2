@@ -330,6 +330,21 @@ def flash_custom_block_selection_aot_meta(attention, kernel_choice="auto", devic
   }
 
 
+def transformer_scoped_vmem_aot_meta(limit_kib) -> dict:
+  """AOT cache meta entry for `krea2_transformer_scoped_vmem_limit_kib`; empty at 0 (the compiler default).
+
+  The limit is a compile option of the DiT block executables only, but the
+  meta is per cache, so changing it also misses the other executables (their
+  programs are unchanged; they are compiled again once). At 0 no key is added,
+  so the fingerprint of a default setup and its cached executables stay valid.
+  The key is added whenever the limit is set, also on a platform that ignores
+  it (CPU): such a run only misses, it never loads a wrong executable.
+  """
+  if not limit_kib:
+    return {}
+  return {"krea2_transformer_scoped_vmem_limit_kib": int(limit_kib)}
+
+
 def krea2_mesh_device_kind(mesh):
   """`device_kind` the flash_custom wrapper sees for `mesh` (None when unknown); same helper as the wrapper."""
   from maxdiffusion.models.attention_flax import _mesh_device_kind  # pylint: disable=import-outside-toplevel
@@ -797,7 +812,7 @@ def main(argv):
   )
   from maxdiffusion.models.flux.util import cast_dict_to_bfloat16_inplace
   from maxdiffusion.schedulers.scheduling_flow_match_flax import FlaxFlowMatchScheduler
-  from maxdiffusion.pipelines.krea2.krea2_pipeline import FlaxKrea2Pipeline
+  from maxdiffusion.pipelines.krea2.krea2_pipeline import FlaxKrea2Pipeline, resolve_transformer_scoped_vmem_limit_kib
   from maxdiffusion.loaders.krea2_lora_pipeline import (
       apply_diff_updates,
       insert_lora_params,
@@ -813,6 +828,8 @@ def main(argv):
   height, width, _ = resolve_generation_size(config)
   # An invalid kernel choice fails here, before any model load.
   attention_kernel_choice = resolve_krea2_attention_kernel(config)
+  # Same for the DiT programs' scoped-VMEM limit (the pipeline parses it again).
+  transformer_scoped_vmem_limit_kib = resolve_transformer_scoped_vmem_limit_kib(config)
   if config.attention == "flash_custom":
     max_logging.log(
         f"flash_custom kernel choice: {attention_kernel_choice} ('auto' = hybrid on TPU v6e, flash elsewhere)"
@@ -1352,6 +1369,8 @@ def main(argv):
           **flash_custom_block_selection_aot_meta(
               config.attention, attention_kernel_choice, krea2_mesh_device_kind(transformer.mesh)
           ),
+          # Conditional key: only a non-default scoped-VMEM limit of the DiT programs misses older caches.
+          **transformer_scoped_vmem_aot_meta(transformer_scoped_vmem_limit_kib),
           "lora_compile_spec": lora_compile_spec,
           "jax": jax.__version__,
       },

@@ -124,6 +124,68 @@ def build_staged_block_lora_params(block_params, block_spec):
   }
 
 
+# Accepted krea2_transformer_scoped_vmem_limit_kib values besides 0 (KiB). The
+# lower bound is half the v6e default (32 MiB), below which the to_q tiling only
+# gets worse (16 MiB: 4 heads / 12 passes); the upper bound is v6e's physical
+# VMEM (128 MiB), which the limit shares with the MSA pool.
+KREA2_SCOPED_VMEM_LIMIT_KIB_RANGE = (16384, 131072)
+
+
+def resolve_transformer_scoped_vmem_limit_kib(config) -> int:
+  """Parsed `krea2_transformer_scoped_vmem_limit_kib` (KiB; 0 = the compiler's default limit).
+
+  A missing key (configs that predate it) and None mean 0. Anything other than
+  0 or an int in `KREA2_SCOPED_VMEM_LIMIT_KIB_RANGE` is a ValueError naming the
+  key, so a typo fails at startup instead of as an XLA compile error after the
+  model has loaded.
+  """
+  value = getattr(config, "krea2_transformer_scoped_vmem_limit_kib", 0)
+  if value is None:
+    return 0
+  low, high = KREA2_SCOPED_VMEM_LIMIT_KIB_RANGE
+  # bool is an int subclass; True must not mean 1 KiB.
+  if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+    raise ValueError(f"krea2_transformer_scoped_vmem_limit_kib must be 0 or an int in [{low}, {high}] (KiB), got {value!r}.")
+  value = int(value)
+  if value != 0 and not low <= value <= high:
+    raise ValueError(f"krea2_transformer_scoped_vmem_limit_kib must be 0 or in [{low}, {high}] (KiB), got {value}.")
+  return value
+
+
+def _mesh_platform(mesh):
+  """Platform ("tpu", "cpu", ...) of the mesh's first device, or None when it cannot be determined.
+
+  A topology mesh (compile_krea2's cross-compile) reports "tpu" like a real
+  one; an AbstractMesh reports its abstract device when it carries one.
+  """
+  try:
+    return mesh.devices.flat[0].platform
+  except (AttributeError, IndexError, TypeError, ValueError):
+    pass
+  try:
+    return mesh.abstract_device.platform
+  except AttributeError:
+    return None
+
+
+def transformer_compiler_options(limit_kib, mesh):
+  """XLA compile options of the executables that run the DiT blocks; None for the compiler defaults.
+
+  The scoped-VMEM limit is the per-fusion working-buffer budget (32 MiB by
+  default on v6e). Since the W8A8 to_q weight is read from HBM (attention glue
+  revision 2), its double-buffered weight window caps the 2k to_q matmul at 6
+  heads per pass, i.e. 8 passes over its activation; 36 MiB gives 8 heads / 6
+  passes, 64 MiB 16 / 3 (v6e-1 cross-compile, 128-token text bucket). The rest of v6e's 128 MiB VMEM is the MSA pool that
+  every Krea 2 program fills, so the limit is raised for the DiT programs only
+  (not the text encoder, text context or VAE). Only TPU knows the option: the
+  CPU backend rejects it ("No such compile option"), so tests and interpret
+  runs never get it.
+  """
+  if limit_kib <= 0 or _mesh_platform(mesh) != "tpu":
+    return None
+  return {"xla_tpu_scoped_vmem_limit_kib": int(limit_kib)}
+
+
 # Transformer param subtrees used by the prompt-only text-context executable and
 # by the staged per-step prelude.
 KREA2_TEXT_CONTEXT_KEYS = ("text_fusion", "txt_in")
@@ -345,6 +407,18 @@ class FlaxKrea2Pipeline:
     if self._jitted_qwen3_forward is not None:
       return
 
+    scoped_vmem_limit_kib = resolve_transformer_scoped_vmem_limit_kib(self._config)
+    dit_compiler_options = transformer_compiler_options(scoped_vmem_limit_kib, self.mesh)
+    if dit_compiler_options:
+      max_logging.log(f"DiT block executables compile with {dit_compiler_options} (other executables: defaults).")
+    elif scoped_vmem_limit_kib:
+      max_logging.log(
+          f"krea2_transformer_scoped_vmem_limit_kib={scoped_vmem_limit_kib} ignored: the mesh platform is "
+          f"{_mesh_platform(self.mesh)}, not tpu."
+      )
+    # Only the executables whose program contains the DiT blocks get the options.
+    dit_jit = functools.partial(aot_cache.cached_jit, compiler_options=dit_compiler_options)
+
     @aot_cache.cached_jit
     def qwen3_forward(q_params, ids, mask, position_ids):
       return krea2_text_encoder_hidden_states(self.text_encoder, q_params, ids, mask, position_ids)
@@ -397,9 +471,9 @@ class FlaxKrea2Pipeline:
       # one hidden-state buffer per block. `transformer_step` rebinds
       # `hidden_states` to every block's output and never reads a donated one.
       if getattr(self._config, "krea2_staged_donate_hidden_states", True):
-        block_jit = functools.partial(aot_cache.cached_jit, donate_argnames=("hidden_states",))
+        block_jit = functools.partial(dit_jit, donate_argnames=("hidden_states",))
       else:
-        block_jit = aot_cache.cached_jit
+        block_jit = dit_jit
 
       @block_jit
       def transformer_block(block_params, lora_params, hidden_states, temb_mod, rotary_emb, attention_mask):
@@ -449,7 +523,7 @@ class FlaxKrea2Pipeline:
 
     else:
 
-      @aot_cache.cached_jit
+      @dit_jit
       def transformer_step(t_params, latents, text_hidden, text_mask, img_ids, txt_ids, t_vec):
         return self.transformer.apply(
             {"params": t_params},

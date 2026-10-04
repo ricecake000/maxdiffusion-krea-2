@@ -27,6 +27,10 @@ limitations under the License.
 # compile_hlo_dir=<dir> additionally writes every compiled executable's optimized
 # HLO (compiled.as_text()) to <dir>/<executable name>.txt, for offline audits of
 # the fusions XLA chose (e.g. transformer_step.txt for the denoising step).
+#
+# krea2_transformer_scoped_vmem_limit_kib=<KiB> compiles the DiT block executables
+# with that scoped-VMEM limit, exactly as generate_krea2.py does (the options
+# travel with the pipeline's cached_jit entries); the JSON name gets _svmem-<KiB>.
 
 import json
 import math
@@ -297,7 +301,10 @@ def compile_executable(name, entry, param_args, activation_args, calls, hlo_dir=
 
   hlo_dir: if non-empty, the optimized HLO of the executable is written to <hlo_dir>/<name>.txt.
   """
-  max_logging.log(f"Compiling {name}...")
+  # The entry's own jit carries its compiler options (e.g. the DiT programs'
+  # scoped-VMEM limit), so this compile matches the runtime one.
+  compiler_options = getattr(entry, "compiler_options", None)
+  max_logging.log(f"Compiling {name}{f' with {compiler_options}' if compiler_options else ''}...")
   t0 = time.perf_counter()
   lowered = entry.jitted.lower(*param_args, *activation_args)
   compiled = lowered.compile()
@@ -332,6 +339,7 @@ def compile_executable(name, entry, param_args, activation_args, calls, hlo_dir=
       "dispatch_runahead": 0,
       "flops_per_device": xla_flops(compiled),
       "compile_seconds": compile_s,
+      "compiler_options": dict(compiler_options) if compiler_options else None,
   }
   max_logging.log(f" -> {name} compiled in {compile_s:.1f}s")
   return record, outputs
@@ -387,6 +395,12 @@ def print_report(report):
   for r in report["executables"]:
     if r["retained_buffers"]:
       max_logging.log(f"  retained during {r['name']}: {', '.join(r['retained_buffers'])}")
+  optioned = [r["name"] for r in report["executables"] if r.get("compiler_options")]
+  limit_kib = report.get("krea2_transformer_scoped_vmem_limit_kib")
+  if optioned:
+    max_logging.log(f"Scoped VMEM limit {limit_kib} KiB (compiler option) in: {', '.join(optioned)}; others: default.")
+  elif limit_kib:
+    max_logging.log(f"krea2_transformer_scoped_vmem_limit_kib={limit_kib} was not applied (target is not a TPU).")
   weights = report["resident_weights"]
   max_logging.log(report["text_encoder_residency"])
   max_logging.log(
@@ -508,6 +522,7 @@ def main(argv):
       KREA2_TEXT_CONTEXT_KEYS,
       FlaxKrea2Pipeline,
       is_classifier_free_guidance_enabled,
+      resolve_transformer_scoped_vmem_limit_kib,
   )
 
   config = pyconfig.config
@@ -515,6 +530,8 @@ def main(argv):
   if not topology:
     raise ValueError("Set compile_topology=<name>, e.g. compile_topology=v6e-4.")
   attention_kernel_choice = resolve_krea2_attention_kernel(config)
+  # Validated before anything compiles; the pipeline applies it to the DiT programs.
+  scoped_vmem_limit_kib = resolve_transformer_scoped_vmem_limit_kib(config)
   # getattr defaults keep this script usable with configs that predate these keys.
   offload = tuple(getattr(config, "krea2_offload_components", None) or ())
   unknown = sorted(set(offload) - set(OFFLOADABLE_COMPONENTS))
@@ -880,6 +897,7 @@ def main(argv):
       "attention": config.attention,
       "krea2_attention_kernel": attention_kernel_choice,
       "krea2_attention_kernel_variant": attention_kernel_variant,
+      "krea2_transformer_scoped_vmem_limit_kib": scoped_vmem_limit_kib,
       "attention_uses_kernel": uses_kernel,
       "flash_min_seq_length": transformer.flash_min_seq_length,
       "executables": records,
@@ -912,6 +930,8 @@ def main(argv):
     suffix += "_embed-host"
   if transformer_quantization:
     suffix += f"_tq-{transformer_quantization}"
+  if scoped_vmem_limit_kib:
+    suffix += f"_svmem-{scoped_vmem_limit_kib}"
   json_path = os.path.join(config.output_dir, f"compile_krea2_{topology}_{width}x{height}{suffix}.json")
   with open(json_path, "w") as f:
     json.dump(report, f, indent=2)

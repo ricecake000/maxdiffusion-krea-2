@@ -82,6 +82,19 @@
 #   v6e-1 timed denoise against glue revision 1: 1024x1024 1.049 -> 0.952 s
 #   (-9.2 %), 2048x2048 6.493 -> 6.475 s (-0.3 %: the transposed to_q matmul got
 #   slower there, 0.809 -> 1.173 ms per call); images bit-identical.
+# - krea2_transformer_scoped_vmem_limit_kib 36864: the DiT program (transformer_step)
+#   compiles with a 36 MiB scoped-VMEM limit instead of XLA's 32 MiB default. Since
+#   the layout copy is gone, the 2k to_q matmul reads its s8 weight from HBM, and
+#   the double-buffered weight window caps its tile at 6 heads under 32 MiB: 8
+#   passes over the 101 MB int8 activation instead of 4 (compile-only diagnosis,
+#   2026-10-05). 36 MiB gives 8 heads / 6 passes (fit model ~950 us per 2k call
+#   against 1184 us measured), 64 MiB 16 heads / 3 passes. v6e's 128 MiB VMEM is
+#   the scoped limit plus an MSA pool that every Krea 2 program fills, so the text
+#   encoder, text context and VAE keep the default. compile_krea2.py v6e-1 with
+#   the 128-token text bucket: all 28 to_q fusions go 6 -> 8 heads at 1k and 2k,
+#   ~200 other fusions (to_k/v/gate/out, gate/up/down_proj) retile, MSA high-water
+#   92.5 -> 84.5 MiB at 2k, HBM peaks unchanged. With 512 text tokens (seq 16896)
+#   the 2k to_q tile stays 6 heads. Unmeasured on a TPU; 0 restores the default.
 # - krea2_text_compaction_multiple 128: valid prompt tokens are gathered to the
 #   front and the text is truncated to a 128-token bucket (exact); typical
 #   prompts use 128 instead of 512 text tokens.
@@ -445,6 +458,15 @@ krea2_offload_components: []
 # 'flash' / 'hybrid' force a variant (hybrid needs more VMEM: on v5e its
 # automatic block_q is capped lower). '' means 'auto'; other values fail at startup.
 krea2_attention_kernel: 'auto'
+# Scoped-VMEM limit (KiB) of the executables that run the DiT blocks (the
+# monolithic transformer_step or the staged transformer_block; not the text
+# encoder, text context or VAE), passed to XLA as the per-program compile option
+# xla_tpu_scoped_vmem_limit_kib on a TPU only (never on CPU). 0 = the compiler's
+# default (32 MiB on v6e); otherwise an int in [16384, 131072]. A larger limit
+# lets fusions use bigger tiles but leaves less of the 128 MiB VMEM to MSA
+# placements. 36864 (36 MiB) here: see the header. Command-line override:
+# krea2_transformer_scoped_vmem_limit_kib=65536.
+krea2_transformer_scoped_vmem_limit_kib: 36864
 # RoPE layout of the DiT blocks: "interleaved" (checkpoint order, rotates
 # (2i, 2i+1) pairs) or "rotate_half" (q/k head dims are permuted at load time so
 # RoPE rotates the two 64-lane halves; identical outputs, cheaper on TPU).

@@ -44,6 +44,28 @@ def _donating_fn(h, w, flag=False):
   return h @ w + (1.0 if flag else 0.0)
 
 
+# An option every XLA backend knows (the CPU one included) and one only TPU
+# knows: the CPU backend rejects the latter at compile time, which proves the
+# options reach that compile.
+_CPU_OPTIONS = {"xla_cpu_enable_fast_math": False}
+_TPU_ONLY_OPTIONS = {"xla_tpu_scoped_vmem_limit_kib": 36864}
+
+
+@functools.partial(aot_cache.cached_jit, compiler_options=_CPU_OPTIONS)
+def _optioned_fn(x, y):
+  return x @ y + 2.0
+
+
+@functools.partial(aot_cache.cached_jit, compiler_options=_TPU_ONLY_OPTIONS)
+def _tpu_optioned_fn(x, y):
+  return x @ y
+
+
+@functools.partial(aot_cache.cached_jit, donate_argnames=("h",), compiler_options=_TPU_ONLY_OPTIONS)
+def _tpu_optioned_donating_fn(h, w):
+  return h @ w
+
+
 class _ObservedLock:
   """Wraps a lock and signals once a second caller tries to enter it."""
 
@@ -540,6 +562,106 @@ class AotCacheTest(unittest.TestCase):
     self.assertEqual(len(calls), 1)
     self.assertFalse(entry._pending)
     self.assertEqual(aot_cache.save_pending(), 0)
+
+  def test_compiler_options_default_to_none(self):
+    self.assertIsNone(self._entry("._toy_fn").compiler_options)
+    self.assertEqual(self._entry("._optioned_fn").compiler_options, _CPU_OPTIONS)
+
+  def test_compiler_options_reach_the_disabled_jit_compile(self):
+    with self.assertRaisesRegex(Exception, "xla_tpu_scoped_vmem_limit_kib"):
+      _tpu_optioned_fn(self._a, self._b)
+    with self.assertRaisesRegex(Exception, "xla_tpu_scoped_vmem_limit_kib"):
+      self._entry("._tpu_optioned_fn").jitted.lower(self._a, self._b).compile()
+    np.testing.assert_allclose(np.asarray(_optioned_fn(self._a, self._b)), self._a @ self._b + 2.0)
+
+  def test_compiler_options_reach_the_adapter_compile(self):
+    # Installed cache: misses run the per-signature adapter, warmup and
+    # save_pending compile it; all of them must carry the options.
+    self._install()
+    with self.assertRaisesRegex(Exception, "xla_tpu_scoped_vmem_limit_kib"):
+      _tpu_optioned_fn(self._a, self._b)
+    with self.assertRaisesRegex(Exception, "xla_tpu_scoped_vmem_limit_kib"):
+      _tpu_optioned_donating_fn(self._fresh_h(), self._b)
+    with self.assertRaisesRegex(Exception, "xla_tpu_scoped_vmem_limit_kib"):
+      with aot_cache.warmup_mode():
+        _tpu_optioned_fn(self._a, self._b)
+
+  def test_compiler_options_record_save_reload(self):
+    self._install()
+    first = _optioned_fn(self._a, self._b)
+    self.assertEqual(aot_cache.save_pending(), 1)
+    entry = self._entry("._optioned_fn")
+    entry._compiled.clear()  # simulate a fresh process
+    entry.load_from_disk()
+    self.assertTrue(entry._compiled)
+    np.testing.assert_allclose(np.asarray(_optioned_fn(self._a, self._b)), np.asarray(first))
+
+  def test_compiler_options_traced_call_inlines_without_them(self):
+    # jax rejects compiler_options on a nested jit; a traced call inlines
+    # through the option-free twin, with the cache disabled and enabled.
+    for install in (False, True):
+      if install:
+        self._install()
+      result = jax.jit(lambda x: _tpu_optioned_fn(x, self._b) + 1.0)(self._a)
+      np.testing.assert_allclose(np.asarray(result), self._a @ self._b + 1.0)
+      result = jax.jit(lambda h: _tpu_optioned_donating_fn(h, self._b))(self._fresh_h())
+      np.testing.assert_allclose(np.asarray(result), self._fresh_h() @ self._b)
+    self.assertEqual(aot_cache.save_pending(), 0)  # nothing recorded
+
+  def _captured_outer_traces(self):
+    """Outer traces whose inner optioned call has only captured concrete arrays (or none)."""
+    a, b = self._a, self._b
+    return {
+        "captured_jit": lambda fn: jax.jit(lambda: fn(a, b))(),
+        "zero_arg_closure_jit": lambda fn: jax.jit(lambda: (lambda: fn(a, b))())(),
+        "eval_shape": lambda fn: jax.eval_shape(lambda: fn(a, b)),
+    }
+
+  def test_compiler_options_captured_outer_trace_inlines(self):
+    # No argument leaf is a tracer here; the active trace context decides.
+    for install in (False, True):
+      if install:
+        self._install()
+      for name, run in self._captured_outer_traces().items():
+        for fn, expected in ((_optioned_fn, self._a @ self._b + 2.0), (_tpu_optioned_fn, self._a @ self._b)):
+          with self.subTest(install=install, trace=name, fn=fn.name):
+            out = run(fn)
+            if name == "eval_shape":
+              self.assertEqual(out.shape, (8, 8))
+            else:
+              np.testing.assert_allclose(np.asarray(out), expected)
+    self.assertEqual(aot_cache.save_pending(), 0)  # nothing recorded
+
+  def test_compiler_options_nested_error_fallback(self):
+    # Safety net: should the trace-context check miss, jax's nested-options
+    # ValueError is caught and the call retried without the options (logged once).
+    with mock.patch.object(aot_cache, "_outer_trace_active", return_value=False):
+      for install in (False, True):
+        if install:
+          self._install()
+        for name, run in self._captured_outer_traces().items():
+          with self.subTest(install=install, trace=name):
+            out = run(_optioned_fn)
+            self.assertEqual(out.shape, (8, 8))
+      entry = self._entry("._optioned_fn")
+      self.assertTrue(entry._logged_nested_fallback)
+      # Other ValueErrors are not swallowed.
+      with self.assertRaises(ValueError):
+        entry._call_optioned(lambda: (_ for _ in ()).throw(ValueError("other")), lambda: None)
+
+  def test_compiler_options_need_the_trace_detector(self):
+    # A jax without trace_state_clean: optioned entries fail at construction,
+    # option-free entries are built and run as before.
+    registered = len(aot_cache._REGISTRY)
+    with mock.patch.object(aot_cache, "_TRACE_STATE_CLEAN", None):
+      with self.assertRaisesRegex(RuntimeError, "krea2_transformer_scoped_vmem_limit_kib=0"):
+        aot_cache.cached_jit(lambda x: x, compiler_options=_CPU_OPTIONS)
+      self.assertEqual(len(aot_cache._REGISTRY), registered)  # nothing registered
+      plain = aot_cache.cached_jit(lambda x: x + 1.0)
+      empty = aot_cache.cached_jit(lambda x: x + 2.0, compiler_options={})
+      np.testing.assert_allclose(np.asarray(plain(self._a)), self._a + 1.0)
+      np.testing.assert_allclose(np.asarray(jax.jit(lambda: empty(self._a))()), self._a + 2.0)
+    aot_cache._REGISTRY[registered:] = []
 
   def test_signature_deterministic_across_processes(self):
     # Signatures live in filenames; a process-dependent component (e.g.

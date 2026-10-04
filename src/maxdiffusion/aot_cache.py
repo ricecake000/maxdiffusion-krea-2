@@ -42,6 +42,10 @@ minus the torch interop):
     the adapter donates (``donate_argnums=(0,)``), so the donation is baked
     into the serialized executable. Fns without donation keep the original
     single-list adapter, so their on-disk executables are unchanged.
+  * ``compiler_options`` (e.g. a TPU scoped-VMEM limit) apply to one
+    wrapped fn only: they go to its own ``jax.jit`` and to its per-signature
+    adapter, so the jit fallback, ``lower().compile()`` and the serialized
+    executable all carry them while other programs keep the defaults.
   * ``install(..., lazy_load=True)`` starts no background loads: a
     signature's file is deserialized on its first call instead (one
     ``os.path.exists`` per shape, one attempt per install), so a cache
@@ -81,6 +85,37 @@ from maxdiffusion import max_logging
 _FORMAT_VERSION = 1
 
 
+def _resolve_trace_state_clean():
+  """jax's "no transformation is tracing" predicate, or None when this jax lacks it.
+
+  ``trace_state_clean`` is private jax API (present in jax 0.11.1 and 0.11.2).
+  Resolved once at import: entries with compiler options depend on it (see
+  ``_outer_trace_active``) and refuse to be built without it.
+  """
+  try:
+    from jax._src import core as jax_core  # pylint: disable=import-outside-toplevel
+  except ImportError:
+    return None
+  return getattr(jax_core, "trace_state_clean", None)
+
+
+_TRACE_STATE_CLEAN = _resolve_trace_state_clean()
+
+
+def _outer_trace_active() -> bool:
+  """Whether a jax transformation (jit, eval_shape, grad, vmap, ...) is tracing right now.
+
+  Argument leaves cannot tell: a call over captured concrete arrays (or with no
+  arguments) inside an outer jit carries no tracer. The trace context can. Only
+  called for entries with compiler options, which cannot exist without the
+  predicate (``_AotEntry.__init__``).
+  """
+  return not _TRACE_STATE_CLEAN()
+
+
+_NESTED_OPTIONS_ERROR = "can only be passed to top-level"
+
+
 def _dynamic_signature(args: tuple, kwargs: dict) -> str:
   """Deterministic digest of everything that selects an executable.
 
@@ -108,13 +143,30 @@ def _dynamic_signature(args: tuple, kwargs: dict) -> str:
 class _AotEntry:
   """Executables for one wrapped fn, keyed by dynamic input signature."""
 
-  def __init__(self, name: str, fn: Callable, static_argnames: tuple, donate_argnames: tuple = ()):
+  def __init__(
+      self,
+      name: str,
+      fn: Callable,
+      static_argnames: tuple,
+      donate_argnames: tuple = (),
+      compiler_options: dict[str, Any] | None = None,
+  ):
     if isinstance(donate_argnames, str):
       donate_argnames = (donate_argnames,)
     self.name = name
     self.fn = fn
     self.static_argnames = tuple(static_argnames)
     self.donate_argnames = tuple(donate_argnames)
+    # None (not {}) when unset, so jax.jit gets exactly its default.
+    self.compiler_options = dict(compiler_options) if compiler_options else None
+    if self.compiler_options and _TRACE_STATE_CLEAN is None:
+      # Without the trace-context check a call inside an outer trace could run a
+      # (donating) executable there; fail at construction instead of degrading.
+      raise RuntimeError(
+          f"{name}: compiler_options {self.compiler_options} need jax._src.core.trace_state_clean, which jax "
+          f"{jax.__version__} does not provide. Set krea2_transformer_scoped_vmem_limit_kib=0 (the compiler's "
+          "default limit) to run without compiler options."
+      )
     overlap = set(self.static_argnames) & set(self.donate_argnames)
     if overlap:
       raise ValueError(f"{name}: args cannot be both static and donated: {sorted(overlap)}")
@@ -126,12 +178,26 @@ class _AotEntry:
         fn,
         static_argnames=static_argnames or None,
         donate_argnames=self.donate_argnames or None,
+        compiler_options=self.compiler_options,
+    )
+    # jax rejects compiler_options on a jit nested in an outer trace, so a
+    # traced call inlines through this option-free twin (the outer program's
+    # options apply there, as for any nested jit).
+    self._nested_jitted = (
+        jax.jit(
+            fn,
+            static_argnames=static_argnames or None,
+            donate_argnames=self.donate_argnames or None,
+        )
+        if self.compiler_options
+        else self.jitted
     )
     self._compiled: dict[str, Any] = {}
     self._out_specs: dict[str, Any] = {}
     self._pending: dict[str, tuple] = {}
     self._adapters: dict[str, Any] = {}
     self._on_disk: set[str] = set()
+    self._logged_nested_fallback = False
     # Signatures a lazy install already tried to load (hit, miss or failure).
     self._lazy_tried: set[str] = set()
     self._lock = threading.Lock()
@@ -193,7 +259,7 @@ class _AotEntry:
         def adapter(flat, _treedef=treedef, _static=static):
           return self.fn(**jax.tree_util.tree_unflatten(_treedef, flat), **_static)
 
-        adapter_jit = jax.jit(adapter)
+        adapter_jit = jax.jit(adapter, compiler_options=self.compiler_options)
       else:
         donated_treedef, treedef = treedefs
 
@@ -204,7 +270,7 @@ class _AotEntry:
               **_static,
           )
 
-        adapter_jit = jax.jit(donating_adapter, donate_argnums=(0,))
+        adapter_jit = jax.jit(donating_adapter, donate_argnums=(0,), compiler_options=self.compiler_options)
       with self._lock:
         self._adapters.setdefault(signature, adapter_jit)
         adapter_jit = self._adapters[signature]
@@ -238,15 +304,38 @@ class _AotEntry:
     return compiled
 
   # ---------------------------------------------------------------- call
+  def _call_optioned(self, call: Callable, fallback: Callable):
+    """Runs ``call``; if jax rejects the compiler options as nested, runs ``fallback``.
+
+    Safety net behind ``_outer_trace_active``: jax raises this ValueError while
+    staging, before anything executes, so no donated buffer has been consumed.
+    """
+    if not self.compiler_options:
+      return call()
+    try:
+      return call()
+    except ValueError as e:
+      if _NESTED_OPTIONS_ERROR not in str(e):
+        raise
+      if not self._logged_nested_fallback:
+        self._logged_nested_fallback = True
+        max_logging.log(f"[aot] {self.name}: called inside an outer trace; inlining without its compiler options")
+      return fallback()
+
   def __call__(self, *args, **kwargs):
+    if self.compiler_options and _outer_trace_active():
+      # jax allows compiler_options on top-level jits only; inside any outer
+      # trace (also one over captured concrete arrays) inline through the
+      # option-free twin and record nothing.
+      return self._nested_jitted(*args, **kwargs)
     if not _STATE.enabled:
-      return self.jitted(*args, **kwargs)
+      return self._call_optioned(lambda: self.jitted(*args, **kwargs), lambda: self._nested_jitted(*args, **kwargs))
     dynamic, static = self._canonicalize(args, kwargs)
     arg_lists, treedefs = self._flatten_dynamic(dynamic)
     if any(isinstance(leaf, jax.core.Tracer) for leaves in arg_lists for leaf in leaves):
       # Under an outer trace a deserialized executable cannot be applied
       # and tracers must not be recorded -- inline like a nested jit.
-      return self.jitted(**dynamic, **static)
+      return self._nested_jitted(**dynamic, **static)
     signature = _dynamic_signature((), {**dynamic, **static})
     if _STATE.lazy_load and signature not in self._compiled:
       self._lazy_load(signature)
@@ -283,7 +372,8 @@ class _AotEntry:
     with self._lock:
       if signature not in self._pending and signature not in self._compiled:
         self._pending[signature] = (arg_lists, treedefs, static)
-    return self._adapter_for(signature, treedefs, static)(*arg_lists)
+    adapter_jit = self._adapter_for(signature, treedefs, static)
+    return self._call_optioned(lambda: adapter_jit(*arg_lists), lambda: self._nested_jitted(**dynamic, **static))
 
   def _align_inputs(self, compiled: Any, arg_lists: tuple):
     """Reshards the flat input leaf lists onto the executable's shardings.
@@ -480,7 +570,12 @@ _REGISTRY: list[_AotEntry] = []
 _LOAD_THREADS: list[threading.Thread] = []
 
 
-def cached_jit(fn: Callable, static_argnames: tuple = (), donate_argnames: tuple = ()) -> Callable:
+def cached_jit(
+    fn: Callable,
+    static_argnames: tuple = (),
+    donate_argnames: tuple = (),
+    compiler_options: dict[str, Any] | None = None,
+) -> Callable:
   """Drop-in replacement for ``jax.jit`` with an optional AOT layer.
 
   Behaves exactly like ``jax.jit(fn, static_argnames=...,
@@ -493,11 +588,17 @@ def cached_jit(fn: Callable, static_argnames: tuple = (), donate_argnames: tuple
   deleted once the call runs) -- rebind it to the output instead. The one
   exception is ``warmup_mode()``, which only compiles and leaves inputs
   intact. Donated args cannot also be static.
+
+  ``compiler_options`` (XLA compile options, e.g.
+  ``{"xla_tpu_scoped_vmem_limit_kib": 36864}``) are compiled into this fn's
+  executables only. They are not part of the on-disk key: the caller puts
+  whatever selects them into the ``install()`` meta. A call under an outer
+  trace inlines without them (jax allows them on top-level jits only).
   """
   # Qualify by module: same-named fns (e.g. the VACE and base
   # transformer_forward_pass) must not glob each other's files.
   name = f"{fn.__module__.rsplit('.', 1)[-1]}.{fn.__name__}"
-  entry = _AotEntry(name, fn, static_argnames, donate_argnames)
+  entry = _AotEntry(name, fn, static_argnames, donate_argnames, compiler_options)
   _REGISTRY.append(entry)
   return entry
 
