@@ -40,7 +40,10 @@
 #   l-sum on the MXU; block selection revision 4): measured on v6e-1 per
 #   attention call at the same block_q 1.674 -> 1.444 ms at 1024x1024 (seq
 #   4224) and 20.558 -> 16.869 ms at 2048x2048 (seq 16512) against 'flash',
-#   same accuracy; image and end-to-end numbers to be measured.
+#   same accuracy. End to end on v6e-1 (2026-10-04, same session, timed
+#   denoise): 1024x1024 1.169 -> 1.119 s (-4.3 %), 2048x2048 7.902 -> 7.109 s
+#   (-10.0 %); images not bit-identical (PSNR 20.9 / 24.6 dB), same scene and
+#   quality.
 #   flash_block_sizes is {}: the kv block sizes come from the kernel's per-chip
 #   defaults (hybrid 2048/2048/1024, pv 256, strip 256; a forced
 #   krea2_attention_kernel=flash keeps the v6e-tuned 2048/1024/256, measured
