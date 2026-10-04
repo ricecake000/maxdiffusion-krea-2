@@ -1821,6 +1821,28 @@ def _krea2_reject_sharded_sequence(mesh, q_axis_names, kv_axis_names):
     )
 
 
+def krea2_flash_custom_io_layout(flash_block_sizes, mesh) -> str:
+  """I/O layout ("head_major" / "direct") of the kernel variant flash_custom picks for this carrier and mesh.
+
+  The same choice as the wrapper's (`resolve_kernel_variant` of the carrier's
+  `kernel` on the mesh's device kind), for callers that shape their
+  projections for it (Krea2Attention's to_v).
+  """
+  choice = _read_custom_block_sizes(flash_block_sizes)["kernel"]
+  return krea2_kernel.kernel_io_layout(krea2_kernel.resolve_kernel_variant(choice, _mesh_device_kind(mesh)))
+
+
+def _krea2_flat_heads_spec(spec):
+  """(B, L, H*D) spec of a (B, H, L, D) mesh spec: batch, length as they are, the heads axis on the last dim.
+
+  Splitting the flat last dim into the heads axis' shards keeps whole heads
+  per shard (contiguous groups of D lanes), i.e. the same split as the 4-D
+  spec; a sharded D is not supported by the kernel (it needs D = 128 locally).
+  """
+  entries = tuple(spec) + (None,) * (4 - len(spec))
+  return jax.sharding.PartitionSpec(entries[0], entries[2], entries[1])
+
+
 @register_kernel("flash_custom")
 def krea2_custom_flash_kernel(q, k, v, context):
   """Krea 2 prefix-masked GQA flash attention (`kernels/krea2_attention.py`).
@@ -1841,6 +1863,14 @@ def krea2_custom_flash_kernel(q, k, v, context):
   dict holds "q_norm_weight" / "k_norm_weight" ((D,) zero-centered RMSNorm
   weights), "eps" and the (L, D/2) rotate_half tables "cos" / "sin".
 
+  The kernel's I/O layout (`krea2_attention.kernel_io_layout` of the selected
+  variant) decides how v and the output travel: "head_major" (flash) pads v to
+  block_kv in (B, Hkv, L, D) and transposes the (B, Hq, D, L) kernel output;
+  "direct" (hybrid) hands v over as the flat, unpadded (B, L, Hkv*D) projection
+  (a 4-D v is transposed back, which XLA cancels against the caller's
+  transpose so the to_v matmul writes the flat layout) and the kernel writes
+  (B, L, Hq*D) itself: no v pad and no output copy.
+
   Returns (B, L, Hq*D) like the other registered kernels.
   """
   heads = context["heads"]
@@ -1851,7 +1881,6 @@ def krea2_custom_flash_kernel(q, k, v, context):
   query, _ = _reshape_data_for_flash(q, heads)
   num_kv_heads = k.shape[1] if k.ndim == 4 else k.shape[-1] // dim_head
   key, _ = _reshape_data_for_flash(k, num_kv_heads)
-  value, _ = _reshape_data_for_flash(v, num_kv_heads)
 
   batch, _, q_seq_len, _ = query.shape
   kv_seq_len = key.shape[2]
@@ -1867,6 +1896,8 @@ def krea2_custom_flash_kernel(q, k, v, context):
     valid_kv_len = attention_mask.astype(jnp.int32).sum(axis=-1)
     valid_kv_len = jnp.broadcast_to(valid_kv_len, (batch,))
 
+  # The variant (and with it the v layout) is not known yet; the operand dtype
+  # only needs v's dtype, which no layout changes.
   user_sizes = _read_custom_block_sizes(context["flash_block_sizes"])
   # The carrier's `kernel` ("auto" / "flash" / "hybrid") picks the kernel
   # variant: "auto" is "hybrid" on a TPU v6e and "flash" elsewhere. The device
@@ -1878,9 +1909,10 @@ def krea2_custom_flash_kernel(q, k, v, context):
       q_seq_len,
       user=user_sizes,
       device_kind=_mesh_device_kind(mesh),
-      dtype=_krea2_operand_dtype(query, key, value),
+      dtype=_krea2_operand_dtype(query, key, v),
   )
   vmem_limit_bytes = user_sizes["vmem_limit_bytes"]
+  direct = krea2_kernel.kernel_io_layout(block_sizes.variant) == "direct"
 
   q_padded_len = krea2_kernel.padded_len(q_seq_len, block_sizes.block_q)
   kv_padded_len = krea2_kernel.padded_len(kv_seq_len, block_sizes.block_kv)
@@ -1893,8 +1925,21 @@ def krea2_custom_flash_kernel(q, k, v, context):
       key = jnp.pad(key, ((0, 0), (0, 0), (0, kv_pad), (0, 0)))
   elif q_seq_len != kv_seq_len:
     raise ValueError(f"krea2_qk_prep needs self-attention lengths, got q {q_seq_len} and kv {kv_seq_len}")
-  if kv_pad:
-    value = jnp.pad(value, ((0, 0), (0, 0), (0, kv_pad), (0, 0)))
+  if direct:
+    # (B, L, Hkv*D), unpadded: the kernel reads the in-bounds rows of its last kv block.
+    if v.ndim == 4:
+      value = jnp.transpose(v, (0, 2, 1, 3)).reshape(v.shape[0], v.shape[2], v.shape[1] * v.shape[3])
+    else:
+      value = v
+    if value.shape != (batch, kv_seq_len, num_kv_heads * dim_head):
+      raise ValueError(
+          f"v has shape {v.shape}, which does not match k {k.shape} (expected (B, L, Hkv*D) = "
+          f"{(batch, kv_seq_len, num_kv_heads * dim_head)} or its (B, Hkv, L, D) form)"
+      )
+  else:
+    value, _ = _reshape_data_for_flash(v, num_kv_heads)
+    if kv_pad:
+      value = jnp.pad(value, ((0, 0), (0, 0), (0, kv_pad), (0, 0)))
 
   attention = krea2_kernel.make_krea2_attention(
       block_sizes,
@@ -1928,14 +1973,22 @@ def krea2_custom_flash_kernel(q, k, v, context):
         f"local q heads {q_local.shape[1]} must be a multiple of local kv heads {k_local.shape[1]}; "
         "shard q and kv heads over the same mesh axis."
     )
-    out = attention(q_local, k_local, v_local, valid_local)  # (b, hq, d, l)
-    return jnp.swapaxes(out, 2, 3)
+    out = attention(q_local, k_local, v_local, valid_local)
+    if direct:
+      return out  # (b, l, hq * d)
+    return jnp.swapaxes(out, 2, 3)  # (b, hq, d, l) -> (b, hq, l, d)
 
   q_axis_names = nn.logical_to_mesh_axes(context["axis_names_q"])
   kv_axis_names = nn.logical_to_mesh_axes(context["axis_names_kv"])
   _krea2_reject_sharded_sequence(mesh, q_axis_names, kv_axis_names)
   valid_axis_names = jax.sharding.PartitionSpec(q_axis_names[0])
-  in_specs = (q_axis_names, kv_axis_names, kv_axis_names, valid_axis_names)
+  if direct:
+    v_axis_names = _krea2_flat_heads_spec(kv_axis_names)
+    out_axis_names = _krea2_flat_heads_spec(q_axis_names)
+  else:
+    v_axis_names = kv_axis_names
+    out_axis_names = q_axis_names
+  in_specs = (q_axis_names, kv_axis_names, v_axis_names, valid_axis_names)
   prep_args = ()
   if qk_prep is not None:
     # The raw (B, H, L, D) q/k shard like the prepared ones; weights and tables are replicated.
@@ -1946,11 +1999,13 @@ def krea2_custom_flash_kernel(q, k, v, context):
       local_attention,
       mesh=mesh,
       in_specs=in_specs,
-      out_specs=q_axis_names,
+      out_specs=out_axis_names,
       check_vma=False,
   )
-  out = mapped_attention(query, key, value, valid_kv_len, *prep_args)  # (B, Hq, L, D)
-  return _reshape_heads_to_head_dim(out)
+  out = mapped_attention(query, key, value, valid_kv_len, *prep_args)
+  if direct:  # (B, L, Hq*D) already; same sharding constraint as _reshape_heads_to_head_dim.
+    return jax.lax.with_sharding_constraint(out, nn.logical_to_mesh_axes((BATCH, LENGTH, HEAD)))
+  return _reshape_heads_to_head_dim(out)  # (B, Hq, L, D) -> (B, L, Hq*D)
 
 
 @register_kernel("cudnn_flash_te")

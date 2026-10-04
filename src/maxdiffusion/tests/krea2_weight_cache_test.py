@@ -54,7 +54,9 @@ from maxdiffusion.models.krea2.text_encoder_quant import (
 )
 from maxdiffusion.models.krea2.transformer_quant import (
     KREA2_DEFAULT_QUANT_TARGETS,
+    KREA2_QUANT_TARGETS,
     KREA2_TRANSFORMER_WEIGHT_QUANT_REVISION,
+    KREA2_TRANSPOSED_KERNEL_TARGETS,
     check_transformer_param_tree,
     quantize_transformer_params,
     resolve_transformer_quantization,
@@ -304,6 +306,51 @@ class WeightCacheTransformerTest(_CacheTestCase):
     check_transformer_param_tree(loaded, abstract)
     self.assert_bit_identical(loaded, fresh)
     self.assertEqual(loaded["blocks_0"]["attn"]["to_q"]["kernel"].dtype, np.int8)
+    expected = model.apply({"params": fresh}, *_model_args()).sample
+    got = model.apply({"params": loaded}, *_model_args()).sample
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(expected))
+
+
+  def test_transposed_kernels_round_trip_under_the_new_revision(self):
+    # All targets, so to_k's (out, in) int8 kernel (not square) goes through the cache. A tree cached under
+    # weight_quant_revision 1 ((in, out) to_q / to_k) is never found under the current meta.
+    self.assertEqual(KREA2_TRANSFORMER_WEIGHT_QUANT_REVISION, 2)
+    model = _tiny_transformer(quant_targets=KREA2_QUANT_TARGETS, rope_layout="rotate_half")
+    abstract = _abstract_params(model)
+    float_params = _random_float_params()
+    params = permute_rope_weights_to_rotate_half(
+        float_params,
+        num_heads=model.num_attention_heads,
+        num_kv_heads=model.num_key_value_heads,
+        head_dim=model.attention_head_dim,
+    )
+    fresh = quantize_transformer_params(params, KREA2_QUANT_TARGETS, scale_dtype=jnp.float32)
+    check_transformer_param_tree(fresh, abstract)
+    config = types.SimpleNamespace(pretrained_model_name_or_path="krea/krea-2", weights_dtype=jnp.float32)
+    meta = transformer_weight_cache_meta(
+        config,
+        "/hf/snapshots/abc123",
+        "w8a8",
+        KREA2_QUANT_TARGETS,
+        "rotate_half",
+        model.num_attention_heads,
+        model.num_key_value_heads,
+        model.attention_head_dim,
+    )
+    self.assertEqual(meta["weight_quant_revision"], 2)
+    stale = {**meta, "weight_quant_revision": 1}
+    self.assertIsNotNone(save_component(self.cache_dir, "transformer", stale, fresh))
+    with mock.patch.object(weight_cache.max_logging, "log"):
+      self.assertIsNone(load_component(self.cache_dir, "transformer", meta, abstract, check_dtypes=True))
+    self.assertIsNotNone(save_component(self.cache_dir, "transformer", meta, fresh))
+    with mock.patch.object(weight_cache.max_logging, "log"):
+      loaded, _ = load_component(self.cache_dir, "transformer", meta, abstract, check_dtypes=True)
+    check_transformer_param_tree(loaded, abstract)
+    self.assert_bit_identical(loaded, fresh)
+    for name in KREA2_TRANSPOSED_KERNEL_TARGETS:
+      in_out = float_params["blocks_0"]["attn"][name]["kernel"].shape
+      self.assertEqual(loaded["blocks_0"]["attn"][name]["kernel"].shape, in_out[::-1])
+    self.assertNotEqual(*loaded["blocks_0"]["attn"]["to_k"]["kernel"].shape)
     expected = model.apply({"params": fresh}, *_model_args()).sample
     got = model.apply({"params": loaded}, *_model_args()).sample
     np.testing.assert_array_equal(np.asarray(got), np.asarray(expected))

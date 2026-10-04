@@ -44,11 +44,19 @@ KREA2_QUANT_ATTN_TARGETS = ("to_q", "to_k", "to_v", "to_gate", "to_out")
 KREA2_QUANT_FF_TARGETS = ("gate_proj", "up_proj", "down_proj")
 KREA2_QUANT_TARGETS = KREA2_QUANT_ATTN_TARGETS + KREA2_QUANT_FF_TARGETS
 KREA2_DEFAULT_QUANT_TARGETS = ("to_q", "to_gate", "to_out", "gate_proj", "up_proj", "down_proj")
+# Quantized projections whose int8 `kernel` is stored transposed, `(features, in)` (`Krea2QuantDense`
+# `transposed_kernel`). Their matmuls emit the head-major (B, H, L, D) layout the q/k prep kernels read, for
+# which XLA wants W^T row-major: an `(in, features)` parameter cost one s8 relayout copy per block step.
+# to_v is not here: the hybrid attention kernel reads the flat (B, L, Hkv*D) v, which wants `(in, features)`.
+# The single source of truth for `Krea2Attention.setup` and `quantize_transformer_params`.
+KREA2_TRANSPOSED_KERNEL_TARGETS = ("to_q", "to_k")
 # Bump when the traced W8A8 graph changes; it is part of the AOT cache key, so this invalidates cached executables.
-KREA2_TRANSFORMER_QUANT_REVISION = 2
+# 3: to_q / to_k int8 kernels transposed (KREA2_TRANSPOSED_KERNEL_TARGETS).
+KREA2_TRANSFORMER_QUANT_REVISION = 3
 # Bump when `quantize_kernel` / `quantize_transformer_params` change the stored values; it is part of the
 # weight cache key (krea2_weight_cache_dir), so this invalidates cached quantized trees.
-KREA2_TRANSFORMER_WEIGHT_QUANT_REVISION = 1
+# 2: to_q / to_k int8 kernels stored as `(features, in)` (KREA2_TRANSPOSED_KERNEL_TARGETS).
+KREA2_TRANSFORMER_WEIGHT_QUANT_REVISION = 2
 
 _BLOCK_KEY = re.compile(r"blocks_\d+")
 _GIB = 1024**3
@@ -138,6 +146,12 @@ class Krea2QuantDense(nn.Module):
   `unflatten` is the feature layout the caller reshapes the output to (e.g.
   `(num_heads, head_dim)`); the rescale then runs in that layout so the matmul
   can emit it directly. The output is still `(..., features)`.
+
+  `transposed_kernel` stores the int8 `kernel` as `(features, in)` (logical
+  axes `kernel_axes` reversed), the layout XLA wants for a matmul that emits a
+  head-major output; with the `(in, features)` parameter it relayouts the
+  weight in every call. The int32 result is the same (exact integer math).
+  `kernel_scale` stays `(features,)`.
   """
 
   features: int
@@ -146,15 +160,20 @@ class Krea2QuantDense(nn.Module):
   param_dtype: jnp.dtype = jnp.float32
   precision: Optional[jax.lax.Precision] = None
   unflatten: Optional[Tuple[int, ...]] = None
+  transposed_kernel: bool = False
 
   @nn.compact
   def __call__(self, inputs, quantized_inputs=None):
     """`quantized_inputs` is the `(x_q, x_scale)` pair of `quantize_activation(inputs, dtype)`,
     passed in when several projections share one activation; None quantizes `inputs` here."""
+    if self.transposed_kernel:
+      kernel_shape, kernel_axes, contract = (self.features, inputs.shape[-1]), tuple(reversed(self.kernel_axes)), 1
+    else:
+      kernel_shape, kernel_axes, contract = (inputs.shape[-1], self.features), tuple(self.kernel_axes), 0
     kernel = self.param(
         "kernel",
-        nn.with_logical_partitioning(nn.initializers.zeros_init(), self.kernel_axes),
-        (inputs.shape[-1], self.features),
+        nn.with_logical_partitioning(nn.initializers.zeros_init(), kernel_axes),
+        kernel_shape,
         jnp.int8,
     )
     # Unboxed, so the per-column scale is replicated.
@@ -163,7 +182,7 @@ class Krea2QuantDense(nn.Module):
       quantized_inputs = quantize_activation(inputs, self.dtype)
     x_q, x_scale = quantized_inputs
     acc = jax.lax.dot_general(
-        x_q, kernel, (((x_q.ndim - 1,), (0,)), ((), ())), preferred_element_type=jnp.int32
+        x_q, kernel, (((x_q.ndim - 1,), (contract,)), ((), ())), preferred_element_type=jnp.int32
     )
     # Rescale in the activation dtype (fuses into the matmul on TPU; the benchmarked bf16 form),
     # unless it cannot hold the largest int32 accumulator (float16: max 65504), then in float32.
@@ -229,7 +248,10 @@ def quantize_transformer_params(host_params, targets, scale_dtype, num_workers=N
   Returns:
     A new plain nested dict in which each target's `kernel` is int8 and a
     `kernel_scale` is added; every other leaf (incl. `lora-*` subtrees) is
-    shared with the input, which is not modified.
+    shared with the input, which is not modified. The int8 kernels of
+    `KREA2_TRANSPOSED_KERNEL_TARGETS` are stored transposed, `(out, in)`
+    (C-contiguous), the others `(in, out)`; the values and scales are those of
+    `quantize_kernel` on the `(in, out)` float kernel either way.
 
   Raises:
     ValueError: no `blocks_*` group, or a missing projection/kernel, or a
@@ -253,15 +275,23 @@ def quantize_transformer_params(host_params, targets, scale_dtype, num_workers=N
         raise ValueError(f"Transformer params have no kernel at {path}/kernel to quantize.")
       if not jnp.issubdtype(proj["kernel"].dtype, jnp.floating):
         raise ValueError(f"{path}/kernel has dtype {proj['kernel'].dtype}; it is already quantized or not a float.")
-      projections.append(proj)
+      projections.append((name, proj))
 
   bytes_before = tree_nbytes(host_params)
   start = time.time()
   num_workers = num_workers or min(8, os.cpu_count() or 1)
   # numpy releases the GIL in the elementwise ops, so threads quantize in parallel.
+
+  def quantize(item):
+    name, proj = item
+    kernel, scale = quantize_kernel(proj["kernel"], scale_dtype)
+    if name in KREA2_TRANSPOSED_KERNEL_TARGETS:
+      kernel = np.ascontiguousarray(kernel.T)
+    return kernel, scale
+
   with ThreadPoolExecutor(max_workers=num_workers) as executor:
-    quantized = list(executor.map(lambda proj: quantize_kernel(proj["kernel"], scale_dtype), projections))
-  for proj, (kernel, scale) in zip(projections, quantized):
+    quantized = list(executor.map(quantize, projections))
+  for (_, proj), (kernel, scale) in zip(projections, quantized):
     proj["kernel"] = kernel
     proj["kernel_scale"] = scale
   bytes_after = tree_nbytes(result)

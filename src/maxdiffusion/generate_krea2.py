@@ -274,17 +274,21 @@ def attention_glue_aot_meta(attention, rope_layout, transformer_quantization, qu
   """AOT cache meta entry for the Krea 2 attention glue; empty where the glue graph is unchanged.
 
   The key carries `KREA2_ATTENTION_GLUE_REVISION` for setups whose traced graph
-  it changes: flash_custom with rotate_half RoPE (the fused q/k prep kernel) or
-  W8A8 on any of to_q/to_k/to_v/to_gate (the shared attention-input
-  quantization). Other setups keep their fingerprint (and cached executables).
+  it changes: every flash_custom setup (the kernel's v / output I/O layout is
+  part of the traced glue for every RoPE layout, with or without W8A8: revision
+  2 changed the hybrid kernel's, so e.g. an unquantized interleaved-RoPE hybrid
+  setup on v6e must not reuse a pre-revision-2 executable; rotate_half adds the
+  fused q/k prep kernel) or W8A8 on any of to_q/to_k/to_v/to_gate (the shared
+  attention-input quantization). Other setups keep their fingerprint (and
+  cached executables). `rope_layout` no longer changes the result.
   """
   from maxdiffusion.models.krea2.transformer_krea2_flax import KREA2_ATTENTION_GLUE_REVISION
 
-  fused_qk_prep = attention == "flash_custom" and rope_layout == "rotate_half"
+  del rope_layout  # every flash_custom setup carries the key
   shared_quantization = bool(transformer_quantization) and any(
       name in (quant_targets or ()) for name in ("to_q", "to_k", "to_v", "to_gate")
   )
-  if not (fused_qk_prep or shared_quantization):
+  if not (attention == "flash_custom" or shared_quantization):
     return {}
   return {"krea2_attention_glue": f"r{KREA2_ATTENTION_GLUE_REVISION}"}
 

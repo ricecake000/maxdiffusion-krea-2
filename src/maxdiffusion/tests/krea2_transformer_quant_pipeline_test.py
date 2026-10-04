@@ -195,7 +195,9 @@ class QuantizedParamResidencyTest(unittest.TestCase):
     check_transformer_param_tree(host_q, abstract)
     host = flax.core.freeze(host_q)
     self.assertEqual(jax.tree_util.tree_structure(host), jax.tree_util.tree_structure(shardings))
-    self.assertEqual(shardings["blocks_0"]["attn"]["to_q"]["kernel"].spec, P(None, "data"))
+    # to_q's int8 kernel is stored transposed, (heads, embed) (KREA2_TRANSPOSED_KERNEL_TARGETS); to_gate is not.
+    self.assertEqual(shardings["blocks_0"]["attn"]["to_q"]["kernel"].spec, P("data", None))
+    self.assertEqual(shardings["blocks_0"]["attn"]["to_gate"]["kernel"].spec, P(None, "data"))
     self.assertEqual(shardings["blocks_0"]["attn"]["to_q"]["kernel_scale"].spec, P())
     host_kernel = host["blocks_0"]["ff"]["down_proj"]["kernel"]
     self.assertIsInstance(host_kernel, np.ndarray)
@@ -395,17 +397,21 @@ class AttentionGlueAotMetaTest(unittest.TestCase):
 
   def test_unchanged_glue_adds_no_key(self):
     # Setups whose traced graph the glue revision does not touch keep their AOT cache fingerprint.
-    self.assertEqual(attention_glue_aot_meta("flash_custom", "interleaved", "", ()), {})
+    self.assertEqual(attention_glue_aot_meta("dot_product", "interleaved", "", ()), {})
     self.assertEqual(attention_glue_aot_meta("dot_product", "rotate_half", "", ()), {})
     self.assertEqual(attention_glue_aot_meta("flash", "rotate_half", "w8a8", ("gate_proj", "to_out")), {})
-    self.assertEqual(attention_glue_aot_meta("flash_custom", "interleaved", "", ("to_q",)), {})
+    self.assertEqual(attention_glue_aot_meta("dot_product", "interleaved", "", ("to_q",)), {})
 
   def test_changed_glue_records_the_revision(self):
     expected = {"krea2_attention_glue": f"r{KREA2_ATTENTION_GLUE_REVISION}"}
-    self.assertEqual(KREA2_ATTENTION_GLUE_REVISION, 1)
+    self.assertEqual(KREA2_ATTENTION_GLUE_REVISION, 2)
     # The v6e-1 preset: flash_custom + rotate_half + W8A8 on the attention projections.
     self.assertEqual(attention_glue_aot_meta("flash_custom", "rotate_half", "w8a8", _TARGETS), expected)
     self.assertEqual(attention_glue_aot_meta("flash_custom", "rotate_half", "", ()), expected)
+    # Every flash_custom setup: the kernel I/O layout (revision 2: hybrid direct v / output) is in the graph.
+    self.assertEqual(attention_glue_aot_meta("flash_custom", "interleaved", "", ()), expected)
+    self.assertEqual(attention_glue_aot_meta("flash_custom", "interleaved", "", ("to_q",)), expected)
+    self.assertEqual(attention_glue_aot_meta("flash_custom", "interleaved", "w8a8", ("gate_proj",)), expected)
     for target in ("to_q", "to_k", "to_v", "to_gate"):
       self.assertEqual(attention_glue_aot_meta("dot_product", "interleaved", "w8a8", (target,)), expected)
 

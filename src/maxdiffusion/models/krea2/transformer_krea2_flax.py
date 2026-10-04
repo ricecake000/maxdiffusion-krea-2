@@ -33,8 +33,13 @@ from ...common_types import BlockSizes
 from ...configuration_utils import ConfigMixin, flax_register_to_config
 from ...utils import BaseOutput
 from ..modeling_flax_utils import FlaxModelMixin
-from ..attention_flax import AttentionOp, apply_rope
-from .transformer_quant import Krea2QuantDense, normalize_quant_targets, quantize_activation
+from ..attention_flax import AttentionOp, apply_rope, krea2_flash_custom_io_layout
+from .transformer_quant import (
+    KREA2_TRANSPOSED_KERNEL_TARGETS,
+    Krea2QuantDense,
+    normalize_quant_targets,
+    quantize_activation,
+)
 
 ROPE_LAYOUTS = ("interleaved", "rotate_half")
 # Bump when the traced attention glue changes; it is part of the AOT cache key
@@ -42,7 +47,10 @@ ROPE_LAYOUTS = ("interleaved", "rotate_half")
 # 1: flash_custom + rotate_half runs q/k norm, RoPE, the q scale and the padding
 #    in one Pallas pass per tensor (kernels/krea2_qk_prep.py); W8A8 projections
 #    share one materialized attention-input quantization (optimization barrier).
-KREA2_ATTENTION_GLUE_REVISION = 1
+# 2: the hybrid kernel takes v as the flat unpadded (B, L, Hkv*D) projection and
+#    writes its output as (B, L, Hq*D) (direct I/O layout): no v pad, no output copy;
+#    the W8A8 to_v then rescales flat, and the to_q/to_k int8 kernels are stored transposed.
+KREA2_ATTENTION_GLUE_REVISION = 2
 
 
 def _validate_rope_layout(layout):
@@ -143,10 +151,13 @@ def apply_explicit_lora(output, inputs, adapters=(), dtype=jnp.float32, precisio
   return output
 
 
-def _projection(features, kernel_axes, quantized, dtype, weights_dtype, precision, unflatten=None):
+def _projection(
+    features, kernel_axes, quantized, dtype, weights_dtype, precision, unflatten=None, transposed_kernel=False
+):
   """A bias-free block projection: `Krea2QuantDense` (W8A8) when `quantized`, else `nn.Dense`.
 
-  `unflatten` is the caller's output layout (see `Krea2QuantDense`); `nn.Dense` ignores it.
+  `unflatten` is the caller's output layout and `transposed_kernel` the int8
+  kernel's stored layout (see `Krea2QuantDense`); `nn.Dense` ignores both.
   """
   if quantized:
     return Krea2QuantDense(
@@ -156,6 +167,7 @@ def _projection(features, kernel_axes, quantized, dtype, weights_dtype, precisio
         param_dtype=weights_dtype,
         precision=precision,
         unflatten=unflatten,
+        transposed_kernel=transposed_kernel,
     )
   return nn.Dense(
       features,
@@ -252,15 +264,28 @@ class Krea2Attention(nn.Module):
     # q/k/v are reshaped to heads right after the projection; W8A8 rescales in that layout.
     q_layout = (self.num_heads, self.head_dim)
     kv_layout = (self.num_kv_heads, self.head_dim)
-    self.to_q = _projection(
-        q_features, ("embed", "heads"), "to_q" in self.quant_targets, unflatten=q_layout, **proj_kwargs
-    )
-    self.to_k = _projection(
-        kv_features, ("embed", "heads"), "to_k" in self.quant_targets, unflatten=kv_layout, **proj_kwargs
-    )
-    self.to_v = _projection(
-        kv_features, ("embed", "heads"), "to_v" in self.quant_targets, unflatten=kv_layout, **proj_kwargs
-    )
+    # Except v for a flash_custom kernel with the "direct" I/O layout (the hybrid kernel), which reads the
+    # flat (B, L, Hkv*D) projection: a head layout rescale there makes XLA emit the to_v matmul head-major
+    # (with an s8 weight relayout) and copy it back to flat. Layout only: the values are the same.
+    v_layout = kv_layout
+    if self.attention_kernel == "flash_custom":
+      if krea2_flash_custom_io_layout(self.flash_block_sizes, self.mesh) == "direct":
+        v_layout = None
+
+    def head_projection(name, features, layout):
+      # The int8 kernels of KREA2_TRANSPOSED_KERNEL_TARGETS are stored (features, in): see transformer_quant.
+      return _projection(
+          features,
+          ("embed", "heads"),
+          name in self.quant_targets,
+          unflatten=layout,
+          transposed_kernel=name in KREA2_TRANSPOSED_KERNEL_TARGETS,
+          **proj_kwargs,
+      )
+
+    self.to_q = head_projection("to_q", q_features, q_layout)
+    self.to_k = head_projection("to_k", kv_features, kv_layout)
+    self.to_v = head_projection("to_v", kv_features, v_layout)
     self.to_gate = _projection(q_features, ("embed", "heads"), "to_gate" in self.quant_targets, **proj_kwargs)
     self.to_out = _projection(self.dim, ("heads", "embed"), "to_out" in self.quant_targets, **proj_kwargs)
     self.norm_q = Krea2RMSNorm(self.head_dim, eps=self.eps)

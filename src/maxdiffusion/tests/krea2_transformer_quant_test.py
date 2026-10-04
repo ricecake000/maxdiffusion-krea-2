@@ -30,9 +30,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from maxdiffusion import pyconfig
+from maxdiffusion import max_utils, pyconfig
 from maxdiffusion.models.attention_flax import AttentionOp
-from maxdiffusion.models.krea2 import transformer_krea2_flax
+from maxdiffusion.models.krea2 import transformer_krea2_flax, transformer_quant
 from maxdiffusion.models.krea2.transformer_krea2_flax import (
     Krea2Attention,
     Krea2Transformer2DModel,
@@ -42,6 +42,9 @@ from maxdiffusion.models.krea2.transformer_krea2_flax import (
 from maxdiffusion.models.krea2.transformer_quant import (
     KREA2_DEFAULT_QUANT_TARGETS,
     KREA2_QUANT_TARGETS,
+    KREA2_TRANSFORMER_QUANT_REVISION,
+    KREA2_TRANSFORMER_WEIGHT_QUANT_REVISION,
+    KREA2_TRANSPOSED_KERNEL_TARGETS,
     Krea2QuantDense,
     check_transformer_param_tree,
     describe_transformer_quantization,
@@ -437,6 +440,39 @@ class Krea2QuantDenseTest(unittest.TestCase):
     self.assertRegex(hlo, r"dot_general.*\(tensor<[0-9x]*xi8>, tensor<[0-9x]*xi8>\) -> tensor<[0-9x]*xi32>")
 
 
+  def test_transposed_kernel_equals_untransposed(self):
+    # The same int8 weights stored (features, in): exact int32 math, identical outputs, flat or unflattened.
+    rng = np.random.RandomState(3)
+    x = jnp.asarray(rng.randn(2, 5, 32).astype(np.float32))
+    w = (rng.randn(32, 24) * 0.2).astype(np.float32)
+    variables = self._params(w)
+    transposed = {
+        "params": {
+            "kernel": jnp.asarray(np.ascontiguousarray(np.asarray(variables["params"]["kernel"]).T)),
+            "kernel_scale": variables["params"]["kernel_scale"],
+        }
+    }
+    for dtype in (jnp.float32, jnp.bfloat16):
+      for unflatten in (None, (3, 8)):
+        with self.subTest(dtype=dtype, unflatten=unflatten):
+          kwargs = dict(kernel_axes=("embed", "heads"), dtype=dtype, unflatten=unflatten)
+          expected = Krea2QuantDense(24, **kwargs).apply(variables, x)
+          actual = Krea2QuantDense(24, transposed_kernel=True, **kwargs).apply(transposed, x)
+          self.assertEqual((actual.shape, actual.dtype), (expected.shape, expected.dtype))
+          np.testing.assert_array_equal(np.asarray(actual, np.float32), np.asarray(expected, np.float32))
+
+  def test_transposed_kernel_init_and_int8_dot_general(self):
+    dense = Krea2QuantDense(24, kernel_axes=("embed", "heads"), transposed_kernel=True)
+    x = jnp.ones((1, 4, 32), jnp.float32)
+    params = dense.init(jax.random.PRNGKey(0), x)["params"]
+    self.assertEqual(params["kernel"].names, ("heads", "embed"))
+    self.assertEqual(params["kernel"].unbox().dtype, jnp.int8)
+    self.assertEqual(params["kernel"].unbox().shape, (24, 32))
+    self.assertEqual(params["kernel_scale"].shape, (24,))
+    hlo = jax.jit(lambda p, x: dense.apply({"params": p}, x)).lower(_unbox(params), x).as_text()
+    self.assertRegex(hlo, r"dot_general.*\(tensor<1x4x32xi8>, tensor<24x32xi8>\) -> tensor<1x4x24xi32>")
+
+
 class QuantizedModelTreeTest(unittest.TestCase):
 
   def _abstract(self, model, inputs):
@@ -454,12 +490,15 @@ class QuantizedModelTreeTest(unittest.TestCase):
           for name in names:
             prefix = (f"blocks_{i}", group, name)
             kernel = quant_tree[prefix + ("kernel",)]
-            self.assertEqual(kernel.shape, float_tree[prefix + ("kernel",)].shape)
+            float_shape = float_tree[prefix + ("kernel",)].shape
             if name in KREA2_DEFAULT_QUANT_TARGETS:
+              transposed = name in KREA2_TRANSPOSED_KERNEL_TARGETS
+              self.assertEqual(kernel.shape, float_shape[::-1] if transposed else float_shape)
               self.assertEqual(kernel.dtype, jnp.int8)
               self.assertEqual(quant_tree[prefix + ("kernel_scale",)].dtype, weights_dtype)
-              self.assertEqual(quant_tree[prefix + ("kernel_scale",)].shape, (kernel.shape[1],))
+              self.assertEqual(quant_tree[prefix + ("kernel_scale",)].shape, (float_shape[1],))
             else:
+              self.assertEqual(kernel.shape, float_shape)
               self.assertEqual(kernel.dtype, weights_dtype)
               self.assertNotIn(prefix + ("kernel_scale",), quant_tree)
       # Nothing outside blocks_* is quantized.
@@ -526,6 +565,47 @@ class QuantizedModelTreeTest(unittest.TestCase):
           proj = getattr(getattr(bound.blocks[i], group), name)
           self.assertIsInstance(proj, Krea2QuantDense)
           self.assertEqual(proj.unflatten, layouts.get(name), (i, name))
+          self.assertEqual(proj.transposed_kernel, name in ("to_q", "to_k"), (i, name))
+
+  def test_to_v_rescales_flat_for_the_direct_kernel_layout(self):
+    # The hybrid flash_custom kernel reads the flat (B, L, Hkv*D) v, so to_v must not rescale in head layout
+    # there; q/k (head-major prep kernel operands) keep theirs, and every other kernel keeps the v head layout.
+    mesh = jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",))
+    hidden = jnp.asarray(np.random.RandomState(0).randn(1, 6, _HIDDEN).astype(np.float32))
+    kv_layout = (_KV_HEADS, _HEAD_DIM)
+    for kernel, kernel_choice, device_kind, expected in (
+        ("flash_custom", "hybrid", None, None),
+        ("flash_custom", "auto", "TPU v6 lite", None),
+        ("flash_custom", None, "TPU v6 lite", None),
+        ("flash_custom", "flash", "TPU v6 lite", kv_layout),
+        ("flash_custom", "auto", "TPU v5 lite", kv_layout),
+        ("flash_custom", "auto", None, kv_layout),
+        ("dot_product", "hybrid", "TPU v6 lite", kv_layout),
+    ):
+      with self.subTest(kernel=kernel, choice=kernel_choice, device_kind=device_kind):
+        attention = Krea2Attention(
+            dim=_HIDDEN,
+            num_heads=_HEADS,
+            num_kv_heads=_KV_HEADS,
+            head_dim=_HEAD_DIM,
+            attention_kernel=kernel,
+            flash_block_sizes=max_utils.CustomFlashBlockSizes(kernel=kernel_choice),
+            mesh=mesh,
+            quant_targets=KREA2_QUANT_TARGETS,
+        )
+        with mock.patch("maxdiffusion.models.attention_flax._mesh_device_kind", return_value=device_kind):
+          params = attention.init(jax.random.PRNGKey(0), hidden)["params"]
+          bound = attention.bind({"params": params})
+          self.assertEqual(bound.to_v.unflatten, expected)
+          self.assertEqual(bound.to_q.unflatten, (_HEADS, _HEAD_DIM))
+          self.assertEqual(bound.to_k.unflatten, kv_layout)
+          # Layout only: the (B, L, Hkv*D) values are the same either way.
+          np.testing.assert_array_equal(
+              np.asarray(bound.to_v(hidden)),
+              np.asarray(Krea2QuantDense(_KV_HEADS * _HEAD_DIM, ("embed", "heads"), unflatten=kv_layout).apply(
+                  {"params": params["to_v"]}, hidden
+              )),
+          )
 
   def test_head_layout_keeps_param_tree_and_output(self):
     inputs = _inputs()
@@ -547,7 +627,8 @@ class QuantizedModelTreeTest(unittest.TestCase):
       self.assertEqual((leaf.shape, leaf.dtype), (flat_tree[path].shape, flat_tree[path].dtype), path)
     for name, features in (("to_q", _HEADS * _HEAD_DIM), ("to_k", _KV_HEADS * _HEAD_DIM), ("to_v", _KV_HEADS * _HEAD_DIM)):
       prefix = ("blocks_0", "attn", name)
-      self.assertEqual((tree[prefix + ("kernel",)].shape, tree[prefix + ("kernel",)].dtype), ((_HIDDEN, features), jnp.int8))
+      shape = (features, _HIDDEN) if name in KREA2_TRANSPOSED_KERNEL_TARGETS else (_HIDDEN, features)
+      self.assertEqual((tree[prefix + ("kernel",)].shape, tree[prefix + ("kernel",)].dtype), (shape, jnp.int8))
       self.assertEqual(tree[prefix + ("kernel_scale",)].shape, (features,))
     np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
 
@@ -718,6 +799,59 @@ class QuantizeTransformerParamsTest(unittest.TestCase):
     unchanged = quantize_transformer_params(flax.core.freeze(self.params), (), np.float32)
     self.assertIsInstance(unchanged, dict)
     self.assertIs(unchanged["blocks_0"]["attn"]["to_q"]["kernel"], self.params["blocks_0"]["attn"]["to_q"]["kernel"])
+
+  def test_transposed_targets_layout(self):
+    # to_q / to_k (KREA2_TRANSPOSED_KERNEL_TARGETS) are stored (out, in) = quantize_kernel's int8 .T; others (in, out).
+    self.assertEqual(KREA2_TRANSPOSED_KERNEL_TARGETS, ("to_q", "to_k"))
+    self.assertEqual((KREA2_TRANSFORMER_QUANT_REVISION, KREA2_TRANSFORMER_WEIGHT_QUANT_REVISION), (3, 2))
+    quantized = quantize_transformer_params(self.params, KREA2_QUANT_TARGETS, np.float32)
+    for i in range(2):
+      for name in KREA2_QUANT_TARGETS:
+        group = "attn" if name in _ATTN_TARGETS else "ff"
+        with self.subTest(block=i, name=name):
+          float_kernel = self.params[f"blocks_{i}"][group][name]["kernel"]
+          proj = quantized[f"blocks_{i}"][group][name]
+          kernel, scale = quantize_kernel(float_kernel, np.float32)
+          np.testing.assert_array_equal(proj["kernel_scale"], scale)
+          self.assertEqual(proj["kernel"].dtype, np.int8)
+          self.assertTrue(proj["kernel"].flags["C_CONTIGUOUS"])
+          if name in KREA2_TRANSPOSED_KERNEL_TARGETS:
+            self.assertEqual(proj["kernel"].shape, float_kernel.shape[::-1])
+            np.testing.assert_array_equal(proj["kernel"], kernel.T)
+          else:
+            self.assertEqual(proj["kernel"].shape, float_kernel.shape)
+            np.testing.assert_array_equal(proj["kernel"], kernel)
+    # to_k is not square here (kv heads < heads): a wrong layout would not pass the tree check.
+    self.assertNotEqual(*quantized["blocks_0"]["attn"]["to_k"]["kernel"].shape)
+    check_transformer_param_tree(quantized, self._abstract(KREA2_QUANT_TARGETS))
+    # The standalone attention module's abstract tree accepts the attention subtree.
+    attention = Krea2Attention(
+        dim=_HIDDEN, num_heads=_HEADS, num_kv_heads=_KV_HEADS, head_dim=_HEAD_DIM, quant_targets=KREA2_QUANT_TARGETS
+    )
+    hidden = jnp.zeros((1, 6, _HIDDEN), jnp.float32)
+    abstract_attention = jax.eval_shape(attention.init, jax.random.PRNGKey(0), hidden)["params"]
+    check_transformer_param_tree(quantized["blocks_0"]["attn"], abstract_attention)
+    with self.assertRaisesRegex(ValueError, "to_k/kernel"):
+      untransposed = flax.core.unfreeze(flax.core.freeze(quantized))
+      untransposed["blocks_0"]["attn"]["to_k"]["kernel"] = np.ascontiguousarray(
+          quantized["blocks_0"]["attn"]["to_k"]["kernel"].T
+      )
+      check_transformer_param_tree(untransposed, self._abstract(KREA2_QUANT_TARGETS))
+
+  def test_transposed_kernels_give_identical_model_output(self):
+    # The stored layout is the only difference: the quantized model gives bit-identical outputs with the
+    # to_q / to_k kernels transposed (default) and with no transposed targets at all.
+    actual = _tiny_model(quant_targets=KREA2_QUANT_TARGETS).apply(
+        {"params": quantize_transformer_params(self.params, KREA2_QUANT_TARGETS, np.float32)}, *self.inputs
+    )
+    with mock.patch.object(transformer_krea2_flax, "KREA2_TRANSPOSED_KERNEL_TARGETS", ()), mock.patch.object(
+        transformer_quant, "KREA2_TRANSPOSED_KERNEL_TARGETS", ()
+    ):
+      params = quantize_transformer_params(self.params, KREA2_QUANT_TARGETS, np.float32)
+      float_shape = self.params["blocks_0"]["attn"]["to_k"]["kernel"].shape
+      self.assertEqual(params["blocks_0"]["attn"]["to_k"]["kernel"].shape, float_shape)
+      expected = _tiny_model(quant_targets=KREA2_QUANT_TARGETS).apply({"params": params}, *self.inputs)
+    np.testing.assert_array_equal(np.asarray(actual.sample), np.asarray(expected.sample))
 
   def test_bfloat16_scales(self):
     quantized = quantize_transformer_params(self.params, ("to_q",), jnp.bfloat16)

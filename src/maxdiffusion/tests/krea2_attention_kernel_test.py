@@ -62,19 +62,39 @@ def _reference(q, k, v, valid_len, scale):
   return jnp.einsum("bhqk,bhkd->bhqd", probs, vf)
 
 
-def _run_kernel(q, k, v, valid_len, block_sizes, scale):
-  """Pads like the registry wrapper and runs the kernel factory in interpret mode."""
-  seq_len = q.shape[2]
-  q_pad = krea2_attention.padded_len(seq_len, block_sizes.block_q) - seq_len
-  kv_pad = krea2_attention.padded_len(seq_len, block_sizes.block_kv) - seq_len
+def _flat_heads(t):
+  """(B, H, L, D) -> (B, L, H*D)."""
+  return jnp.swapaxes(t, 1, 2).reshape(t.shape[0], t.shape[2], -1)
+
+
+def _run_kernel_raw(q, k, v, valid_len, block_sizes, scale):
+  """Pads like the registry wrapper and runs the kernel factory in interpret mode.
+
+  q, k, v are (B, H, L, D); v goes in the variant's I/O layout. Returns the
+  kernel's own output: (B, Hq, D, Lq) for head_major, (B, Lq, Hq*D) for direct.
+  """
+  q_len, kv_len = q.shape[2], k.shape[2]
+  q_pad = krea2_attention.padded_len(q_len, block_sizes.block_q) - q_len
+  kv_pad = krea2_attention.padded_len(kv_len, block_sizes.block_kv) - kv_len
   q_scaled = (q.astype(jnp.float32) * scale * _LOG2E).astype(q.dtype)
   q_scaled = jnp.pad(q_scaled, ((0, 0), (0, 0), (0, q_pad), (0, 0)))
   k = jnp.pad(k, ((0, 0), (0, 0), (0, kv_pad), (0, 0)))
-  v = jnp.pad(v, ((0, 0), (0, 0), (0, kv_pad), (0, 0)))
+  if krea2_attention.kernel_io_layout(block_sizes.variant) == "direct":
+    v = _flat_heads(v)
+  else:
+    v = jnp.pad(v, ((0, 0), (0, 0), (0, kv_pad), (0, 0)))
   fn = krea2_attention.make_krea2_attention(
-      block_sizes, q_seq_len=seq_len, kv_seq_len=seq_len, use_base2_exp=True, interpret=True
+      block_sizes, q_seq_len=q_len, kv_seq_len=kv_len, use_base2_exp=True, interpret=True
   )
-  out = fn(q_scaled, k, v, jnp.asarray(valid_len, jnp.int32))
+  return fn(q_scaled, k, v, jnp.asarray(valid_len, jnp.int32))
+
+
+def _run_kernel(q, k, v, valid_len, block_sizes, scale):
+  """`_run_kernel_raw` with the output in (B, Hq, Lq, D) for either layout."""
+  out = _run_kernel_raw(q, k, v, valid_len, block_sizes, scale)
+  if krea2_attention.kernel_io_layout(block_sizes.variant) == "direct":
+    batch, q_len, _ = out.shape
+    return jnp.swapaxes(out.reshape(batch, q_len, q.shape[1], _D), 1, 2)
   return jnp.swapaxes(out, 2, 3)
 
 
@@ -468,6 +488,44 @@ class Krea2HybridKernelTest(unittest.TestCase):
     )
 
 
+class Krea2HybridDirectLayoutTest(unittest.TestCase):
+  """The hybrid kernel's direct I/O layout (flat unpadded v in, flat output out) against the flash variant."""
+
+  scale = 1.0 / math.sqrt(_D)
+
+  def test_direct_layout_matches_flash(self):
+    # GQA 4/2 (lane block h // 2 of the flat v), q and kv lengths that are not
+    # multiples of block_q 384 / block_kv 512: partial edge blocks on v (76 rows)
+    # and on the output (316 or 332 rows). Valid lengths full, ragged and 1.
+    sizes = (384, 512, 512, 256, 128, 256)
+    for q_len, kv_len in ((1100, 1100), (700, 1100)):
+      q = _random_qkv(2, 4, 2, q_len, seed=q_len)[0]
+      _, k, v = _random_qkv(2, 4, 2, kv_len, seed=kv_len + 1)
+      for valid in ([kv_len, kv_len], [1049, 300], [1, kv_len], [kv_len, 1]):
+        with self.subTest(q_len=q_len, kv_len=kv_len, valid=valid):
+          raw = _run_kernel_raw(q, k, v, valid, _hybrid(*sizes), self.scale)
+          self.assertEqual(raw.shape, (2, q_len, 4 * _D))
+          self.assertEqual(raw.dtype, jnp.bfloat16)
+          self.assertTrue(bool(jnp.all(jnp.isfinite(raw.astype(jnp.float32)))))
+          flash = _flat_heads(_run_kernel(q, k, v, valid, krea2_attention.Krea2BlockSizes(*sizes[:4]), self.scale))
+          np.testing.assert_allclose(np.asarray(raw, np.float32), np.asarray(flash, np.float32), atol=2e-2, rtol=2e-2)
+          self.assertLess(_rel_l2(raw, flash), 1e-2)
+          ref = _flat_heads(_reference(q, k, v, valid, self.scale))
+          self.assertLess(_rel_l2(raw, ref), 1e-2)
+          if 1 in valid:  # a single valid key: every query of that batch returns its value row exactly
+            b = valid.index(1)
+            expected = jnp.repeat(v[b, :, 0, :], 2, axis=0).reshape(-1)
+            np.testing.assert_array_equal(np.asarray(raw[b], np.float32), np.broadcast_to(expected, raw[b].shape))
+
+  def test_direct_layout_rejects_head_major_v(self):
+    q, k, v = _random_qkv(1, 2, 1, 256, seed=21)
+    fn = krea2_attention.make_krea2_attention(
+        _hybrid(256, 256, 256, 256, 128, 128), q_seq_len=256, kv_seq_len=256, interpret=True
+    )
+    with self.assertRaisesRegex(AssertionError, "direct I/O layout"):
+      fn(q, k, v, jnp.asarray([256], jnp.int32))
+
+
 # Unique transformer sequence lengths of the 22 aspect presets with the 128-token text bucket.
 _PRESET_SEQ_LENS = (4224, 4160, 4016, 4184, 16512, 16256, 15680, 16352)
 
@@ -487,6 +545,16 @@ class Krea2KernelVariantSelectionTest(unittest.TestCase):
         parse(value)
     self.assertEqual(krea2_attention.KERNEL_VARIANTS, ("flash", "hybrid"))
     self.assertEqual(krea2_attention.KERNEL_CHOICES, ("auto", "flash", "hybrid"))
+
+  def test_kernel_io_layout(self):
+    self.assertEqual(krea2_attention.KERNEL_IO_LAYOUTS, ("head_major", "direct"))
+    self.assertEqual(krea2_attention.kernel_io_layout("flash"), "head_major")
+    self.assertEqual(krea2_attention.kernel_io_layout("hybrid"), "direct")
+    for variant in krea2_attention.KERNEL_VARIANTS:
+      self.assertIn(krea2_attention.kernel_io_layout(variant), krea2_attention.KERNEL_IO_LAYOUTS)
+    for value in ("auto", "HYBRID", "", None):
+      with self.subTest(value=value), self.assertRaisesRegex(ValueError, "flash.*hybrid"):
+        krea2_attention.kernel_io_layout(value)
 
   def test_resolve_kernel_variant(self):
     resolve = krea2_attention.resolve_kernel_variant
@@ -941,6 +1009,100 @@ class Krea2FlashCustomRegistryTest(unittest.TestCase):
       out = attention_flax.KERNEL_REGISTRY["flash_custom"](flat(q), flat(k), flat(v), context)
     ref = _reference(q, k, v, [190, 190], 1.0 / math.sqrt(_D))
     np.testing.assert_allclose(np.asarray(out, np.float32), np.asarray(flat(ref), np.float32), atol=2e-2, rtol=2e-2)
+
+
+  def test_flash_custom_hybrid_and_flash_agree_through_the_registry(self):
+    # Both I/O layouts through the registry entry with 4-D and flat 3-D inputs:
+    # q length 600 is not a multiple of block_q / block_kv 256 (partial edge
+    # blocks on the hybrid's v and output), GQA 4/2, two batches.
+    batch, hq, hkv, seq_len = 2, 4, 2, 600
+    q, k, v = _random_qkv(batch, hq, hkv, seq_len, seed=15)
+    mesh = Mesh(np.array(jax.devices()[:1]), ("data",))
+    carriers = {
+        "flash": max_utils.CustomFlashBlockSizes(
+            block_q=256, block_kv=256, block_kv_compute=256, block_kv_compute_in=256, kernel="flash"
+        ),
+        "hybrid": max_utils.CustomFlashBlockSizes(
+            block_q=256,
+            block_kv=256,
+            block_kv_compute=256,
+            block_kv_compute_in=256,
+            block_kv_pv=128,
+            block_q_strip=128,
+            kernel="hybrid",
+        ),
+    }
+    for valid in ([seq_len, 457], [1, seq_len]):
+      mask = (jnp.arange(seq_len)[None, :] < jnp.asarray(valid)[:, None]).astype(jnp.int32)
+      context = {
+          "heads": hq,
+          "dim_head": _D,
+          "scale": 1.0 / math.sqrt(_D),
+          "mesh": mesh,
+          "attention_mask": mask,
+          "axis_names_q": (attention_flax.BATCH, attention_flax.HEAD, attention_flax.LENGTH, attention_flax.D_KV),
+          "axis_names_kv": (attention_flax.BATCH, attention_flax.HEAD, attention_flax.KV_LENGTH, attention_flax.D_KV),
+      }
+      outs = {}
+      for name, carrier in carriers.items():
+        for form, args in (("4d", (q, k, v)), ("flat", tuple(_flat_heads(t) for t in (q, k, v)))):
+          with self.subTest(valid=valid, kernel=name, form=form), mesh, nn.partitioning.axis_rules(()):
+            out = attention_flax.KERNEL_REGISTRY["flash_custom"](*args, dict(context, flash_block_sizes=carrier))
+            self.assertEqual(out.shape, (batch, seq_len, hq * _D))
+            outs[(name, form)] = out
+      ref = _flat_heads(_reference(q, k, v, valid, 1.0 / math.sqrt(_D)))
+      for key, out in outs.items():
+        with self.subTest(valid=valid, out=key):
+          np.testing.assert_allclose(
+              np.asarray(out, np.float32), np.asarray(outs[("flash", "4d")], np.float32), atol=2e-2, rtol=2e-2
+          )
+          self.assertLess(_rel_l2(out, ref), 1e-2)
+      # The two input forms are the same arrays to the kernel: identical outputs per variant.
+      for name in carriers:
+        np.testing.assert_array_equal(np.asarray(outs[(name, "4d")]), np.asarray(outs[(name, "flat")]))
+
+  def test_flash_custom_direct_layout_rejects_mismatched_v(self):
+    # _apply_attention's input check would catch most of these first, so call the registry entry.
+    q, k, v = _random_qkv(1, 2, 1, 256, seed=16)
+    mesh = Mesh(np.array(jax.devices()[:1]), ("data",))
+    context = {
+        "heads": 2,
+        "dim_head": _D,
+        "scale": 1.0 / math.sqrt(_D),
+        "mesh": mesh,
+        "attention_mask": None,
+        "flash_block_sizes": max_utils.CustomFlashBlockSizes(kernel="hybrid"),
+        "axis_names_q": (attention_flax.BATCH, attention_flax.HEAD, attention_flax.LENGTH, attention_flax.D_KV),
+        "axis_names_kv": (attention_flax.BATCH, attention_flax.HEAD, attention_flax.KV_LENGTH, attention_flax.D_KV),
+    }
+    for bad_v in (v[:, :, :200], _flat_heads(v)[:, :200], jnp.concatenate([_flat_heads(v)] * 2, axis=-1)):
+      with self.subTest(shape=bad_v.shape), mesh, nn.partitioning.axis_rules(()):
+        with self.assertRaisesRegex(ValueError, "does not match k"):
+          attention_flax.KERNEL_REGISTRY["flash_custom"](q, k, bad_v, context)
+
+  def test_flash_custom_io_layout_follows_the_wrapper_choice(self):
+    layout = attention_flax.krea2_flash_custom_io_layout
+    mesh = Mesh(np.array(jax.devices()[:1]), ("data",))
+    for carrier, device_kind, expected in (
+        (None, _V6E, "direct"),
+        (max_utils.CustomFlashBlockSizes(kernel="auto"), _V6E, "direct"),
+        ({"kernel": " 'Flash' "}, _V6E, "head_major"),
+        (None, _V5E, "head_major"),
+        (None, None, "head_major"),
+        ({"kernel": "hybrid"}, None, "direct"),
+    ):
+      with self.subTest(carrier=carrier, device_kind=device_kind):
+        with mock.patch.object(attention_flax, "_mesh_device_kind", return_value=device_kind):
+          self.assertEqual(layout(carrier, mesh), expected)
+    self.assertEqual(layout(None, None), "head_major")
+    with self.assertRaisesRegex(ValueError, "auto.*flash.*hybrid"):
+      layout({"kernel": "splash"}, mesh)
+
+  def test_flat_heads_spec(self):
+    spec = attention_flax._krea2_flat_heads_spec  # pylint: disable=protected-access
+    self.assertEqual(spec(P("data", "tensor", None, None)), P("data", None, "tensor"))
+    self.assertEqual(spec(P(("data", "fsdp"), None, "context", None)), P(("data", "fsdp"), "context", None))
+    self.assertEqual(spec(P("data")), P("data", None, None))
 
 
 class Krea2RejectShardedSequenceTest(unittest.TestCase):

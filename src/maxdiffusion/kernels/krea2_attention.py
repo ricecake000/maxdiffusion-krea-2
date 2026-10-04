@@ -41,8 +41,9 @@ extension (block_q up to 8192, bounded by the calibrated per-chip budgets in
 block_q 4096 at the aspect presets' sequence lengths (4016, 16256, 16352),
 which is about 3x slower in the kernel on a TPU v6e-1.
 
-Two kernel variants share the wrapper, grid, BlockSpecs and inputs/outputs
-(`Krea2BlockSizes.variant`):
+Two kernel variants share the wrapper, grid, q/k BlockSpecs and the math
+(`Krea2BlockSizes.variant`), but not the v / output layout
+(`kernel_io_layout`):
 
   * "flash": the kernel described above. Per kv chunk of block_kv_compute rows
     it updates m / l / o for the whole (bq) lane range per block_kv_compute_in
@@ -65,6 +66,21 @@ Two kernel variants share the wrapper, grid, BlockSpecs and inputs/outputs
     1.674 / 20.558 ms for "flash" (same wrapper, same block_q), with the same
     accuracy. Its QK^T scratch makes it VMEM-hungry: block_q is capped by
     `_estimated_hybrid_vmem_bytes` against `_HYBRID_VMEM_BUDGET_BYTES`.
+
+I/O layouts (`KERNEL_IO_LAYOUTS`; q and k are always (B, Hq|Hkv, L_pad, 128),
+padded to block_q / block_kv):
+
+  layout       variant   v                             output
+  head_major   flash     (B, Hkv, Lkv_pad, 128) padded  (B, Hq, 128, q_seq_len)
+  direct       hybrid    (B, kv_seq_len, Hkv*128)       (B, q_seq_len, Hq*128)
+
+"direct" is the model's own projection layout: the to_v matmul output goes in
+as it is (no pad, no head-major relayout; kv head h // g is lane block h // g
+of the last axis, the last kv block is a partial edge block of which the
+kernel reads only the in-bounds rows), and the output needs no transpose /
+reshape copy before to_gate / to_out (the kernel transposes each normalized
+(128, block_q) tile once, on the XLU, and the last q block is a partial edge
+block with a masked writeback).
 
 Selection (`select_krea2_block_sizes`): the user carrier's `kernel` field
 ("auto" / "flash" / "hybrid", `krea2_attention_kernel` in the Krea 2 configs)
@@ -97,6 +113,9 @@ INTERPRET = False
 
 KERNEL_VARIANTS = ("flash", "hybrid")
 KERNEL_CHOICES = ("auto",) + KERNEL_VARIANTS
+# v / output layouts of `make_krea2_attention` (see the module docstring).
+KERNEL_IO_LAYOUTS = ("head_major", "direct")
+_KERNEL_IO_LAYOUT = {"flash": "head_major", "hybrid": "direct"}
 # Chips on which kernel choice "auto" runs the hybrid variant (measured faster
 # on a v6e-1; it does not fit the default v5e VMEM limit at the same sizes).
 _AUTO_HYBRID_DEVICE_KINDS = ("TPU v6 lite",)
@@ -196,6 +215,18 @@ def parse_kernel_choice(value) -> str:
   return text
 
 
+def kernel_io_layout(variant: str) -> str:
+  """v / output layout of a kernel variant: "head_major" for "flash", "direct" for "hybrid".
+
+  head_major: v (B, Hkv, Lkv_pad, 128) padded to block_kv, output
+  (B, Hq, 128, q_seq_len). direct: v (B, kv_seq_len, Hkv*128) unpadded, output
+  (B, q_seq_len, Hq*128). q and k are (B, H, L_pad, 128) in both.
+  """
+  if variant not in KERNEL_VARIANTS:
+    raise ValueError(f"variant={variant!r} must be one of {list(KERNEL_VARIANTS)}.")
+  return _KERNEL_IO_LAYOUT[variant]
+
+
 def resolve_kernel_variant(choice, device_kind) -> str:
   """Kernel variant for a (parsed or raw) kernel choice on `device_kind`.
 
@@ -285,7 +316,7 @@ def _estimated_hybrid_vmem_bytes(block_q: int, block_kv: int, block_kv_compute: 
 
   Explicit scratch: the f32 (block_kv_compute, bq) QK^T tile, f32 m (8, bq)
   and o_ext (136, bq), the (136 -> 144, block_kv) v^T_ext tile; double-buffered
-  q (bq, 128) / out (128, bq) / k, v (block_kv, 128) blocks of `itemsize`
+  q / out (bq, 128) / k, v (block_kv, 128) blocks of `itemsize`
   bytes; plus `_HYBRID_TEMP_BYTES_PER_LANE` compiler temporaries per q lane
   (fitted to compiles, see `_HYBRID_VMEM_BUDGET_BYTES`).
   """
@@ -682,7 +713,14 @@ def _krea2_hybrid_kernel(
     use_base2_exp: bool,
     interpret: bool,
 ):
-  """Hybrid variant: explicit QK^T scratch, lane strips, l-sum on the MXU (see the module docstring)."""
+  """Hybrid variant: explicit QK^T scratch, lane strips, l-sum on the MXU (see the module docstring).
+
+  Direct I/O layout: v_ref is the (bkv, 128) block of kv head h // g of the
+  flat (B, kv_seq_len, Hkv*128) v, o_ref the (bq, 128) block of q head h of the
+  flat (B, q_seq_len, Hq*128) output. The last kv block is a partial edge block
+  whose rows past kv_seq_len are not DMA'd: only its first `last_block_len`
+  rows may be read (run_block reads exactly `block_len` rows).
+  """
   float32, p_dtype = jnp.float32, q_ref.dtype
   b, j = pl.program_id(0), pl.program_id(3)
   valid_len = valid_ref[b]
@@ -764,8 +802,10 @@ def _krea2_hybrid_kernel(
 
   @pl.when(is_last)
   def end():
+    # Direct layout: the (bq, 128) output block is (query, channel), so the
+    # normalized (128, bq) accumulator is transposed once per (head, q block).
     l_inv = 1.0 / o_scratch_ref[_HEAD_DIM : _HEAD_DIM + 1, :]
-    o_ref[...] = (o_scratch_ref[0:_HEAD_DIM, :] * l_inv).astype(o_ref.dtype)
+    o_ref[...] = (o_scratch_ref[0:_HEAD_DIM, :] * l_inv).T.astype(o_ref.dtype)
 
 
 def _krea2_hybrid_forward(
@@ -781,15 +821,18 @@ def _krea2_hybrid_forward(
     vmem_limit_bytes: int | None,
     interpret: bool,
 ) -> jax.Array:
+  """Hybrid variant, direct I/O layout: v (B, kv_seq_len, Hkv*128), output (B, q_seq_len, Hq*128)."""
   batch, num_q_heads, padded_q_seq_len, head_dim_qk = q.shape
-  _, num_kv_heads, padded_kv_seq_len, _ = k.shape
-  head_dim_v = v.shape[-1]
+  _, num_kv_heads, padded_kv_seq_len, head_dim_k = k.shape
   bq, bkv = block_sizes.block_q, block_sizes.block_kv
 
   assert block_sizes.variant == "hybrid", f"{block_sizes.variant=}"
-  assert head_dim_qk == _HEAD_DIM and head_dim_v == _HEAD_DIM, f"head_dim must be 128, got {head_dim_qk=} {head_dim_v=}"
-  assert k.shape == v.shape, f"k/v shape mismatch: {k.shape} vs {v.shape}"
+  assert head_dim_qk == _HEAD_DIM and head_dim_k == _HEAD_DIM, f"head_dim must be 128, got {head_dim_qk=} {head_dim_k=}"
   assert k.shape[0] == batch, f"q/k batch mismatch: {q.shape} vs {k.shape}"
+  assert v.shape == (batch, kv_seq_len, num_kv_heads * _HEAD_DIM), (
+      f"v must be the unpadded flat (B, kv_seq_len, Hkv*128) = {(batch, kv_seq_len, num_kv_heads * _HEAD_DIM)} "
+      f"(direct I/O layout), got {v.shape}"
+  )
   assert num_q_heads % num_kv_heads == 0, f"{num_q_heads=} must be a multiple of {num_kv_heads=}"
   assert padded_q_seq_len % bq == 0, f"q length {padded_q_seq_len} must be padded to a multiple of block_q={bq}"
   assert padded_kv_seq_len % bkv == 0, f"kv length {padded_kv_seq_len} must be padded to a multiple of block_kv={bkv}"
@@ -802,19 +845,23 @@ def _krea2_hybrid_forward(
   def q_index_map(b, h, i, j, *_):
     return (b, h, i, 0)
 
-  def kv_index_map(b, h, i, j, *_):
+  def k_index_map(b, h, i, j, *_):
     return (b, h // q_heads_per_kv_head, j, 0)
 
+  def v_index_map(b, h, i, j, *_):
+    # Lane block h // g of the flat heads axis is kv head h // g.
+    return (b, j, h // q_heads_per_kv_head)
+
   def out_index_map(b, h, i, j, *_):
-    return (b, h, 0, i)
+    return (b, i, h)
 
   in_specs = [
       pl.BlockSpec((None, None, bq, head_dim_qk), q_index_map),
-      pl.BlockSpec((None, None, bkv, head_dim_qk), kv_index_map),
-      pl.BlockSpec((None, None, bkv, head_dim_v), kv_index_map),
+      pl.BlockSpec((None, None, bkv, head_dim_qk), k_index_map),
+      pl.BlockSpec((None, bkv, _HEAD_DIM), v_index_map),
   ]
-  out_specs = pl.BlockSpec((None, None, head_dim_v, bq), out_index_map)
-  out_shape = jax.ShapeDtypeStruct((batch, num_q_heads, head_dim_v, q_seq_len), q.dtype)
+  out_specs = pl.BlockSpec((None, bq, _HEAD_DIM), out_index_map)
+  out_shape = jax.ShapeDtypeStruct((batch, q_seq_len, num_q_heads * _HEAD_DIM), q.dtype)
   scratch_shapes = [
       pltpu.VMEM((NUM_SUBLANES, bq), jnp.float32),  # m
       pltpu.VMEM((_EXT_ROWS, bq), jnp.float32),  # o_ext: rows 0..127 o, row 128 l
@@ -871,14 +918,19 @@ def make_krea2_attention(
   The returned `fn(q, k, v, valid_kv_len)` takes
     q: (B, Hq, Lq_pad, 128), already scaled by softmax_scale (times log2(e)
       when `use_base2_exp`), Lq_pad a multiple of block_q;
-    k, v: (B, Hkv, Lkv_pad, 128), Hq % Hkv == 0, Lkv_pad a multiple of block_kv;
+    k: (B, Hkv, Lkv_pad, 128), Hq % Hkv == 0, Lkv_pad a multiple of block_kv;
+    v: in the variant's I/O layout (`kernel_io_layout(block_sizes.variant)`):
+      "head_major" (flash): (B, Hkv, Lkv_pad, 128) like k;
+      "direct" (hybrid): (B, kv_seq_len, Hkv*128), unpadded;
     valid_kv_len: (B,) int32, kv position p of batch b is attended iff
       p < valid_kv_len[b] (a prefix mask; must be >= 1);
-  and returns (B, Hq, 128, q_seq_len) in q.dtype (head_dim-major, transposed
-  like the custom splash kernel; the caller swaps the last two axes).
+  and returns, in q.dtype,
+    "head_major": (B, Hq, 128, q_seq_len) (head_dim-major, transposed like the
+      custom splash kernel; the caller swaps the last two axes);
+    "direct": (B, q_seq_len, Hq*128) (the model's layout, no copy afterwards).
   `q_seq_len` / `kv_seq_len` are the static unpadded lengths.
-  `block_sizes.variant` picks the kernel ("flash" or "hybrid"); both take and
-  return the same arrays.
+  `block_sizes.variant` picks the kernel ("flash" or "hybrid"); both compute
+  the same attention.
   """
   forward = _krea2_hybrid_forward if block_sizes.variant == "hybrid" else _krea2_attention_forward
 
