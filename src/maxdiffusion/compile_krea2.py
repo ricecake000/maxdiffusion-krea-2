@@ -41,7 +41,14 @@ from jax.experimental.topologies import get_topology_desc
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from maxdiffusion import max_logging, max_utils, pyconfig
-from maxdiffusion.generate_krea2 import build_krea2_transformer, build_qwen3_config, resolve_generation_size
+from maxdiffusion.generate_krea2 import (
+    build_krea2_transformer,
+    build_qwen3_config,
+    krea2_mesh_device_kind,
+    resolve_generation_size,
+    resolve_krea2_attention_kernel,
+)
+from maxdiffusion.kernels.krea2_attention import resolve_kernel_variant
 from maxdiffusion.models.krea2.transformer_quant import describe_transformer_quantization, resolve_transformer_quantization
 
 GIB = 1024**3
@@ -494,6 +501,7 @@ def main(argv):
   topology = config.compile_topology
   if not topology:
     raise ValueError("Set compile_topology=<name>, e.g. compile_topology=v6e-4.")
+  attention_kernel_choice = resolve_krea2_attention_kernel(config)
   # getattr defaults keep this script usable with configs that predate these keys.
   offload = tuple(getattr(config, "krea2_offload_components", None) or ())
   unknown = sorted(set(offload) - set(OFFLOADABLE_COMPONENTS))
@@ -542,7 +550,20 @@ def main(argv):
         f"krea2_text_compaction_multiple={compaction_multiple}: the text bucket is prompt-dependent, so the estimate "
         f"uses the worst case text length max_sequence_length={seq_txt}."
     )
-  max_logging.log(f"RoPE layout: {transformer.rope_layout}; attention kernel: {transformer.attention_kernel}")
+  # flash_custom picks its kernel variant per chip; the topology devices report the target chip
+  # (same helper as the kernel wrapper and generate_krea2's AOT meta).
+  attention_device_kind = krea2_mesh_device_kind(transformer.mesh)
+  attention_kernel_variant = (
+      resolve_kernel_variant(attention_kernel_choice, attention_device_kind) if config.attention == "flash_custom" else None
+  )
+  max_logging.log(
+      f"RoPE layout: {transformer.rope_layout}; attention kernel: {transformer.attention_kernel}"
+      + (
+          f" (krea2_attention_kernel {attention_kernel_choice} -> {attention_kernel_variant} on {attention_device_kind})"
+          if attention_kernel_variant
+          else ""
+      )
+  )
   seq_txt_full = seq_txt + KREA2_PROMPT_TEMPLATE_START_IDX
   in_channels = transformer.in_channels
 
@@ -829,6 +850,8 @@ def main(argv):
       "transformer_quantization": transformer_quantization,
       "transformer_quant_targets": list(transformer_quant_targets),
       "attention": config.attention,
+      "krea2_attention_kernel": attention_kernel_choice,
+      "krea2_attention_kernel_variant": attention_kernel_variant,
       "attention_uses_kernel": uses_kernel,
       "flash_min_seq_length": transformer.flash_min_seq_length,
       "executables": records,

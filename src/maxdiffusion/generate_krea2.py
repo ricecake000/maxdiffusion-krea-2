@@ -48,6 +48,7 @@ limitations under the License.
 #   JAX_PLATFORMS=cpu python src/maxdiffusion/generate_krea2.py src/maxdiffusion/configs/base_krea2_turbo_v6e1.yml \
 #     skip_jax_distributed_system=True krea2_weight_cache_dir=/path/to/weights krea2_weight_cache_build_only=True
 
+import dataclasses
 import gc
 import inspect
 from concurrent.futures import ThreadPoolExecutor
@@ -181,6 +182,37 @@ def build_qwen3_config(te_config, config):
   )
 
 
+def resolve_krea2_attention_kernel(config) -> str:
+  """Parsed `krea2_attention_kernel` ("auto" / "flash" / "hybrid"); raises ValueError on anything else.
+
+  A missing key (configs that predate it), None, '' and a quoted empty
+  override (`krea2_attention_kernel=''`) mean "auto".
+  """
+  from maxdiffusion.kernels.krea2_attention import parse_kernel_choice
+
+  value = getattr(config, "krea2_attention_kernel", None)
+  try:
+    return parse_kernel_choice(value)
+  except ValueError as e:
+    raise ValueError(f"krea2_attention_kernel: {e}") from e
+
+
+def krea2_flash_block_sizes(config):
+  """`max_utils.get_flash_block_sizes(config)` plus, for flash_custom, the kernel choice in its `kernel` field.
+
+  flash_custom reads the choice from the carrier ("auto" picks the hybrid
+  kernel variant on a TPU v6e, flash elsewhere); a carrier is built when
+  `flash_block_sizes` is empty. Other attention kernels get the carrier as is.
+  """
+  carrier = max_utils.get_flash_block_sizes(config)
+  if config.attention != "flash_custom":
+    return carrier
+  kernel = resolve_krea2_attention_kernel(config)
+  if carrier is None:
+    return max_utils.CustomFlashBlockSizes(kernel=kernel)
+  return dataclasses.replace(carrier, kernel=kernel)
+
+
 def build_krea2_transformer(transformer_cfg, config, mesh, quant_targets=None):
   """Builds the Krea 2 transformer module from a `transformer/config.json` dict (defaults if empty).
 
@@ -213,7 +245,7 @@ def build_krea2_transformer(transformer_cfg, config, mesh, quant_targets=None):
       rope_theta=transformer_cfg.get("rope_theta", 1000.0),
       norm_eps=transformer_cfg.get("norm_eps", 1e-5),
       attention_kernel=config.attention,
-      flash_block_sizes=max_utils.get_flash_block_sizes(config),
+      flash_block_sizes=krea2_flash_block_sizes(config),
       mask_padding_tokens=config.mask_padding_tokens,
       rope_layout=getattr(config, "krea2_rope_layout", "interleaved"),
       mesh=mesh,
@@ -238,22 +270,48 @@ def transformer_quantization_aot_meta(mode, targets) -> dict:
   return {"krea2_transformer_quantization": f"{mode}:{','.join(targets)}:r{KREA2_TRANSFORMER_QUANT_REVISION}"}
 
 
-def flash_custom_block_selection_aot_meta(attention) -> dict:
-  """AOT cache meta entry for the flash_custom automatic block sizes; empty for other kernels.
+def flash_custom_block_selection_aot_meta(attention, kernel_choice="auto", device_kind=None) -> dict:
+  """AOT cache meta entries for the flash_custom kernel and block sizes; empty for other kernels.
 
   `flash_block_sizes` in the meta only records the configured sizes, not the
-  automatic choice, so the value carries `KREA2_BLOCK_SELECTION_REVISION` and a
-  changed choice misses executables cached for the previous one. Other kernels
-  keep their fingerprint. A "+budget" suffix marks `AUTO_BLOCK_Q_BUDGET_EXTENSION`
-  on, since the kernel's block choice differs with it while the revision does not,
-  so executables compiled with it on must not be reused after it is switched off.
+  automatic choice, so "krea2_block_selection" carries
+  `KREA2_BLOCK_SELECTION_REVISION` and a changed choice misses executables
+  cached for the previous one. Other kernels keep their fingerprint. A
+  "+budget" suffix marks `AUTO_BLOCK_Q_BUDGET_EXTENSION` on, since the kernel's
+  block choice differs with it while the revision does not, so executables
+  compiled with it on must not be reused after it is switched off.
+  "krea2_attention_kernel" records the parsed kernel choice (`kernel_choice`,
+  from `resolve_krea2_attention_kernel`). The choice alone does not identify
+  the executable ("auto" is hybrid on a TPU v6e and flash elsewhere, and the
+  default block sizes are per chip), so the meta also records `device_kind`
+  (the chip the kernel compiles for, as the flash_custom wrapper sees it:
+  `krea2_mesh_device_kind(mesh)` of the transformer mesh; "" when unknown) and
+  the variant `resolve_kernel_variant` picks for it.
   """
-  from maxdiffusion.kernels.krea2_attention import AUTO_BLOCK_Q_BUDGET_EXTENSION, KREA2_BLOCK_SELECTION_REVISION
+  from maxdiffusion.kernels.krea2_attention import (
+      AUTO_BLOCK_Q_BUDGET_EXTENSION,
+      KREA2_BLOCK_SELECTION_REVISION,
+      parse_kernel_choice,
+      resolve_kernel_variant,
+  )
 
   if attention != "flash_custom":
     return {}
   suffix = "+budget" if AUTO_BLOCK_Q_BUDGET_EXTENSION else ""
-  return {"krea2_block_selection": f"r{KREA2_BLOCK_SELECTION_REVISION}{suffix}"}
+  choice = parse_kernel_choice(kernel_choice)
+  return {
+      "krea2_block_selection": f"r{KREA2_BLOCK_SELECTION_REVISION}{suffix}",
+      "krea2_attention_kernel": choice,
+      "krea2_attention_device_kind": device_kind or "",
+      "krea2_attention_kernel_variant": resolve_kernel_variant(choice, device_kind),
+  }
+
+
+def krea2_mesh_device_kind(mesh):
+  """`device_kind` the flash_custom wrapper sees for `mesh` (None when unknown); same helper as the wrapper."""
+  from maxdiffusion.models.attention_flax import _mesh_device_kind  # pylint: disable=import-outside-toplevel
+
+  return _mesh_device_kind(mesh)
 
 
 def _weight_cache_dir(config) -> str:
@@ -730,6 +788,12 @@ def main(argv):
   # Height/width are multiples of 16 (VAE 8x downsampling x 2x2 latent patches),
   # so the eval_shape dummies below match what the pipeline will actually run.
   height, width, _ = resolve_generation_size(config)
+  # An invalid kernel choice fails here, before any model load.
+  attention_kernel_choice = resolve_krea2_attention_kernel(config)
+  if config.attention == "flash_custom":
+    max_logging.log(
+        f"flash_custom kernel choice: {attention_kernel_choice} ('auto' = hybrid on TPU v6e, flash elsewhere)"
+    )
   # Mirrors FlaxKrea2Pipeline: flash_custom always compacts, with the full text
   # length as the bucket when krea2_text_compaction_multiple is off.
   text_compaction_multiple = int(getattr(config, "krea2_text_compaction_multiple", 0) or 0)
@@ -1257,8 +1321,10 @@ def main(argv):
           "krea2_rope_layout": transformer.rope_layout,
           # Conditional key: with quantization off the meta (and fingerprint) matches older caches.
           **transformer_quantization_aot_meta(transformer_quantization, transformer_quant_targets),
-          # Conditional key: only flash_custom picks block sizes automatically per chip.
-          **flash_custom_block_selection_aot_meta(config.attention),
+          # Conditional keys: only flash_custom picks its kernel variant and block sizes per chip.
+          **flash_custom_block_selection_aot_meta(
+              config.attention, attention_kernel_choice, krea2_mesh_device_kind(transformer.mesh)
+          ),
           "lora_compile_spec": lora_compile_spec,
           "jax": jax.__version__,
       },

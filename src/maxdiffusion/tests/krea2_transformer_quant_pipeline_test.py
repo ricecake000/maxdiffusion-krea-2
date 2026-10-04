@@ -19,6 +19,7 @@ limitations under the License.
 # quantized host tree, LoRA on quantized projections and the model builder
 # (float32 activations throughout).
 
+import hashlib
 import re
 import types
 import unittest
@@ -32,14 +33,20 @@ import numpy as np
 from flax import linen as nn
 from flax.linen import partitioning as nn_partitioning
 from flax.traverse_util import flatten_dict
+from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
+from maxdiffusion import max_utils
 from maxdiffusion.generate_krea2 import (
     build_krea2_transformer,
     flash_custom_block_selection_aot_meta,
+    krea2_flash_block_sizes,
+    krea2_mesh_device_kind,
+    resolve_krea2_attention_kernel,
     transformer_quantization_aot_meta,
 )
 from maxdiffusion.kernels import krea2_attention
+from maxdiffusion.models import attention_flax
 from maxdiffusion.kernels.krea2_attention import KREA2_BLOCK_SELECTION_REVISION
 from maxdiffusion.loaders.krea2_lora_pipeline import Krea2LoraLoaderMixin, insert_lora_params, make_lora_compile_spec
 from maxdiffusion.models.krea2.lora_util import convert_krea2_lora_to_flax
@@ -383,25 +390,141 @@ class TransformerQuantizationAotMetaTest(unittest.TestCase):
     )
 
 
+_V6E, _V5E = "TPU v6 lite", "TPU v5 lite"
+
+
 class FlashCustomBlockSelectionAotMetaTest(unittest.TestCase):
 
   def test_other_kernels_add_no_key(self):
     # Other attention kernels keep the AOT cache fingerprint they had before the key existed.
     for attention in ("flash", "dot_product", "cudnn_flash_te", ""):
       self.assertEqual(flash_custom_block_selection_aot_meta(attention), {})
+      self.assertEqual(flash_custom_block_selection_aot_meta(attention, "hybrid"), {})
 
-  def test_flash_custom_records_revision(self):
+  def test_flash_custom_records_revision_kernel_choice_and_chip(self):
     self.assertEqual(
         flash_custom_block_selection_aot_meta("flash_custom"),
-        {"krea2_block_selection": f"r{KREA2_BLOCK_SELECTION_REVISION}"},
+        {
+            "krea2_block_selection": f"r{KREA2_BLOCK_SELECTION_REVISION}",
+            "krea2_attention_kernel": "auto",
+            "krea2_attention_device_kind": "",
+            "krea2_attention_kernel_variant": "flash",
+        },
     )
-    self.assertEqual(flash_custom_block_selection_aot_meta("flash_custom"), {"krea2_block_selection": "r3"})
+    self.assertEqual(KREA2_BLOCK_SELECTION_REVISION, 4)
+    cases = (
+        ("auto", _V6E, "auto", "hybrid"),
+        ("", _V6E, "auto", "hybrid"),
+        ("auto", _V5E, "auto", "flash"),
+        ("flash", _V6E, "flash", "flash"),
+        (" Hybrid ", _V5E, "hybrid", "hybrid"),
+        ("hybrid", None, "hybrid", "hybrid"),
+    )
+    for choice, device_kind, recorded, variant in cases:
+      with self.subTest(choice=choice, device_kind=device_kind):
+        self.assertEqual(
+            flash_custom_block_selection_aot_meta("flash_custom", choice, device_kind),
+            {
+                "krea2_block_selection": "r4",
+                "krea2_attention_kernel": recorded,
+                "krea2_attention_device_kind": device_kind or "",
+                "krea2_attention_kernel_variant": variant,
+            },
+        )
+    with self.assertRaises(ValueError):
+      flash_custom_block_selection_aot_meta("flash_custom", "splash", _V6E)
+
+  def test_fingerprint_differs_per_chip(self):
+    # Same config, mesh shape and inputs: "auto" compiles hybrid on v6e and flash on v5e, so the AOT
+    # fingerprints (aot_cache.install hashes the sorted meta items) must differ; the same chip must match.
+    def fingerprint(choice, device_kind, attention="flash_custom"):
+      meta = {"attention": attention, "mesh_shape": "{'data': 1}"}
+      meta.update(flash_custom_block_selection_aot_meta(attention, choice, device_kind))
+      return hashlib.sha256(repr(sorted(meta.items())).encode()).hexdigest()[:12]
+
+    self.assertNotEqual(fingerprint("auto", _V6E), fingerprint("auto", _V5E))
+    self.assertNotEqual(fingerprint("hybrid", _V6E), fingerprint("hybrid", _V5E))
+    self.assertNotEqual(fingerprint("auto", _V6E), fingerprint("flash", _V6E))
+    self.assertEqual(fingerprint("auto", _V6E), fingerprint("auto", _V6E))
+    self.assertEqual(fingerprint("auto", _V6E), fingerprint("", _V6E))
+    # Other kernels keep their chip-independent fingerprint.
+    self.assertEqual(fingerprint("auto", _V6E, "flash"), fingerprint("auto", _V5E, "flash"))
+
+  def test_mesh_device_kind_matches_the_wrapper(self):
+    mesh = Mesh(np.array(jax.devices()[:1]), ("data",))
+    self.assertEqual(krea2_mesh_device_kind(mesh), "cpu")
+    self.assertEqual(krea2_mesh_device_kind(mesh.abstract_mesh), "cpu")
+    self.assertIsNone(krea2_mesh_device_kind(None))
+    with mock.patch.object(attention_flax, "_mesh_device_kind", return_value=_V6E):
+      self.assertEqual(krea2_mesh_device_kind(mesh), _V6E)
 
   def test_flash_custom_records_budget_extension(self):
     # Executables compiled with the budget extension on must miss once it is switched off.
     with mock.patch.object(krea2_attention, "AUTO_BLOCK_Q_BUDGET_EXTENSION", True):
-      self.assertEqual(flash_custom_block_selection_aot_meta("flash_custom"), {"krea2_block_selection": "r3+budget"})
+      self.assertEqual(
+          flash_custom_block_selection_aot_meta("flash_custom", "flash", _V6E),
+          {
+              "krea2_block_selection": "r4+budget",
+              "krea2_attention_kernel": "flash",
+              "krea2_attention_device_kind": _V6E,
+              "krea2_attention_kernel_variant": "flash",
+          },
+      )
       self.assertEqual(flash_custom_block_selection_aot_meta("flash"), {})
+
+
+class Krea2AttentionKernelConfigTest(unittest.TestCase):
+
+  def test_resolve_config_value(self):
+    cases = {
+        None: "auto",
+        "": "auto",
+        "''": "auto",
+        "auto": "auto",
+        "flash": "flash",
+        "HYBRID": "hybrid",
+        "'hybrid'": "hybrid",
+    }
+    for value, expected in cases.items():
+      with self.subTest(value=value):
+        self.assertEqual(resolve_krea2_attention_kernel(_build_config(krea2_attention_kernel=value)), expected)
+    # Configs that predate the key mean auto.
+    self.assertEqual(resolve_krea2_attention_kernel(_build_config()), "auto")
+    for bad in ("splash", "flash_custom", "hybrid2", 1):
+      with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "krea2_attention_kernel"):
+        resolve_krea2_attention_kernel(_build_config(krea2_attention_kernel=bad))
+
+  def test_carrier_gets_the_kernel_for_flash_custom(self):
+    # Empty flash_block_sizes: a carrier is built just for the kernel choice.
+    carrier = krea2_flash_block_sizes(_build_config(attention="flash_custom", krea2_attention_kernel="hybrid"))
+    self.assertEqual(carrier, max_utils.CustomFlashBlockSizes(kernel="hybrid"))
+    self.assertEqual(hash(carrier), hash(max_utils.CustomFlashBlockSizes(kernel="hybrid")))
+    carrier = krea2_flash_block_sizes(_build_config(attention="flash_custom"))
+    self.assertEqual(carrier.kernel, "auto")
+    # Configured sizes are kept, including the hybrid-only fields.
+    sizes = {
+        "block_kv": 2048,
+        "block_kv_compute": 2048,
+        "block_kv_compute_in": 1024,
+        "block_kv_pv": 256,
+        "block_q_strip": 256,
+    }
+    carrier = krea2_flash_block_sizes(
+        _build_config(attention="flash_custom", flash_block_sizes=sizes, krea2_attention_kernel="'flash'")
+    )
+    self.assertEqual(carrier, max_utils.CustomFlashBlockSizes(kernel="flash", **sizes))
+    self.assertIsInstance(hash(carrier), int)
+    # Other kernels get get_flash_block_sizes unchanged (no kernel field), even with a bad choice.
+    self.assertIsNone(krea2_flash_block_sizes(_build_config(attention="dot_product", krea2_attention_kernel="hybrid")))
+    with self.assertRaisesRegex(ValueError, "krea2_attention_kernel"):
+      krea2_flash_block_sizes(_build_config(attention="flash_custom", krea2_attention_kernel="fast"))
+
+  def test_transformer_carries_the_kernel_choice(self):
+    transformer = build_krea2_transformer(
+        _TINY_CFG, _build_config(attention="flash_custom", krea2_attention_kernel="hybrid"), None
+    )
+    self.assertEqual(transformer.flash_block_sizes, max_utils.CustomFlashBlockSizes(kernel="hybrid"))
+    self.assertIsNone(build_krea2_transformer(_TINY_CFG, _build_config(), None).flash_block_sizes)
 
 
 if __name__ == "__main__":

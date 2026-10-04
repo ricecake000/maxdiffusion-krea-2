@@ -24,26 +24,36 @@
 #   ~7.5 GiB bf16) and its 0.72 GiB embedding table stays on the host
 #   (krea2_text_embed_on_host, exact lookup). compile_krea2.py v6e-1:
 #   1024x1024 peak 17.52 GiB, 2048x2048 peak 21.30 GiB (both VAE decode) of
-#   31.25 GiB usable, so 2048x2048 also fits with everything resident.
-#   Measured on v6e-1 (8 steps, warm): 1.29 s at 1024x1024 (bf16 1.88 s) and
-#   8.24 s at 2048x2048 (bf16 with the text encoder offloaded 11.29 s).
+#   31.25 GiB usable, so 2048x2048 also fits with everything resident (same
+#   peaks with the hybrid and the flash kernel variant, 2026-10-04).
+#   Measured on v6e-1 with the flash kernel variant (8 steps, warm): 1.29 s
+#   at 1024x1024 (bf16 1.88 s) and 8.24 s at 2048x2048 (bf16 with the text
+#   encoder offloaded 11.29 s).
 #   Non-square presets (block_q 2048): 2k@16:9 7.41 s, 1k@4:3 1.14 s (2026-09-30,
 #   reproduced by the automatic choice 2026-10-02); 2k@4:3 7.08 s with block_q 1792.
 #   For the bf16 transformer override krea2_transformer_quantization=''; then
 #   1024x1024 peaks at 28.84 GiB and 2048x2048 needs krea2_offload_components
 #   ['text_encoder'] (peak 29.18 GiB, 3.44 GiB int8 swap per generation).
 # - attention 'flash_custom': the Krea 2 Pallas kernel (GQA without K/V
-#   expansion, prefix key mask). flash_block_sizes sets the kv block sizes
-#   (block_q stays automatic, so they hold at every resolution): measured on
-#   v6e-1 against the kernel's auto sizes ({}) 1.512 -> 1.348 ms per attention
-#   call at 1024x1024 and 8.34 -> 8.05 s denoise at 2048x2048, images
-#   bit-identical. The automatic block_q is capped at 2048 (kernel revision 3)
-#   and charges ~200 query rows per q block (so 2k@4:3 gets 1792, not 512;
-#   measured 2026-10-02: 7.08 s denoise, 7.50 s with 3968 on 2026-09-30).
-#   The VMEM-budget extension (4224 / 3328 at the squares, 1.25 s / 7.96 s) is
-#   off: with these kv sizes it picks block_q 4096 at the aspect presets'
-#   sequence lengths, 3x slower in the kernel (2k@16:9 17.98 s vs 7.41 s with
-#   2048, 1k@4:3 1.81 s vs 1.14 s; measured 2026-09-30).
+#   expansion, prefix key mask). krea2_attention_kernel 'auto' runs its
+#   'hybrid' variant on v6e (explicit QK^T scratch, 256-lane softmax strips,
+#   l-sum on the MXU; block selection revision 4): measured on v6e-1 per
+#   attention call at the same block_q 1.674 -> 1.444 ms at 1024x1024 (seq
+#   4224) and 20.558 -> 16.869 ms at 2048x2048 (seq 16512) against 'flash',
+#   same accuracy; image and end-to-end numbers to be measured.
+#   flash_block_sizes is {}: the kv block sizes come from the kernel's per-chip
+#   defaults (hybrid 2048/2048/1024, pv 256, strip 256; a forced
+#   krea2_attention_kernel=flash keeps the v6e-tuned 2048/1024/256, measured
+#   against the generic 1024/512/256 1.512 -> 1.348 ms per call at 1024x1024
+#   and 8.34 -> 8.05 s denoise at 2048x2048, images bit-identical). block_q
+#   stays automatic: capped at 2048 (revision 3) and charging ~200 query rows
+#   per q block (so 2k@4:3 gets 1792, not 512; measured with flash 2026-10-02:
+#   7.08 s denoise, 7.50 s with 3968 on 2026-09-30); the hybrid VMEM cap does
+#   not bind on v6e (block_q 1408 / 1664 at the squares, like flash).
+#   The flash VMEM-budget extension (4224 / 3328 at the squares, 1.25 s /
+#   7.96 s) is off: with the flash kv sizes it picks block_q 4096 at the aspect
+#   presets' sequence lengths, 3x slower in the kernel (2k@16:9 17.98 s vs
+#   7.41 s with 2048, 1k@4:3 1.81 s vs 1.14 s; measured 2026-09-30).
 # - krea2_rope_layout 'rotate_half': q/k head dims are permuted at load time so
 #   RoPE works on lane-dense 64-wide halves (exact).
 # - krea2_text_compaction_multiple 128: valid prompt tokens are gathered to the
@@ -148,7 +158,8 @@ mask_padding_tokens: True
 #    in cross attention q.
 attention_sharding_uniform: True
 
-flash_block_sizes: {block_kv: 2048, block_kv_compute: 1024, block_kv_compute_in: 256}
+# Empty: the kv block sizes are the kernel's per-chip, per-variant defaults (see header).
+flash_block_sizes: {}
 # GroupNorm groups
 norm_num_groups: 32
 
@@ -400,6 +411,11 @@ krea2_staged_donate_hidden_states: True
 # freed. Lowers peak HBM at the cost of a host->device transfer per generation.
 # Allowed entries: "text_encoder", "transformer".
 krea2_offload_components: []
+# attention 'flash_custom' only: kernel variant of the Krea 2 Pallas kernel.
+# 'auto' (default): 'hybrid' on a TPU v6e, 'flash' on every other chip;
+# 'flash' / 'hybrid' force a variant (hybrid needs more VMEM: on v5e its
+# automatic block_q is capped lower). '' means 'auto'; other values fail at startup.
+krea2_attention_kernel: 'auto'
 # RoPE layout of the DiT blocks: "interleaved" (checkpoint order, rotates
 # (2i, 2i+1) pairs) or "rotate_half" (q/k head dims are permuted at load time so
 # RoPE rotates the two 64-lane halves; identical outputs, cheaper on TPU).

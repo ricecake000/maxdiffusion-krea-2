@@ -1743,25 +1743,48 @@ def _read_custom_block_sizes(flash_block_sizes):
   """Reads the custom-kernel block-size carrier without filling defaults.
 
   Same dict / attribute handling as `_extract_custom_block_sizes`, but missing or
-  None fields stay None so the caller can apply its own defaults.
+  None fields stay None so the caller can apply its own defaults. `kernel` (the
+  flash_custom kernel choice) is passed through as it is: an empty string means
+  "auto" to `krea2_attention.parse_kernel_choice`, like None.
   """
-  names = ("block_q", "block_kv", "block_kv_compute", "block_kv_compute_in", "vmem_limit_bytes")
+  names = (
+      "block_q",
+      "block_kv",
+      "block_kv_compute",
+      "block_kv_compute_in",
+      "block_kv_pv",
+      "block_q_strip",
+      "vmem_limit_bytes",
+  )
   if flash_block_sizes is None:
-    return dict.fromkeys(names)
+    sizes = dict.fromkeys(names)
+    sizes["kernel"] = None
+    return sizes
   if isinstance(flash_block_sizes, dict):
-    return {name: flash_block_sizes.get(name, None) or None for name in names}
-  return {name: getattr(flash_block_sizes, name, None) or None for name in names}
+    get = flash_block_sizes.get
+  else:
+    get = lambda name, default: getattr(flash_block_sizes, name, default)
+  sizes = {name: get(name, None) or None for name in names}
+  sizes["kernel"] = get("kernel", None)
+  return sizes
 
 
 def _mesh_device_kind(mesh):
   """`device_kind` of the mesh's first device, or None when it cannot be determined.
 
-  None covers no mesh, an AbstractMesh (its `devices` raises ValueError), an
-  empty device array and a device without `device_kind`.
+  A concrete Mesh reports its first device. An AbstractMesh (its `devices`
+  raises ValueError) reports its `abstract_device` when it carries one (an
+  abstract mesh derived from a concrete or topology mesh does). None covers no
+  mesh, an AbstractMesh without an abstract device, an empty device array and a
+  device without `device_kind`.
   """
   try:
     return mesh.devices.flat[0].device_kind
   except (AttributeError, IndexError, TypeError, ValueError):
+    pass
+  try:
+    return mesh.abstract_device.device_kind
+  except AttributeError:
     return None
 
 
@@ -1835,10 +1858,12 @@ def krea2_custom_flash_kernel(q, k, v, context):
     valid_kv_len = jnp.broadcast_to(valid_kv_len, (batch,))
 
   user_sizes = _read_custom_block_sizes(context["flash_block_sizes"])
-  # block_q is the kernel's automatic choice (at most 2048, padded rows plus a
-  # per-block overhead). The device kind and operand dtype only matter for the
-  # VMEM-budget extension, which is off (topology-desc devices of a
-  # cross-compile report the target chip here too).
+  # The carrier's `kernel` ("auto" / "flash" / "hybrid") picks the kernel
+  # variant: "auto" is "hybrid" on a TPU v6e and "flash" elsewhere. The device
+  # kind also picks the per-variant default kv block sizes and the hybrid VMEM
+  # cap of the automatic block_q (at most 2048, padded rows plus a per-block
+  # overhead); topology-desc devices of a cross-compile report the target chip
+  # here too. The operand dtype only matters for the VMEM budgets.
   block_sizes = krea2_kernel.select_krea2_block_sizes(
       q_seq_len,
       user=user_sizes,

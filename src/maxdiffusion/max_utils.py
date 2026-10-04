@@ -631,6 +631,12 @@ class CustomFlashBlockSizes:
   block_kv_compute_in: int | None = None
   heads_per_tile: int | None = None
   vmem_limit_bytes: int | None = None
+  # flash_custom (Krea 2) only: kernel choice ("auto" / "flash" / "hybrid",
+  # None = auto; set from `krea2_attention_kernel`) and the hybrid variant's
+  # block_kv_pv / block_q_strip.
+  kernel: str | None = None
+  block_kv_pv: int | None = None
+  block_q_strip: int | None = None
 
 
 def get_flash_block_sizes(config):
@@ -650,6 +656,8 @@ def get_flash_block_sizes(config):
           block_kv_compute_in=user_block_sizes.get("block_kv_compute_in"),
           heads_per_tile=user_block_sizes.get("heads_per_tile"),
           vmem_limit_bytes=user_block_sizes.get("vmem_limit_bytes"),
+          block_kv_pv=user_block_sizes.get("block_kv_pv"),
+          block_q_strip=user_block_sizes.get("block_q_strip"),
       )
     if attention_is_tokamax:
       max_logging.log(

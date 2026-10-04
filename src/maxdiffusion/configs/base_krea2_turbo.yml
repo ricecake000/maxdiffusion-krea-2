@@ -326,6 +326,11 @@ krea2_staged_donate_hidden_states: True
 # freed. Lowers peak HBM at the cost of a host->device transfer per generation.
 # Allowed entries: "text_encoder", "transformer".
 krea2_offload_components: []
+# attention 'flash_custom' only: kernel variant of the Krea 2 Pallas kernel.
+# 'auto' (default): 'hybrid' on a TPU v6e, 'flash' on every other chip;
+# 'flash' / 'hybrid' force a variant (hybrid needs more VMEM: on v5e its
+# automatic block_q is capped lower). '' means 'auto'; other values fail at startup.
+krea2_attention_kernel: 'auto'
 # RoPE layout of the DiT blocks: "interleaved" (checkpoint order, rotates
 # (2i, 2i+1) pairs) or "rotate_half" (q/k head dims are permuted at load time so
 # RoPE rotates the two 64-lane halves; identical outputs, cheaper on TPU).
