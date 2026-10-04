@@ -94,7 +94,13 @@
 #   the 128-token text bucket: all 28 to_q fusions go 6 -> 8 heads at 1k and 2k,
 #   ~200 other fusions (to_k/v/gate/out, gate/up/down_proj) retile, MSA high-water
 #   92.5 -> 84.5 MiB at 2k, HBM peaks unchanged. With 512 text tokens (seq 16896)
-#   the 2k to_q tile stays 6 heads. Unmeasured on a TPU; 0 restores the default.
+#   the 2k to_q tile stays 6 heads. 0 restores the default.
+#   v6e-1, same session and node (2026-10-05), timed denoise 32 / 36 / 64 MiB:
+#   1024x1024 0.956 / 0.937 / 0.960 s, 2048x2048 6.429 / 6.282 / 6.154 s (36 MiB
+#   -2.0 % / -2.3 %; 64 MiB is faster only at 2k). xprof at 2k: to_q 1.173 ->
+#   0.789 ms per call, up_proj 2.676 -> 2.483 ms, device time 6723 -> 6530 ms.
+#   Images are not bit-identical across limits (retiled bf16 fusions change the
+#   f32 accumulation order): same scene, small detail changes.
 # - krea2_text_compaction_multiple 128: valid prompt tokens are gathered to the
 #   front and the text is truncated to a 128-token bucket (exact); typical
 #   prompts use 128 instead of 512 text tokens.
