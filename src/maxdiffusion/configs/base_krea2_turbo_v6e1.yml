@@ -142,6 +142,22 @@
 #   distributed coordinator):
 #     JAX_PLATFORMS=cpu generate_krea2.py <this file> skip_jax_distributed_system=True \
 #       krea2_weight_cache_dir=<dir> krea2_weight_cache_build_only=True
+# - Cold start (slim node, both off by default): krea2_weight_cache_wait_s=<n>
+#   lets the process start while the weight cache is still being pulled (each
+#   component waits up to n s for its own <component>-<fp>/meta.json), and
+#   aot_cache_gcs=gs://<bucket>/<prefix> makes each lazily loaded executable
+#   missing in aot_cache_dir download itself from the bucket (crc32c-checked; a
+#   missing object compiles), so no separate executable pull is needed:
+#     generate_krea2.py <this file> krea2_weight_cache_dir=<dir> aot_cache_dir=<dir> \
+#       krea2_weight_cache_wait_s=900 aot_cache_gcs=gs://<bucket>/aot prompt=...
+#   Every run logs "[TIMING] Startup timeline (s since process start): imports=..
+#   config=.. late_imports=.. tpu_init=.. mesh=.. shapes=.. tokenizer=..
+#   load_done=.. pipeline=.. warmup_done=.. timed_done=.. saved=.." (absolute
+#   marks; t0 = KREA2_PROCESS_T0 from the shell wrapper when set, else the
+#   module import), "[TIMING] Startup biggest gaps: .." and at exit
+#   "[TIMING] exit begins at <s>". The tokenizer loads beside the weights, the
+#   VAE is read without torch, and neither torch nor transformers is imported
+#   before the tokenizer thread starts.
 
 # This sentinel is a reminder to choose a real run name.
 run_name: 'krea2_turbo_v6e1'
@@ -320,9 +336,17 @@ krea2_weight_cache_dir: ''
 # (e.g. a CPU VM with JAX_PLATFORMS=cpu plus skip_jax_distributed_system=True, as a machine without a TPU
 # has no JAX distributed coordinator); excludes krea2_precompile.
 krea2_weight_cache_build_only: False
+# Cold start: seconds each weight cache component waits for its directory (its meta.json) to appear before
+# the normal load, for a cache still being pulled while the process starts (polls every 1 s; the timeout
+# falls through to the normal miss handling). 0 means off.
+krea2_weight_cache_wait_s: 0
 # Load a cached executable when its shape is first called instead of all of them at startup. On
 # here because a precompiled cache holds ~30 shapes and one run calls only a few.
 aot_cache_lazy_load: True
+# gs://<bucket>[/<prefix>] holding the aot_cache_dir executables: a lazily loaded executable missing in
+# aot_cache_dir is first downloaded from <prefix>/<file name> (crc32c-checked); a missing object compiles as
+# before. Needs aot_cache_dir and aot_cache_lazy_load. Not part of the executables' key. Empty means off.
+aot_cache_gcs: ''
 # Overlap the independent Transformer/Qwen host reads with VAE loading.
 parallel_component_loading: True
 hf_data_dir: ''

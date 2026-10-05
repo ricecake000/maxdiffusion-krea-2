@@ -852,6 +852,8 @@ class FlaxKrea2Pipeline:
         images.block_until_ready()
 
     trace["vae_decode"] = time.perf_counter() - t0
+    # Wall clock (epoch seconds) of the decode's end, for generate_krea2's startup timeline.
+    trace["vae_decode_done_at"] = time.time()
     max_logging.log(f" -> [TIMING] VAE Decoding: {trace['vae_decode']:.4f} seconds")
 
     # AOT warmup compiles against faithful shapes but substitutes zero-valued

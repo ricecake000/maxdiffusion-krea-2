@@ -15,7 +15,6 @@
 """PyTorch - Flax general utilities."""
 import re
 
-import torch
 import jax
 import jax.numpy as jnp
 from flax.linen import Partitioned
@@ -56,7 +55,11 @@ def validate_flax_state_dict(expected_pytree: dict, new_pytree: dict):
       max_logging.log(f"key: {key} not found...")
 
 
-def torch2jax(torch_tensor: torch.Tensor) -> Array:
+def torch2jax(torch_tensor: "torch.Tensor") -> Array:
+  # torch is imported on first use, not with this module: its import costs seconds, and the loaders that read
+  # safetensors with framework="np" (e.g. the Krea 2 VAE) never need it.
+  import torch  # pylint: disable=import-outside-toplevel
+
   is_bfloat16 = torch_tensor.dtype == torch.bfloat16
   if is_bfloat16:
     # upcast the tensor to fp32

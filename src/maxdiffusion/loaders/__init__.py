@@ -12,6 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .lora_pipeline import StableDiffusionLoraLoaderMixin
-from .flux_lora_pipeline import FluxLoraLoaderMixin
-from .wan_lora_nnx_loader import Wan2_1NNXLoraLoader, Wan2_2NNXLoraLoader
+import importlib
+
+# Loaded on first access (PEP 562), not with the package: these loaders import torch (through
+# models.modeling_utils), seconds on every start of a process that only needs a torch-free loader such as
+# loaders.krea2_lora_pipeline. `from maxdiffusion.loaders import X` works as before.
+_LAZY_EXPORTS = {
+    "StableDiffusionLoraLoaderMixin": ".lora_pipeline",
+    "FluxLoraLoaderMixin": ".flux_lora_pipeline",
+    "Wan2_1NNXLoraLoader": ".wan_lora_nnx_loader",
+    "Wan2_2NNXLoraLoader": ".wan_lora_nnx_loader",
+}
+
+__all__ = list(_LAZY_EXPORTS)
+
+
+def __getattr__(name):
+  module = _LAZY_EXPORTS.get(name)
+  if module is None:
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+  value = getattr(importlib.import_module(module, __name__), name)
+  globals()[name] = value
+  return value
+
+
+def __dir__():
+  return sorted(set(globals()) | set(_LAZY_EXPORTS))

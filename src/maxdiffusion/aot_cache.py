@@ -51,6 +51,13 @@ minus the torch interop):
     ``os.path.exists`` per shape, one attempt per install), so a cache
     holding many shapes does not load all of them for a run that calls
     only a few.
+  * ``install(..., lazy_load=True, gcs_prefix="gs://<bucket>/<prefix>")``
+    fetches a signature's missing file from ``<prefix>/<file name>`` before
+    that lazy load (crc32c-checked, into ``<file>.dl-tmp-<pid>-<thread id>``
+    and renamed into place; one fetch per final path at a time across the
+    process, so wrappers of the same name in independent pipelines share
+    one download); a missing object or any failure is a miss (compile as
+    without the file). The URL is not part of the fingerprint.
 
 Usage::
 
@@ -74,6 +81,7 @@ import os
 import pickle
 import re
 import threading
+import time
 from typing import Any, Callable
 
 import jax
@@ -83,6 +91,144 @@ from jax.experimental import serialize_executable
 from maxdiffusion import max_logging
 
 _FORMAT_VERSION = 1
+
+# GCS fetch of lazily loaded executables (install(gcs_prefix=...)). Objects at or above _GCS_BIG_BYTES are
+# downloaded in _GCS_CHUNK_BYTES chunks by _GCS_WORKERS threads. A download lands in
+# "<path>.dl-tmp-<pid>-<thread id>" (the ".dl-tmp-" leftover grammar of the tooling's gcs_cache.py) and is renamed
+# into place. Fetches of one final path are serialized by its _FETCH_LOCKS entry: several _AotEntry wrappers can
+# carry the same name (independent pipeline instances build independent wrappers), and their fetches must not race
+# on one temp file or rename a partial file into place. Different paths still download in parallel.
+_GCS_BIG_BYTES = 64 * 1024**2
+_GCS_CHUNK_BYTES = 32 * 1024**2
+_GCS_WORKERS = 8
+_DL_TMP = ".dl-tmp-"
+_GCS_BUCKET_RE = re.compile(r"[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]")
+_GCS_CLIENT = None
+_GCS_CLIENT_LOCK = threading.Lock()
+_FETCH_LOCKS: dict[str, threading.Lock] = {}
+_FETCH_LOCKS_LOCK = threading.Lock()
+
+
+def normalize_gcs_prefix(url: Any) -> str:
+  """Validated `gs://<bucket>[/<prefix>]` without a trailing slash; '' for an empty value (off).
+
+  Surrounding whitespace and quotes are dropped, so a command-line override
+  `aot_cache_gcs=''` means off. Raises ValueError for anything else than
+  `gs://` + a bucket name (lowercase letters, digits, '.', '_', '-') + an
+  optional object prefix without empty, '.' or '..' segments or whitespace.
+  """
+  text = "" if url is None else str(url).strip().strip("'\"").strip()
+  if not text:
+    return ""
+  if not text.startswith("gs://"):
+    raise ValueError(f"{url!r} is not a gs://<bucket>[/<prefix>] URL")
+  bucket, _, prefix = text[len("gs://") :].rstrip("/").partition("/")
+  if not _GCS_BUCKET_RE.fullmatch(bucket):
+    raise ValueError(f"{url!r}: {bucket!r} is not a valid GCS bucket name")
+  if prefix and (re.search(r"\s", prefix) or any(part in ("", ".", "..") for part in prefix.split("/"))):
+    raise ValueError(f"{url!r}: {prefix!r} is not a valid object prefix")
+  return f"gs://{bucket}/{prefix}" if prefix else f"gs://{bucket}"
+
+
+def _split_gcs_prefix(gcs_prefix: str) -> tuple[str, str]:
+  """(bucket, object prefix) of a normalized `gs://` URL."""
+  bucket, _, prefix = gcs_prefix[len("gs://") :].partition("/")
+  return bucket, prefix
+
+
+def _make_gcs_client():
+  """The one place the storage client is created (tests replace this function)."""
+  from google.cloud import storage  # pylint: disable=import-outside-toplevel
+
+  return storage.Client()
+
+
+def _gcs_client():
+  """The process's storage client, created on first use."""
+  global _GCS_CLIENT
+  with _GCS_CLIENT_LOCK:
+    if _GCS_CLIENT is None:
+      _GCS_CLIENT = _make_gcs_client()
+    return _GCS_CLIENT
+
+
+def _gcs_transfer_manager():
+  """google.cloud.storage.transfer_manager (tests replace this function)."""
+  from google.cloud.storage import transfer_manager  # pylint: disable=import-outside-toplevel
+
+  return transfer_manager
+
+
+def _fetch_lock(path: str) -> threading.Lock:
+  """The process-wide lock serializing the fetches of one final path."""
+  key = os.path.abspath(path)
+  with _FETCH_LOCKS_LOCK:
+    lock = _FETCH_LOCKS.get(key)
+    if lock is None:
+      lock = _FETCH_LOCKS[key] = threading.Lock()
+    return lock
+
+
+def _fetch_from_gcs(fn_name: str, path: str, gcs_prefix: str) -> bool:
+  """Downloads `<prefix>/<basename of path>` to `path`. Returns whether `path` now exists. Never raises.
+
+  The whole fetch holds the path's process-wide lock (_fetch_lock), and the
+  file is checked again once the lock is held: a concurrent fetch of the
+  same path (another wrapper of the same name) that completed meanwhile
+  makes this call return True without a second download.
+  """
+  with _fetch_lock(path):
+    if os.path.exists(path):
+      return True
+    return _download_from_gcs(fn_name, path, gcs_prefix)
+
+
+def _download_from_gcs(fn_name: str, path: str, gcs_prefix: str) -> bool:
+  """The download of _fetch_from_gcs (called with the path's fetch lock held). Returns whether it did.
+
+  The object is written to `<path>.dl-tmp-<pid>-<thread id>`, checked
+  against its crc32c by the client library and renamed into place, so
+  `path` only ever holds a complete file. A missing object is a normal miss
+  (one log line), any other failure is logged and also a miss; the
+  temporary file is removed on every path.
+  """
+  name = os.path.basename(path)
+  bucket_name, prefix = _split_gcs_prefix(gcs_prefix)
+  object_name = f"{prefix}/{name}" if prefix else name
+  url = f"gs://{bucket_name}/{object_name}"
+  tmp_path = f"{path}{_DL_TMP}{os.getpid()}-{threading.get_ident()}"
+  try:
+    start = time.perf_counter()
+    blob = _gcs_client().bucket(bucket_name).get_blob(object_name)
+    if blob is None:
+      max_logging.log(f"[aot] {fn_name}: {name} not in {gcs_prefix}; will compile")
+      return False
+    size = int(blob.size or 0)
+    if size >= _GCS_BIG_BYTES:
+      _gcs_transfer_manager().download_chunks_concurrently(
+          blob,
+          tmp_path,
+          chunk_size=_GCS_CHUNK_BYTES,
+          max_workers=_GCS_WORKERS,
+          worker_type="thread",
+          crc32c_checksum=True,
+      )
+    else:
+      blob.download_to_filename(tmp_path, checksum="crc32c")
+    os.replace(tmp_path, path)
+    max_logging.log(
+        f"[aot] {fn_name}: fetched {name} ({size / 1e6:.1f}MB) from {url} in {time.perf_counter() - start:.2f} s"
+    )
+    return True
+  except Exception as e:  # noqa: BLE001 - a failed fetch is a miss, the shape compiles
+    max_logging.log(f"[aot] {fn_name}: fetching {name} from {url} failed ({e!r}); will compile")
+    return False
+  finally:
+    try:
+      if os.path.lexists(tmp_path):
+        os.remove(tmp_path)
+    except OSError:
+      pass
 
 
 def _resolve_trace_state_clean():
@@ -419,7 +565,12 @@ class _AotEntry:
     """Loads one signature's executable on its first call after a lazy install.
 
     Tried at most once per install: a missing file then costs a single
-    ``os.path.exists`` and a corrupt file is not re-read on every call. The
+    ``os.path.exists`` (plus, with a GCS prefix installed, one fetch attempt
+    of ``<prefix>/<file name>``) and a corrupt file is not re-read on every call.
+    ``_lazy_lock`` is per wrapper, but wrappers of the same name (independent
+    pipeline instances) share a path: _fetch_from_gcs serializes their
+    fetches with a process-wide per-path lock and skips the download when
+    the file appeared meanwhile. The
     flip side is that a file another process saves later in this install is
     not picked up by this process until the next install().
 
@@ -433,12 +584,15 @@ class _AotEntry:
     # executable of the old dir/fingerprint/mesh into the new install.
     generation = _STATE.generation
     mesh = _STATE.mesh
+    gcs_prefix = _STATE.gcs_prefix
     path = self._path_for(signature)
     with self._lazy_lock:
       with self._lock:
         if generation != _STATE.generation or signature in self._compiled or signature in self._lazy_tried:
           return
         self._lazy_tried.add(signature)
+      if gcs_prefix and not os.path.exists(path):
+        _fetch_from_gcs(self.name, path, gcs_prefix)
       if os.path.exists(path):
         self._load_path(path, generation, mesh, expected_signature=signature)
 
@@ -561,6 +715,8 @@ class _State:
     self.mesh = None
     self.warmup_only = False
     self.lazy_load = False
+    # gs://<bucket>[/<prefix>] lazy loads fetch missing files from; '' = off.
+    self.gcs_prefix = ""
     # Bumped by every install(); loads started under an older one drop their results.
     self.generation = 0
 
@@ -603,13 +759,19 @@ def cached_jit(
   return entry
 
 
-def install(cache_dir: str, meta: dict[str, Any], mesh: Any, lazy_load: bool = False) -> None:
+def install(cache_dir: str, meta: dict[str, Any], mesh: Any, lazy_load: bool = False, gcs_prefix: str = "") -> None:
   """Enables the AOT cache and starts background deserialization.
 
   With ``lazy_load`` nothing is deserialized here; each signature's file
   is loaded on the first call of that signature instead. Use it when the
   cache holds many more shapes than one run calls. Every install sets the
   mode, so a later eager install turns lazy loading off again.
+
+  With ``gcs_prefix`` (``gs://<bucket>[/<prefix>]``, lazy loading only) a
+  signature whose file is missing locally is first fetched from
+  ``<prefix>/<file name>`` into ``cache_dir``; an eager install ignores it
+  (one log line). The prefix is not part of the fingerprint: the same
+  executables live in both places.
 
   Loads still running from an earlier install drop their results, but
   ``save_pending()`` is not guarded: do not install while it runs.
@@ -622,14 +784,21 @@ def install(cache_dir: str, meta: dict[str, Any], mesh: Any, lazy_load: bool = F
     mesh: The pipeline mesh; pins device order for deserialization and
       provides the context for re-lowering at save time.
     lazy_load: Load executables on first use instead of all at install.
+    gcs_prefix: Where lazy loads fetch missing files from ('' = nowhere).
+      Validated with ``normalize_gcs_prefix`` (ValueError when invalid).
   """
   if not cache_dir:
     return
+  gcs_prefix = normalize_gcs_prefix(gcs_prefix)
+  if gcs_prefix and not lazy_load:
+    max_logging.log(f"[aot] {gcs_prefix} is ignored: only lazy loading fetches executables from GCS")
+    gcs_prefix = ""
   os.makedirs(cache_dir, exist_ok=True)
   _STATE.cache_dir = cache_dir
   _STATE.fingerprint = hashlib.sha256(repr(sorted(meta.items())).encode()).hexdigest()[:12]
   _STATE.mesh = mesh
   _STATE.lazy_load = bool(lazy_load)
+  _STATE.gcs_prefix = gcs_prefix
   _STATE.enabled = True
   # Bumped after the fields above and before the entries are cleared: a load
   # that sees the new generation also sees the new dir/mesh, and a load that

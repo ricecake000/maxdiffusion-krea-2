@@ -47,7 +47,24 @@ limitations under the License.
 #
 #   JAX_PLATFORMS=cpu python src/maxdiffusion/generate_krea2.py src/maxdiffusion/configs/base_krea2_turbo_v6e1.yml \
 #     skip_jax_distributed_system=True krea2_weight_cache_dir=/path/to/weights krea2_weight_cache_build_only=True
+#
+# Cold start on a node whose caches are still arriving: krea2_weight_cache_wait_s=<n> waits up to n s per component
+# for its weight cache directory, aot_cache_gcs=gs://<bucket>/<prefix> fetches each lazily loaded executable missing
+# in aot_cache_dir from the bucket. "[TIMING] Startup timeline" lists the startup marks (seconds since
+# KREA2_PROCESS_T0 when the shell wrapper sets it, else since this module started importing):
+#
+#   KREA2_PROCESS_T0=$(date +%s.%N) python src/maxdiffusion/generate_krea2.py \
+#     src/maxdiffusion/configs/base_krea2_turbo_v6e1.yml krea2_weight_cache_dir=/path/to/weights \
+#     aot_cache_dir=/path/to/aot krea2_weight_cache_wait_s=900 aot_cache_gcs=gs://bucket/aot prompt="a fox in the snow"
 
+# pylint: disable=wrong-import-position
+import time
+
+# Wall clock when this module started importing, before jax/flax/maxdiffusion: the origin of the startup
+# timeline unless the shell wrapper passes an earlier one in KREA2_PROCESS_T0 (resolve_process_t0).
+_PROCESS_T0 = time.time()
+
+import atexit
 import dataclasses
 import gc
 import inspect
@@ -55,7 +72,7 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import math
 import os
-import time
+import threading
 from contextlib import ExitStack
 from typing import List, Tuple
 
@@ -78,6 +95,137 @@ from maxdiffusion.models.krea2.resolution_presets import (
     parse_krea2_precompile,
     resolve_krea2_resolution,
 )
+
+# Marks of the startup timeline in the order main() reaches them (absolute seconds since the process start).
+STARTUP_TIMELINE_ORDER = (
+    "imports",
+    "config",
+    "late_imports",
+    "tpu_init",
+    "mesh",
+    "shapes",
+    "tokenizer",
+    "load_done",
+    "pipeline",
+    "precompile_done",
+    "warmup_done",
+    "timed_done",
+    "saved",
+)
+
+
+def resolve_process_t0(env_value, import_t0: float) -> Tuple[float, str]:
+  """`(t0, origin)` of the startup timeline: `KREA2_PROCESS_T0` when valid, else the module import time.
+
+  `env_value` (epoch seconds, set by the shell wrapper right before exec) is
+  used when it parses as a finite float that is not later than `import_t0`
+  (the process started before it imported this module); otherwise
+  `import_t0`. `origin` is "KREA2_PROCESS_T0", "module import" or
+  "module import (KREA2_PROCESS_T0 ignored: <value>)".
+  """
+  if env_value is None or not str(env_value).strip():
+    return import_t0, "module import"
+  try:
+    value = float(env_value)
+  except ValueError:
+    value = None
+  if value is None or not math.isfinite(value) or value > import_t0:
+    return import_t0, f"module import (KREA2_PROCESS_T0 ignored: {env_value!r})"
+  return value, "KREA2_PROCESS_T0"
+
+
+class StartupTimeline:
+  """Wall-clock marks in seconds since the process start, logged as two [TIMING] lines.
+
+  `mark(name, parallel=True)` records a step that ran beside the main thread
+  (e.g. the tokenizer load in its thread): it is listed, but not part of the
+  serial chain the biggest gaps are computed from. Thread-safe.
+  """
+
+  def __init__(self, t0: float):
+    self.t0 = t0
+    self._marks = {}
+    self._parallel = set()
+    self._lock = threading.Lock()
+
+  def mark(self, name: str, at: float = None, parallel: bool = False) -> None:
+    """Records `name` at wall time `at` (default now); a repeated name keeps the last time."""
+    seconds = (time.time() if at is None else at) - self.t0
+    with self._lock:
+      self._marks[name] = seconds
+      if parallel:
+        self._parallel.add(name)
+      else:
+        self._parallel.discard(name)
+
+  def marks(self) -> dict:
+    with self._lock:
+      return dict(self._marks)
+
+  def lines(self) -> List[str]:
+    """The timeline line (absolute marks) and the line naming the two biggest serial gaps."""
+    with self._lock:
+      marks, parallel = dict(self._marks), set(self._parallel)
+    names = [name for name in STARTUP_TIMELINE_ORDER if name in marks]
+    names += [name for name in marks if name not in STARTUP_TIMELINE_ORDER]
+    timeline = "[TIMING] Startup timeline (s since process start): " + " ".join(
+        f"{name}={marks[name]:.2f}" for name in names
+    )
+    gaps, previous = [], 0.0
+    for seconds, name in sorted((marks[name], name) for name in names if name not in parallel):
+      gaps.append((seconds - previous, name))
+      previous = seconds
+    biggest = sorted(gaps, key=lambda gap: -gap[0])[:2]
+    return [timeline, "[TIMING] Startup biggest gaps: " + ", ".join(f"{name} {gap:.2f}" for gap, name in biggest)]
+
+  def log(self) -> None:
+    for line in self.lines():
+      max_logging.log(line)
+
+
+_EXIT_HOOK_T0 = []
+
+
+def _log_exit_begins() -> None:
+  if _EXIT_HOOK_T0:
+    max_logging.log(f"[TIMING] exit begins at {time.time() - _EXIT_HOOK_T0[-1]:.2f}")
+
+
+def register_exit_timing(t0: float) -> None:
+  """Logs `[TIMING] exit begins at <s>` (seconds since `t0`) when the interpreter exits; registered once."""
+  if not _EXIT_HOOK_T0:
+    atexit.register(_log_exit_begins)
+  _EXIT_HOOK_T0.append(t0)
+
+
+def resolve_aot_cache_gcs(config) -> str:
+  """Normalized `aot_cache_gcs` ('' = off); ValueError when invalid or set without what it needs.
+
+  The URL is fetched from by lazy loads only, into aot_cache_dir: it needs
+  both `aot_cache_dir` and `aot_cache_lazy_load`, so a configured URL never
+  silently does nothing.
+  """
+  try:
+    url = aot_cache.normalize_gcs_prefix(getattr(config, "aot_cache_gcs", ""))
+  except ValueError as e:
+    raise ValueError(f"aot_cache_gcs: {e}") from e
+  if not url:
+    return ""
+  if not getattr(config, "aot_cache_dir", ""):
+    raise ValueError(f"aot_cache_gcs={url} needs aot_cache_dir: fetched executables are stored there.")
+  if not getattr(config, "aot_cache_lazy_load", False):
+    raise ValueError(f"aot_cache_gcs={url} needs aot_cache_lazy_load=True: only lazy loading fetches executables from GCS.")
+  return url
+
+
+def resolve_weight_cache_wait_s(config) -> int:
+  """`krea2_weight_cache_wait_s` as an int >= 0 (0 when the key is missing); ValueError otherwise."""
+  value = getattr(config, "krea2_weight_cache_wait_s", 0)
+  if value is None or value == "":
+    return 0
+  if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+    raise ValueError(f"krea2_weight_cache_wait_s must be an integer >= 0 (seconds, 0 = off), got {value!r}")
+  return value
 
 
 def partition_prompts(prompt_str: str, batch_size: int) -> List[str]:
@@ -142,7 +290,9 @@ def load_qwen_image_vae(snapshot_dir, config, vae_mesh, rngs):
   params = state.to_pure_dict()
   state = dict(nnx.to_flat_state(state))
 
-  params = load_wan_vae(snapshot_dir, params, "cpu")
+  # Every tensor of the Krea 2 VAE is float32 (checked in the Krea-2-Turbo safetensors header), so numpy reads it
+  # with the same values as the torch path, and the generate process never imports torch.
+  params = load_wan_vae(snapshot_dir, params, "cpu", framework="np")
   target_dtype = np.dtype(config.weights_dtype)
   params = jax.tree_util.tree_map(
       lambda x: x if np.dtype(x.dtype) == target_dtype else x.astype(config.weights_dtype),
@@ -394,12 +544,20 @@ def load_or_build_host_params(cache, abstract_params, build, load_trace, trace_k
 
   `cache` is a `WeightCacheSpec` or None (no cache: `build` runs, nothing is
   read). On a hit `build` is not called. `load_trace[trace_key]` gets the time
-  of the cache read whenever one was attempted. A miss with `cache.source_files`
+  of the cache read whenever one was attempted. With `cache.wait_s` > 0 the read
+  first waits for the component's directory (`wait_for_component`), timed in
+  `load_trace[trace_key with "_read" -> "_wait"]`. A miss with `cache.source_files`
   None (no checkpoint safetensors to build from) raises RuntimeError.
   """
-  from maxdiffusion.models.krea2.weight_cache import load_component
+  from maxdiffusion.models.krea2.weight_cache import load_component, wait_for_component
 
   if cache is not None:
+    if cache.wait_s > 0:
+      # The directory may still be arriving (cache pulled while this process starts); a timeout falls
+      # through to the normal read, which then misses.
+      t0 = time.perf_counter()
+      wait_for_component(cache.cache_dir, cache.component, cache.meta, cache.wait_s)
+      load_trace[trace_key.replace("_read", "_wait")] = time.perf_counter() - t0
     t0 = time.perf_counter()
     cached = load_component(
         cache.cache_dir,
@@ -756,6 +914,12 @@ def log_precompile_summary(records) -> None:
 
 
 def main(argv):
+  process_t0, process_t0_origin = resolve_process_t0(os.environ.get("KREA2_PROCESS_T0"), _PROCESS_T0)
+  timeline = StartupTimeline(process_t0)
+  timeline.mark("imports")
+  register_exit_timing(process_t0)
+  if process_t0_origin != "KREA2_PROCESS_T0":
+    max_logging.log(f"Startup timeline origin: {process_t0_origin}")
   jax.config.update("jax_use_shardy_partitioner", True)
 
   # 1. Load configurations
@@ -778,6 +942,7 @@ def main(argv):
   ]
   default_args.extend(custom_overrides)
   pyconfig.initialize(default_args)
+  timeline.mark("config")
 
   # Import modules after jax.distributed.initialize() has run via pyconfig.initialize()
   from maxdiffusion.models.krea2.util import (
@@ -819,6 +984,8 @@ def main(argv):
       maybe_load_krea2_lora,
   )
 
+  timeline.mark("late_imports")
+
   config = pyconfig.config
   os.makedirs(config.output_dir, exist_ok=True)
   # The resolution and the precompile plan are resolved before anything else so
@@ -830,6 +997,9 @@ def main(argv):
   attention_kernel_choice = resolve_krea2_attention_kernel(config)
   # Same for the DiT programs' scoped-VMEM limit (the pipeline parses it again).
   transformer_scoped_vmem_limit_kib = resolve_transformer_scoped_vmem_limit_kib(config)
+  # The cold-start knobs, too.
+  aot_cache_gcs = resolve_aot_cache_gcs(config)
+  weight_cache_wait_s = resolve_weight_cache_wait_s(config)
   if config.attention == "flash_custom":
     max_logging.log(
         f"flash_custom kernel choice: {attention_kernel_choice} ('auto' = hybrid on TPU v6e, flash elsewhere)"
@@ -862,6 +1032,7 @@ def main(argv):
   # The ICI parallelism product must equal the number of devices PER SLICE
   # (see max_utils.create_device_mesh), not the global device count.
   all_devices = jax.devices()
+  timeline.mark("tpu_init")
   try:
     num_slices = 1 + max(d.slice_index for d in all_devices)
   except Exception:
@@ -891,6 +1062,7 @@ def main(argv):
   vae_devices_array = devices_array.flatten().reshape(total_devices // vae_spatial, vae_spatial)
   vae_mesh = Mesh(vae_devices_array, ("redundant", "vae_spatial"))
   vae_logical_axis_rules = getattr(config, "vae_logical_axis_rules", None)
+  timeline.mark("mesh")
 
   # 3. Resolve weights repository snapshot
   repo_id = config.pretrained_model_name_or_path
@@ -1040,6 +1212,7 @@ def main(argv):
             mesh,
         )
     )
+  timeline.mark("shapes")
 
   # 6b. Quantized-weight cache (krea2_weight_cache_dir): a hit replaces the checkpoint
   # read, the rotate-half permutation and the quantization of that component.
@@ -1061,6 +1234,7 @@ def main(argv):
               transformer.attention_head_dim,
           ),
           list_source_files(transformer_path),
+          weight_cache_wait_s,
       )
       if transformer_cache_dir
       else None
@@ -1073,6 +1247,7 @@ def main(argv):
               config, snapshot_dir, te_quantization, te_quant_tile_size, te_embed_on_host, qwen3_config.dtype
           ),
           list_source_files(text_encoder_path),
+          weight_cache_wait_s,
       )
       if text_encoder_cache_dir
       else None
@@ -1113,6 +1288,16 @@ def main(argv):
   # Build-only mode never loads the VAE.
   common_executor = ThreadPoolExecutor(max_workers=1) if parallel_loading and not build_only else None
   vae_future = common_executor.submit(load_vae_timed) if common_executor is not None else None
+
+  def load_tokenizer_marked(parallel):
+    result = load_krea2_tokenizer(tokenizer_path, snapshot_dir)
+    timeline.mark("tokenizer", parallel=parallel)
+    return result
+
+  # The tokenizer (and the transformers import it brings) loads in its own thread beside the weights; it is
+  # joined before the pipeline is built. Sequential mode keeps it after the load; build-only mode needs none.
+  tokenizer_executor = ThreadPoolExecutor(max_workers=1) if parallel_loading and not build_only else None
+  tokenizer_future = tokenizer_executor.submit(load_tokenizer_marked, True) if tokenizer_executor is not None else None
 
   try:
     with jax.default_device(cpu_device):
@@ -1264,6 +1449,8 @@ def main(argv):
               load_trace,
               time.time() - t_load_start,
           )
+          timeline.mark("load_done")
+          timeline.log()
           return
 
         params = flax.core.freeze(params)
@@ -1291,6 +1478,9 @@ def main(argv):
   finally:
     if common_executor is not None:
       common_executor.shutdown(wait=True)
+    if tokenizer_executor is not None:
+      # Returns at once: a failed load leaves the thread to finish on its own, the join below waits for it.
+      tokenizer_executor.shutdown(wait=False)
 
   # 8. VAE (Qwen-Image / Wan 2.1 architecture, NNX). In sequential mode,
   # preserve the historical order and load it after the main parameter trees.
@@ -1299,14 +1489,18 @@ def main(argv):
     (vae, vae_cache), load_trace["vae"] = load_vae_timed()
 
   load_time = time.time() - t_load_start
+  timeline.mark("load_done")
   max_logging.log(f" -> [TIMING] Total Model Loading & Device Placement: {load_time:.2f} seconds")
   max_logging.log(
       " -> [TIMING] Load breakdown: "
       + ", ".join(f"{stage}={seconds:.2f}s" for stage, seconds in load_trace.items())
   )
 
-  # 9. Tokenizer
-  tokenizer = load_krea2_tokenizer(tokenizer_path, snapshot_dir)
+  # 9. Tokenizer (loaded beside the weights in parallel mode)
+  if tokenizer_future is not None:
+    tokenizer = tokenizer_future.result()
+  else:
+    tokenizer = load_tokenizer_marked(False)
 
   # 10. FlowMatch scheduler (exponential dynamic shifting; mu is set per-call)
   scheduler = FlaxFlowMatchScheduler(
@@ -1377,8 +1571,11 @@ def main(argv):
       mesh=mesh,
       # With many cached shapes (e.g. after krea2_precompile) load only the ones this run calls.
       lazy_load=bool(getattr(config, "aot_cache_lazy_load", False)),
+      # Lazy loads fetch missing executables from there; not part of the meta (same executables).
+      gcs_prefix=aot_cache_gcs,
   )
   aot_cache.wait_for_loads()
+  timeline.mark("pipeline")
 
   latents_to_use = None
   if getattr(config, "latents_path", ""):
@@ -1432,6 +1629,8 @@ def main(argv):
           [KREA2_PRECOMPILE_PROMPT] * config.batch_size,
       )
       log_precompile_summary(precompile_records)
+      timeline.mark("precompile_done")
+      timeline.log()
       max_logging.log(f"SUCCESS! Precompile complete for {len(precompile_records)} resolution/text combination(s)!")
       return
 
@@ -1446,12 +1645,17 @@ def main(argv):
     # Persist newly-seen shape signatures synchronously. Saving in the
     # background competes with the first real request for CPU and disk I/O.
     aot_cache.save_pending()
+    timeline.mark("warmup_done")
     warmup_time = sum(warmup_trace.get(k, 0.0) for k in timed_phases)
 
     max_logging.log("Running timed pass at full device speed...")
     with max_utils.Profiler(config, session_name="krea2_timed"):
       with jax.profiler.StepTraceAnnotation("krea2_generate", step_num=0):
         _, main_trace = pipeline(prompt=active_prompts, output_name=config.output_name, **call_kwargs)
+    # The pipeline call that decodes also saves the image: timed_done is the end of its VAE decode.
+    if "vae_decode_done_at" in main_trace:
+      timeline.mark("timed_done", at=main_trace["vae_decode_done_at"])
+    timeline.mark("saved")
     main_time = sum(main_trace.get(k, 0.0) for k in timed_phases)
 
   if getattr(config, "enable_profiler", False) and jax.process_index() == 0:
@@ -1491,6 +1695,7 @@ def main(argv):
   max_logging.log(f"   - Krea2 Denoising:   {main_trace.get('denoise_loop', 0.0):.2f}s")
   max_logging.log(f"   - VAE Decoding:      {main_trace.get('vae_decode', 0.0):.2f}s")
   max_logging.log("=" * 80)
+  timeline.log()
   max_logging.log(f"SUCCESS! Generation complete for {config.batch_size} image(s)!")
 
 

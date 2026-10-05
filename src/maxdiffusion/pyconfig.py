@@ -24,6 +24,7 @@ from typing import Any, Union
 
 import jax
 import yaml
+from . import aot_cache
 from . import max_logging
 from . import max_utils
 from .models.wan.wan_utils import CAUSVID_TRANSFORMER_MODEL_NAME_OR_PATH, WAN_21_FUSION_X_MODEL_NAME_OR_PATH
@@ -61,6 +62,25 @@ def _validate_training_model_name(model_name: str | None):
     raise ValueError(
         f"Invalid config.model_name '{model_name}' for training. Allowed values: {sorted(_ALLOWED_TRAINING_MODEL_NAMES)}"
     )
+
+
+def _validate_krea2_cold_start_keys(raw_keys) -> None:
+  """Normalizes and validates `aot_cache_gcs` and `krea2_weight_cache_wait_s` (Krea 2 configs only).
+
+  `aot_cache_gcs`: '' (off) or `gs://<bucket>[/<prefix>]`, stored without
+  surrounding quotes or a trailing slash. `krea2_weight_cache_wait_s`: an int
+  >= 0 (0 = off). Raises ValueError otherwise. Configs without the keys are
+  untouched.
+  """
+  if "aot_cache_gcs" in raw_keys:
+    try:
+      raw_keys["aot_cache_gcs"] = aot_cache.normalize_gcs_prefix(raw_keys["aot_cache_gcs"])
+    except ValueError as e:
+      raise ValueError(f"aot_cache_gcs: {e}") from e
+  if "krea2_weight_cache_wait_s" in raw_keys:
+    value = raw_keys["krea2_weight_cache_wait_s"]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+      raise ValueError(f"krea2_weight_cache_wait_s must be an integer >= 0 (seconds, 0 = off), got {value!r}")
 
 
 def string_to_bool(s: str) -> bool:
@@ -197,6 +217,8 @@ class _HyperParameters:
   @staticmethod
   def user_init(raw_keys):
     """Transformations between the config data and configs used at runtime"""
+    # Before the config is written or the devices are counted: a bad value fails at once.
+    _validate_krea2_cold_start_keys(raw_keys)
     if "remat_policy" not in raw_keys:
       raw_keys["remat_policy"] = "None"
     if "names_which_can_be_saved" not in raw_keys:

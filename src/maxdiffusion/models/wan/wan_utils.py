@@ -24,7 +24,6 @@ from typing import Callable, Optional
 
 import ml_dtypes
 import numpy as np
-import torch
 import jax
 import jax.numpy as jnp
 from maxdiffusion import max_logging
@@ -248,6 +247,8 @@ def load_causvid_transformer(
   with jax.default_device(device):
     if hf_download:
       ckpt_shard_path = hf_hub_download(pretrained_model_name_or_path, filename="causal_model.pt")
+      import torch  # pylint: disable=import-outside-toplevel
+
       loaded_state_dict = torch.load(ckpt_shard_path)
 
       tensors = {}
@@ -307,12 +308,14 @@ def load_wan_transformer(
     )
 
 
-def _torch_tensor_to_numpy(tensor: torch.Tensor) -> np.ndarray:
+def _torch_tensor_to_numpy(tensor: "torch.Tensor") -> np.ndarray:
   """Converts a CPU torch tensor to numpy without copying or upcasting.
 
   bfloat16 has no native numpy dtype, so it is reinterpreted through uint16
   into ml_dtypes.bfloat16 (bit-identical, zero-copy).
   """
+  import torch  # pylint: disable=import-outside-toplevel
+
   if tensor.dtype == torch.bfloat16:
     return tensor.view(torch.uint16).numpy().view(ml_dtypes.bfloat16)
   return tensor.numpy()
@@ -618,7 +621,44 @@ def load_wan_animate_transformer(
     return flax_state_dict
 
 
-def load_wan_vae(pretrained_model_name_or_path: str, eval_shapes: dict, device: str, hf_download: bool = True):
+# safetensors dtypes the numpy framework reads natively (no bfloat16 / float8).
+_NUMPY_SAFETENSORS_DTYPES = frozenset(("BOOL", "U8", "I8", "U16", "I16", "U32", "I32", "U64", "I64", "F16", "F32", "F64"))
+
+
+def _read_safetensors_as_jax(ckpt_path: str, framework: str) -> dict:
+  """Every tensor of `ckpt_path` as a jax array on the first CPU device.
+
+  framework="pt" reads torch tensors and converts them with `torch2jax`.
+  framework="np" reads numpy arrays and never imports torch; `jnp.array` of a
+  numpy array gives the same values and dtype as torch2jax does for every
+  non-bfloat16 tensor. A file holding a dtype numpy cannot represent (bf16,
+  float8) is read with "pt" instead (one log line).
+  """
+  if framework not in ("pt", "np"):
+    raise ValueError(f"framework must be 'pt' or 'np', got {framework!r}")
+  if framework == "np":
+    with safe_open(ckpt_path, framework="np") as f:
+      dtypes = {k: f.get_slice(k).get_dtype() for k in f.keys()}
+      unsupported = sorted({d for d in dtypes.values() if d not in _NUMPY_SAFETENSORS_DTYPES})
+      if not unsupported:
+        cpu = jax.local_devices(backend="cpu")[0]
+        return {k: jnp.array(f.get_tensor(k), device=cpu) for k in dtypes}
+    max_logging.log(f"{ckpt_path} holds {', '.join(unsupported)} tensors, which numpy cannot read; reading it with torch")
+  tensors = {}
+  with safe_open(ckpt_path, framework="pt") as f:
+    for k in f.keys():
+      tensors[k] = torch2jax(f.get_tensor(k))
+  return tensors
+
+
+def load_wan_vae(
+    pretrained_model_name_or_path: str, eval_shapes: dict, device: str, hf_download: bool = True, framework: str = "pt"
+):
+  """Loads the Wan VAE safetensors into `eval_shapes`' structure.
+
+  `framework` "np" reads the file without torch (see `_read_safetensors_as_jax`);
+  the default "pt" keeps the torch read.
+  """
   device = jax.devices(device)[0]
   subfolder = "vae"
   filename = "diffusion_pytorch_model.safetensors"
@@ -631,10 +671,7 @@ def load_wan_vae(pretrained_model_name_or_path: str, eval_shapes: dict, device: 
   max_logging.log(f"Load and port {pretrained_model_name_or_path} VAE on {device}")
   with jax.default_device(device):
     if ckpt_path is not None:
-      tensors = {}
-      with safe_open(ckpt_path, framework="pt") as f:
-        for k in f.keys():
-          tensors[k] = torch2jax(f.get_tensor(k))
+      tensors = _read_safetensors_as_jax(ckpt_path, framework)
       flax_state_dict = {}
       cpu = jax.local_devices(backend="cpu")[0]
       for pt_key, tensor in tensors.items():

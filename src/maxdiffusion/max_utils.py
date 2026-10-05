@@ -36,6 +36,7 @@ import typing
 import logging
 from pathlib import Path
 import subprocess
+import sys
 import numpy as np
 
 import flax
@@ -55,7 +56,6 @@ from flax.linen import partitioning as nn_partitioning
 from flax.training import train_state
 from jax.experimental import mesh_utils
 
-from transformers import FlaxCLIPTextModel, FlaxCLIPTextPreTrainedModel
 from flax import struct
 from flax import core
 from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel
@@ -65,8 +65,6 @@ try:
 except ImportError:
   machinelearning_run = None
   xprof = None
-
-from tensorboardX import writer
 
 from google.cloud import storage
 
@@ -181,6 +179,10 @@ class Profiler:
 
 
 def initialize_summary_writer(config):
+  # Imported here: tensorboardX imports torch when it is installed, seconds on every start of a process that
+  # imports max_utils but never writes a summary.
+  from tensorboardX import writer  # pylint: disable=import-outside-toplevel
+
   return writer.SummaryWriter(config.tensorboard_dir) if jax.process_index() == 0 else None
 
 
@@ -421,6 +423,25 @@ def unbox_logicallypartioned_trainstate(boxed_train_state: train_state.TrainStat
   )
 
 
+def _is_flax_clip_text_model(model) -> bool:
+  """Whether `model` is a transformers FlaxCLIPTextModel / FlaxCLIPTextPreTrainedModel.
+
+  transformers is imported here, not at module level: importing it (and torch through it) costs seconds on every
+  start of a process that imports max_utils, and most never build a CLIP model. A model that is an instance of a
+  transformers class implies transformers is already imported, so without it in `sys.modules` the answer is False
+  without importing anything. A failed import (or a transformers without these classes) also skips the check.
+  """
+  if "transformers" not in sys.modules:
+    return False
+  try:
+    from transformers import FlaxCLIPTextModel, FlaxCLIPTextPreTrainedModel  # pylint: disable=import-outside-toplevel
+  except ImportError:
+    return False
+  if FlaxCLIPTextModel is None or FlaxCLIPTextPreTrainedModel is None:
+    return False
+  return isinstance(model, (FlaxCLIPTextModel, FlaxCLIPTextPreTrainedModel))
+
+
 def init_train_state(model, tx, weights_init_fn, params=None, training=True, eval_only=False):
   """
   We pass in "static" objects like model, tx, config, as JAX compares them by
@@ -430,9 +451,7 @@ def init_train_state(model, tx, weights_init_fn, params=None, training=True, eva
   Args: model_params, model, tx, training
   """
   if not params:
-    is_clip_model = False
-    if FlaxCLIPTextModel is not None and FlaxCLIPTextPreTrainedModel is not None:
-      is_clip_model = isinstance(model, FlaxCLIPTextModel) or isinstance(model, FlaxCLIPTextPreTrainedModel)
+    is_clip_model = _is_flax_clip_text_model(model)
     if is_clip_model:
       params = weights_init_fn()
     else:

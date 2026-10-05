@@ -81,6 +81,8 @@ class WeightCacheSpec(NamedTuple):
   component: str
   meta: dict
   source_files: Optional[list]
+  # krea2_weight_cache_wait_s: seconds a read waits for the component's directory (0 = no wait).
+  wait_s: int = 0
 
 
 class _ShortRead(Exception):
@@ -98,6 +100,38 @@ def weight_cache_fingerprint(meta: dict) -> str:
 
 def component_dir(cache_dir: str, component: str, meta: dict) -> str:
   return os.path.join(cache_dir, f"{component}-{weight_cache_fingerprint(meta)}")
+
+
+def wait_for_component(cache_dir, component, meta, wait_s, poll_s=1.0, sleep=time.sleep, clock=time.monotonic):
+  """Waits up to `wait_s` seconds for `component_dir(...)/meta.json`; returns the seconds waited, None on timeout.
+
+  For a cache still being pulled while the process starts: a pulled directory
+  is complete once its meta.json exists (written last, the directory is renamed
+  into place). Returns 0.0 at once (no log) when it already exists or `wait_s`
+  is not positive. Otherwise logs one line at the start and one when it
+  appears (or the wait times out), polling every `poll_s` seconds. Only this
+  directory ends the wait: an ordinary pull writes directories in sorted-name
+  order, so a complete directory of another fingerprint says nothing about
+  whether this one is still coming. Never raises for the cache; the caller's
+  normal load decides hit or miss.
+  """
+  directory = component_dir(cache_dir, component, meta)
+  meta_path = os.path.join(directory, _META_FILE)
+  if wait_s <= 0 or os.path.exists(meta_path):
+    return 0.0
+  max_logging.log(f"[weight cache] {component}: waiting up to {wait_s} s for {directory} (pull in progress)")
+  start = clock()
+  deadline = start + wait_s
+  while True:
+    now = clock()
+    if now >= deadline:
+      max_logging.log(f"[weight cache] {component}: {directory} did not appear within {wait_s} s")
+      return None
+    sleep(min(poll_s, deadline - now))
+    if os.path.exists(meta_path):
+      waited = clock() - start
+      max_logging.log(f"[weight cache] {component}: {directory} appeared after {waited:.1f} s")
+      return waited
 
 
 def list_source_files(source_dir: str) -> Optional[list]:

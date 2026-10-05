@@ -18,6 +18,8 @@ limitations under the License.
 # timestep-shift computation and rotary position-id helpers.
 
 import gc
+import json
+import os
 import traceback
 
 import jax
@@ -61,6 +63,31 @@ def _is_extra_special_tokens_error(err: BaseException) -> bool:
   return any("special_tokens" in frame.name for frame in traceback.extract_tb(err.__traceback__))
 
 
+def _config_has_list_extra_special_tokens(*tokenizer_dirs) -> bool:
+  """Whether the first readable `tokenizer_config.json` among `tokenizer_dirs` stores `extra_special_tokens` as a list.
+
+  False when none can be read or parsed: the load then runs as before (with the
+  retry on the known error).
+  """
+  for directory in tokenizer_dirs:
+    if not directory:
+      continue
+    try:
+      with open(os.path.join(directory, "tokenizer_config.json"), "r", encoding="utf-8") as f:
+        tokenizer_config = json.load(f)
+    except (OSError, ValueError):
+      continue
+    return isinstance(tokenizer_config, dict) and isinstance(tokenizer_config.get("extra_special_tokens"), list)
+  return False
+
+
+def _transformers_major_version(transformers_module) -> int:
+  try:
+    return int(str(transformers_module.__version__).split(".", 1)[0])
+  except (AttributeError, ValueError):
+    return 0
+
+
 def load_krea2_tokenizer(tokenizer_path: str, snapshot_dir: str = None):
   """Loads the Krea 2 (Qwen) tokenizer from `tokenizer_path`, falling back to
   `snapshot_dir`'s `tokenizer` subfolder.
@@ -72,7 +99,12 @@ def load_krea2_tokenizer(tokenizer_path: str, snapshot_dir: str = None):
   tokens in tokenizer.json, so on exactly that error the load is retried once
   with `extra_special_tokens={}`, which does not change tokenization. Any other
   error propagates (after the `snapshot_dir` subfolder fallback, if given).
+
+  The tokenizer is built once: when tokenizer_config.json (read first) has a
+  list there and transformers is older than 5, the first load already passes
+  `extra_special_tokens={}`; the retry stays for a config that could not be read.
   """
+  import transformers  # pylint: disable=import-outside-toplevel
   from transformers import AutoTokenizer
 
   def load(**kwargs):
@@ -83,10 +115,16 @@ def load_krea2_tokenizer(tokenizer_path: str, snapshot_dir: str = None):
         raise
       return AutoTokenizer.from_pretrained(snapshot_dir, subfolder="tokenizer", local_files_only=True, **kwargs)
 
+  snapshot_tokenizer_dir = os.path.join(snapshot_dir, "tokenizer") if snapshot_dir is not None else None
+  initial_kwargs = {}
+  if _transformers_major_version(transformers) < 5 and _config_has_list_extra_special_tokens(
+      tokenizer_path, snapshot_tokenizer_dir
+  ):
+    initial_kwargs = {"extra_special_tokens": {}}
   try:
-    return load()
+    return load(**initial_kwargs)
   except AttributeError as err:
-    if not _is_extra_special_tokens_error(err):
+    if initial_kwargs or not _is_extra_special_tokens_error(err):
       raise
     max_logging.log(
         "Warning: this transformers version expects a dict for the tokenizer's `extra_special_tokens` but "

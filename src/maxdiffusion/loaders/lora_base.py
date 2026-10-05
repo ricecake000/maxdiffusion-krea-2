@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from ..models.modeling_utils import load_state_dict
 from ..utils import _get_model_file
 
 import safetensors
@@ -99,6 +98,9 @@ class LoRABaseMixin:
               subfolder=subfolder,
               user_agent=user_agent,
           )
+          # Imported here: models.modeling_utils imports torch, which torch-free subclasses never need.
+          from ..models.modeling_utils import load_state_dict  # pylint: disable=import-outside-toplevel
+
           state_dict = load_state_dict(model_file)
       else:
         state_dict = pretrained_model_name_or_path_or_dict
