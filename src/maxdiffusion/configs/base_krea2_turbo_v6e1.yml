@@ -150,8 +150,12 @@
 #   missing object compiles), so no separate executable pull is needed:
 #     generate_krea2.py <this file> krea2_weight_cache_dir=<dir> aot_cache_dir=<dir> \
 #       krea2_weight_cache_wait_s=900 aot_cache_gcs=gs://<bucket>/aot prompt=...
+#   krea2_model_wait_s=<n> (off by default) also lets it start while the slim
+#   model directory (a local pretrained_model_name_or_path) is still being
+#   fetched: it waits up to n s, after the mesh, for the fetch's
+#   .krea2_fetch_slim or .krea2_fetch_complete marker.
 #   Every run logs "[TIMING] Startup timeline (s since process start): imports=..
-#   config=.. late_imports=.. tpu_init=.. mesh=.. shapes=.. tokenizer=..
+#   config=.. late_imports=.. tpu_init=.. mesh=.. model_dir=.. shapes=.. tokenizer=..
 #   load_done=.. pipeline=.. warmup_done=.. timed_done=.. saved=.." (absolute
 #   marks; t0 = KREA2_PROCESS_T0 from the shell wrapper when set, else the
 #   module import), "[TIMING] Startup biggest gaps: .." and at exit
@@ -340,6 +344,12 @@ krea2_weight_cache_build_only: False
 # the normal load, for a cache still being pulled while the process starts (polls every 1 s; the timeout
 # falls through to the normal miss handling). 0 means off.
 krea2_weight_cache_wait_s: 0
+# Cold start: seconds to wait, before the first read of pretrained_model_name_or_path, for a local model
+# directory that is still being fetched while the process starts. The fetch's marker (.krea2_fetch_slim or
+# .krea2_fetch_complete, written last) ends the wait; it polls every 0.5 s and a timeout falls through to
+# the normal read (which then fails as before when files are missing). Only for a local directory (an
+# absolute path, ./ ../ ~ or an existing directory); a Hugging Face repo id is never waited for. 0 means off.
+krea2_model_wait_s: 0
 # Load a cached executable when its shape is first called instead of all of them at startup. On
 # here because a precompiled cache holds ~30 shapes and one run calls only a few.
 aot_cache_lazy_load: True

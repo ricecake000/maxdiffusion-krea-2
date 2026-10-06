@@ -79,6 +79,8 @@ class Krea2ColdStartConfigTest(unittest.TestCase):
       self.assertEqual(config["aot_cache_gcs"], "", name)
       self.assertIs(type(config["krea2_weight_cache_wait_s"]), int, name)
       self.assertEqual(config["krea2_weight_cache_wait_s"], 0, name)
+      self.assertIs(type(config["krea2_model_wait_s"]), int, name)
+      self.assertEqual(config["krea2_model_wait_s"], 0, name)
 
   def test_preset_unset_and_valid_values(self):
     config = self._load_preset()
@@ -86,15 +88,22 @@ class Krea2ColdStartConfigTest(unittest.TestCase):
     self.assertEqual(config.krea2_weight_cache_wait_s, 0)
     self.assertEqual(generate_krea2.resolve_aot_cache_gcs(config), "")
     self.assertEqual(generate_krea2.resolve_weight_cache_wait_s(config), 0)
+    self.assertEqual(config.krea2_model_wait_s, 0)
+    self.assertEqual(generate_krea2.resolve_model_wait_s(config), 0)
 
     config = self._load_preset(
-        "aot_cache_gcs=gs://tpu-test-507316-krea2-use1/aot/", "krea2_weight_cache_wait_s=900", "aot_cache_dir=/x"
+        "aot_cache_gcs=gs://tpu-test-507316-krea2-use1/aot/",
+        "krea2_weight_cache_wait_s=900",
+        "aot_cache_dir=/x",
+        "krea2_model_wait_s=120",
     )
     self.assertEqual(config.aot_cache_gcs, "gs://tpu-test-507316-krea2-use1/aot")
     self.assertEqual(config.krea2_weight_cache_wait_s, 900)
     # The v6e-1 preset loads lazily, so the URL is usable as is.
     self.assertEqual(generate_krea2.resolve_aot_cache_gcs(config), "gs://tpu-test-507316-krea2-use1/aot")
     self.assertEqual(generate_krea2.resolve_weight_cache_wait_s(config), 900)
+    self.assertEqual(config.krea2_model_wait_s, 120)
+    self.assertEqual(generate_krea2.resolve_model_wait_s(config), 120)
 
     self.assertEqual(self._load_preset("aot_cache_gcs=''").aot_cache_gcs, "")
 
@@ -107,10 +116,30 @@ class Krea2ColdStartConfigTest(unittest.TestCase):
         "krea2_weight_cache_wait_s=-1",
         "krea2_weight_cache_wait_s=abc",
         "krea2_weight_cache_wait_s=1.5",
+        "krea2_model_wait_s=abc",
+        "krea2_model_wait_s=1.5",
+        "krea2_model_wait_s=True",
     ):
       with self.subTest(override=override):
         with self.assertRaises(ValueError):
           self._load_preset(override)
+    # Only a negative value parses as an int on the command line and reaches the cold-start check.
+    with self.assertRaisesRegex(ValueError, r"krea2_model_wait_s must be an integer >= 0 \(seconds, 0 = off\), got -1"):
+      self._load_preset("krea2_model_wait_s=-1")
+
+  def test_validate_model_wait_s(self):
+    from maxdiffusion import pyconfig  # pylint: disable=import-outside-toplevel
+
+    validate = pyconfig._validate_krea2_cold_start_keys  # pylint: disable=protected-access
+    for value in (0, 1, 900):
+      validate({"krea2_model_wait_s": value})
+    validate({})
+    for value in (-1, True, "5"):
+      with self.subTest(value=value):
+        with self.assertRaisesRegex(
+            ValueError, rf"krea2_model_wait_s must be an integer >= 0 \(seconds, 0 = off\), got {value!r}"
+        ):
+          validate({"krea2_model_wait_s": value})
 
   def test_resolve_aot_cache_gcs_needs_dir_and_lazy_load(self):
     url = "gs://krea2-bkt/aot"
@@ -133,6 +162,16 @@ class Krea2ColdStartConfigTest(unittest.TestCase):
       with self.subTest(value=value):
         with self.assertRaises(ValueError):
           generate_krea2.resolve_weight_cache_wait_s(types.SimpleNamespace(krea2_weight_cache_wait_s=value))
+
+  def test_resolve_model_wait_s(self):
+    resolve = generate_krea2.resolve_model_wait_s
+    self.assertEqual(resolve(types.SimpleNamespace()), 0)
+    self.assertEqual(resolve(types.SimpleNamespace(krea2_model_wait_s=0)), 0)
+    self.assertEqual(resolve(types.SimpleNamespace(krea2_model_wait_s=30)), 30)
+    for value in (-1, True, 2.5, "10"):
+      with self.subTest(value=value):
+        with self.assertRaisesRegex(ValueError, "krea2_model_wait_s must be an integer >= 0"):
+          resolve(types.SimpleNamespace(krea2_model_wait_s=value))
 
   def test_gcs_without_lazy_load_fails_before_model_load(self):
     from maxdiffusion import pyconfig  # pylint: disable=import-outside-toplevel
@@ -204,6 +243,20 @@ class Krea2StartupTimelineTest(unittest.TestCase):
     with mock.patch.object(generate_krea2.max_logging, "log") as log:
       timeline.log()
     self.assertEqual([c.args[0] for c in log.call_args_list], [timeline_line, gaps_line])
+
+  def test_model_dir_mark_between_mesh_and_shapes(self):
+    order = generate_krea2.STARTUP_TIMELINE_ORDER
+    self.assertEqual(order[order.index("mesh") + 1 : order.index("shapes")], ("model_dir",))
+    # main() waits for the model directory after the mesh, before its first read of it.
+    with open(generate_krea2.__file__, encoding="utf-8") as f:
+      source = f.read()
+    positions = [
+        source.index('timeline.mark("mesh")'),
+        source.index("wait_for_model_dir(config.pretrained_model_name_or_path, model_wait_s)"),
+        source.index('timeline.mark("model_dir")'),
+        source.index("repo_id = config.pretrained_model_name_or_path"),
+    ]
+    self.assertEqual(positions, sorted(positions))
 
   def test_serial_tokenizer_is_a_gap(self):
     timeline = generate_krea2.StartupTimeline(0.0)
@@ -356,6 +409,127 @@ class Krea2WeightCacheWaitTest(unittest.TestCase):
 
   def test_spec_defaults_to_no_wait(self):
     self.assertEqual(WeightCacheSpec("/c", "transformer", {}, None).wait_s, 0)
+
+
+class Krea2ModelDirWaitTest(unittest.TestCase):
+
+  def setUp(self):
+    self._tmp = tempfile.TemporaryDirectory()
+    self.addCleanup(self._tmp.cleanup)
+    self.path = self._tmp.name
+
+  def _mark(self, name=".krea2_fetch_slim"):
+    with open(os.path.join(self.path, name), "w", encoding="utf-8") as f:
+      f.write("")
+
+  def _fake_clock(self, on_sleep=None):
+    now = [1000.0]
+    sleeps = []
+
+    def clock():
+      return now[0]
+
+    def sleep(seconds):
+      sleeps.append(seconds)
+      now[0] += seconds
+      if on_sleep is not None:
+        on_sleep(len(sleeps))
+
+    return clock, sleep, sleeps
+
+  def test_markers(self):
+    self.assertEqual(generate_krea2.MODEL_FETCH_MARKERS, (".krea2_fetch_slim", ".krea2_fetch_complete"))
+
+  def test_off_or_marker_present_returns_at_once(self):
+    clock, sleep, sleeps = self._fake_clock()
+    with mock.patch.object(generate_krea2.max_logging, "log") as log:
+      self.assertEqual(generate_krea2.wait_for_model_dir(self.path, 0, sleep=sleep, clock=clock), 0.0)
+      missing = os.path.join(self.path, "not-yet")
+      self.assertEqual(generate_krea2.wait_for_model_dir(missing, 0, sleep=sleep, clock=clock), 0.0)
+      for name in generate_krea2.MODEL_FETCH_MARKERS:
+        with self.subTest(name=name):
+          self._mark(name)
+          self.assertEqual(generate_krea2.wait_for_model_dir(self.path, 30, sleep=sleep, clock=clock), 0.0)
+          os.remove(os.path.join(self.path, name))
+    self.assertEqual(sleeps, [])
+    log.assert_not_called()
+
+  def test_appears_during_the_wait(self):
+    clock, sleep, sleeps = self._fake_clock(on_sleep=lambda n: n == 3 and self._mark())
+    with mock.patch.object(generate_krea2.max_logging, "log") as log:
+      waited = generate_krea2.wait_for_model_dir(self.path, 30, sleep=sleep, clock=clock)
+    self.assertEqual(waited, 1.5)
+    self.assertEqual(sleeps, [0.5, 0.5, 0.5])
+    self.assertEqual(
+        [c.args[0] for c in log.call_args_list],
+        [
+            f"[model] waiting up to 30 s for a fetch marker in {self.path} (fetch in progress)",
+            f"[model] {self.path}: fetch marker appeared after 1.5 s",
+        ],
+    )
+
+  def test_either_marker_ends_the_wait(self):
+    for name in generate_krea2.MODEL_FETCH_MARKERS:
+      with self.subTest(name=name):
+        clock, sleep, sleeps = self._fake_clock(on_sleep=lambda n, name=name: n == 2 and self._mark(name))
+        with mock.patch.object(generate_krea2.max_logging, "log"):
+          self.assertEqual(generate_krea2.wait_for_model_dir(self.path, 30, sleep=sleep, clock=clock), 1.0)
+        self.assertEqual(sleeps, [0.5, 0.5])
+        os.remove(os.path.join(self.path, name))
+
+  def test_a_directory_without_a_marker_does_not_end_the_wait(self):
+    # Files of the fetch in progress, a directory named like a marker: none of them is a marker file.
+    os.makedirs(os.path.join(self.path, "text_encoder"))
+    with open(os.path.join(self.path, "text_encoder", "config.json"), "w", encoding="utf-8") as f:
+      f.write("{}")
+    os.makedirs(os.path.join(self.path, ".krea2_fetch_complete"))
+    clock, sleep, sleeps = self._fake_clock()
+    with mock.patch.object(generate_krea2.max_logging, "log"):
+      self.assertIsNone(generate_krea2.wait_for_model_dir(self.path, 3, sleep=sleep, clock=clock))
+    self.assertEqual(sleeps, [0.5] * 6)
+
+  def test_timeout(self):
+    missing = os.path.join(self.path, "Krea-2-Turbo")
+    clock, sleep, sleeps = self._fake_clock()
+    with mock.patch.object(generate_krea2.max_logging, "log") as log:
+      waited = generate_krea2.wait_for_model_dir(missing, 1.2, sleep=sleep, clock=clock)
+    self.assertIsNone(waited)
+    self.assertEqual([round(seconds, 9) for seconds in sleeps], [0.5, 0.5, 0.2])
+    self.assertEqual(log.call_args_list[-1].args[0], f"[model] {missing}: no fetch marker within 1.2 s")
+
+  def test_is_local_model_path(self):
+    for path in ("/abs/x", "./x", "../x", "~/x"):
+      with self.subTest(path=path):
+        self.assertTrue(generate_krea2.is_local_model_path(path))
+    cwd = os.getcwd()
+    os.chdir(self.path)
+    try:
+      os.makedirs(os.path.join("models", "Krea-2-Turbo"))
+      self.assertTrue(generate_krea2.is_local_model_path(os.path.join("models", "Krea-2-Turbo")))
+      for path in ("krea/Krea-2-Turbo", "org/name", "Krea-2-Turbo"):
+        with self.subTest(path=path):
+          self.assertFalse(generate_krea2.is_local_model_path(path))
+    finally:
+      os.chdir(cwd)
+
+  def test_hf_repo_id_is_not_waited_for(self):
+    clock, sleep, sleeps = self._fake_clock()
+    with mock.patch.object(generate_krea2.max_logging, "log") as log:
+      self.assertEqual(generate_krea2.wait_for_model_dir("krea/Krea-2-Turbo", 600, sleep=sleep, clock=clock), 0.0)
+    self.assertEqual(sleeps, [])
+    self.assertEqual(log.call_count, 1)
+    self.assertIn("ignored", log.call_args.args[0])
+    self.assertIn("krea/Krea-2-Turbo", log.call_args.args[0])
+
+  def test_real_threads(self):
+    timer = threading.Timer(0.2, self._mark, args=(".krea2_fetch_complete",))
+    timer.start()
+    self.addCleanup(timer.cancel)
+    with mock.patch.object(generate_krea2.max_logging, "log"):
+      waited = generate_krea2.wait_for_model_dir(self.path, 10, poll_s=0.05)
+    self.assertIsNotNone(waited)
+    self.assertGreater(waited, 0.1)
+    self.assertLess(waited, 5.0)
 
 
 def _set_model_specific_special_tokens(message):

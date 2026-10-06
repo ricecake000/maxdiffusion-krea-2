@@ -49,13 +49,17 @@ limitations under the License.
 #     skip_jax_distributed_system=True krea2_weight_cache_dir=/path/to/weights krea2_weight_cache_build_only=True
 #
 # Cold start on a node whose caches are still arriving: krea2_weight_cache_wait_s=<n> waits up to n s per component
-# for its weight cache directory, aot_cache_gcs=gs://<bucket>/<prefix> fetches each lazily loaded executable missing
-# in aot_cache_dir from the bucket. "[TIMING] Startup timeline" lists the startup marks (seconds since
-# KREA2_PROCESS_T0 when the shell wrapper sets it, else since this module started importing):
+# for its weight cache directory, krea2_model_wait_s=<n> waits up to n s (after the mesh, before the first read of
+# pretrained_model_name_or_path) for the model fetch's .krea2_fetch_slim / .krea2_fetch_complete marker (only for
+# a local directory; a Hugging Face repo id is downloaded, never waited for),
+# aot_cache_gcs=gs://<bucket>/<prefix> fetches each lazily loaded executable missing in aot_cache_dir from the
+# bucket. "[TIMING] Startup timeline" lists the startup marks (seconds since KREA2_PROCESS_T0 when the shell wrapper
+# sets it, else since this module started importing):
 #
 #   KREA2_PROCESS_T0=$(date +%s.%N) python src/maxdiffusion/generate_krea2.py \
-#     src/maxdiffusion/configs/base_krea2_turbo_v6e1.yml krea2_weight_cache_dir=/path/to/weights \
-#     aot_cache_dir=/path/to/aot krea2_weight_cache_wait_s=900 aot_cache_gcs=gs://bucket/aot prompt="a fox in the snow"
+#     src/maxdiffusion/configs/base_krea2_turbo_v6e1.yml pretrained_model_name_or_path=/path/to/Krea-2-Turbo \
+#     krea2_weight_cache_dir=/path/to/weights aot_cache_dir=/path/to/aot krea2_weight_cache_wait_s=900 \
+#     krea2_model_wait_s=900 aot_cache_gcs=gs://bucket/aot prompt="a fox in the snow"
 
 # pylint: disable=wrong-import-position
 import time
@@ -103,6 +107,7 @@ STARTUP_TIMELINE_ORDER = (
     "late_imports",
     "tpu_init",
     "mesh",
+    "model_dir",
     "shapes",
     "tokenizer",
     "load_done",
@@ -226,6 +231,73 @@ def resolve_weight_cache_wait_s(config) -> int:
   if isinstance(value, bool) or not isinstance(value, int) or value < 0:
     raise ValueError(f"krea2_weight_cache_wait_s must be an integer >= 0 (seconds, 0 = off), got {value!r}")
   return value
+
+
+# Written last by the model fetch (fetch_model.py / gcs_cache.py pull-slim): slim and full fetch.
+MODEL_FETCH_MARKERS = (".krea2_fetch_slim", ".krea2_fetch_complete")
+
+
+def resolve_model_wait_s(config) -> int:
+  """`krea2_model_wait_s` as an int >= 0 (0 when the key is missing); ValueError otherwise."""
+  value = getattr(config, "krea2_model_wait_s", 0)
+  if value is None or value == "":
+    return 0
+  if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+    raise ValueError(f"krea2_model_wait_s must be an integer >= 0 (seconds, 0 = off), got {value!r}")
+  return value
+
+
+def _model_fetch_marker_exists(path) -> bool:
+  return any(os.path.isfile(os.path.join(path, name)) for name in MODEL_FETCH_MARKERS)
+
+
+def is_local_model_path(path) -> bool:
+  """True when `path` names a local model directory, False for a Hugging Face repo id.
+
+  Local: an absolute path, one starting with "." or "~" (`./x`, `../x`, `~/x`)
+  or an existing relative directory. Anything else (`krea/Krea-2-Turbo`,
+  `org/name`) is a repo id. Only classifies; expands nothing.
+  """
+  return os.path.isabs(path) or path.startswith((".", "~")) or os.path.isdir(path)
+
+
+def wait_for_model_dir(path, wait_s, poll_s=0.5, sleep=time.sleep, clock=time.monotonic):
+  """Waits up to `wait_s` seconds for a fetch marker in `path`; returns the seconds waited, None on timeout.
+
+  For a local model directory still being fetched while the process starts:
+  the fetch writes `.krea2_fetch_slim` (slim) or `.krea2_fetch_complete`
+  (full) last, so either marker means the directory is complete. Returns 0.0
+  at once (no log) when `wait_s` is not positive or a marker already exists,
+  and 0.0 after one log line when `path` is not a local model path
+  (is_local_model_path: a Hugging Face repo id is downloaded, not waited for).
+  A local path that does not exist yet is waited for (the fetch creates it).
+  Otherwise logs one line at the start and one when a marker appears (or the
+  wait times out), polling every `poll_s` seconds. Never raises; the caller's
+  normal read of the directory decides.
+  """
+  if wait_s <= 0:
+    return 0.0
+  if not is_local_model_path(path):
+    max_logging.log(
+        f"[model] krea2_model_wait_s={wait_s} ignored: {path!r} is not a local model directory"
+        " (a Hugging Face repo id is downloaded, not waited for)"
+    )
+    return 0.0
+  if _model_fetch_marker_exists(path):
+    return 0.0
+  max_logging.log(f"[model] waiting up to {wait_s} s for a fetch marker in {path} (fetch in progress)")
+  start = clock()
+  deadline = start + wait_s
+  while True:
+    now = clock()
+    if now >= deadline:
+      max_logging.log(f"[model] {path}: no fetch marker within {wait_s} s")
+      return None
+    sleep(min(poll_s, deadline - now))
+    if _model_fetch_marker_exists(path):
+      waited = clock() - start
+      max_logging.log(f"[model] {path}: fetch marker appeared after {waited:.1f} s")
+      return waited
 
 
 def partition_prompts(prompt_str: str, batch_size: int) -> List[str]:
@@ -1000,6 +1072,7 @@ def main(argv):
   # The cold-start knobs, too.
   aot_cache_gcs = resolve_aot_cache_gcs(config)
   weight_cache_wait_s = resolve_weight_cache_wait_s(config)
+  model_wait_s = resolve_model_wait_s(config)
   if config.attention == "flash_custom":
     max_logging.log(
         f"flash_custom kernel choice: {attention_kernel_choice} ('auto' = hybrid on TPU v6e, flash elsewhere)"
@@ -1063,6 +1136,10 @@ def main(argv):
   vae_mesh = Mesh(vae_devices_array, ("redundant", "vae_spatial"))
   vae_logical_axis_rules = getattr(config, "vae_logical_axis_rules", None)
   timeline.mark("mesh")
+
+  # A cold start may run this process beside the model fetch: wait for its marker before the first read.
+  wait_for_model_dir(config.pretrained_model_name_or_path, model_wait_s)
+  timeline.mark("model_dir")
 
   # 3. Resolve weights repository snapshot
   repo_id = config.pretrained_model_name_or_path

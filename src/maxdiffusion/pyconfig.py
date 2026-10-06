@@ -65,12 +65,12 @@ def _validate_training_model_name(model_name: str | None):
 
 
 def _validate_krea2_cold_start_keys(raw_keys) -> None:
-  """Normalizes and validates `aot_cache_gcs` and `krea2_weight_cache_wait_s` (Krea 2 configs only).
+  """Normalizes and validates `aot_cache_gcs`, `krea2_weight_cache_wait_s` and `krea2_model_wait_s` (Krea 2 only).
 
   `aot_cache_gcs`: '' (off) or `gs://<bucket>[/<prefix>]`, stored without
-  surrounding quotes or a trailing slash. `krea2_weight_cache_wait_s`: an int
-  >= 0 (0 = off). Raises ValueError otherwise. Configs without the keys are
-  untouched.
+  surrounding quotes or a trailing slash. `krea2_weight_cache_wait_s` and
+  `krea2_model_wait_s`: an int >= 0 (0 = off). Raises ValueError otherwise.
+  Configs without the keys are untouched.
   """
   if "aot_cache_gcs" in raw_keys:
     try:
@@ -81,6 +81,10 @@ def _validate_krea2_cold_start_keys(raw_keys) -> None:
     value = raw_keys["krea2_weight_cache_wait_s"]
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
       raise ValueError(f"krea2_weight_cache_wait_s must be an integer >= 0 (seconds, 0 = off), got {value!r}")
+  if "krea2_model_wait_s" in raw_keys:
+    value = raw_keys["krea2_model_wait_s"]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+      raise ValueError(f"krea2_model_wait_s must be an integer >= 0 (seconds, 0 = off), got {value!r}")
 
 
 def string_to_bool(s: str) -> bool:
