@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Krea 2 Turbo — personal endpoint</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="mark">
+    <span class="mark-name">Krea 2 Turbo</span>
+    <span class="mark-sub">personal endpoint</span>
+  </div>
+
+  <div class="topbar-right">
+    <span class="status" id="status" data-state="unknown">
+      <span class="status-dot" aria-hidden="true"></span>
+      <span class="status-text" id="status-text">checking</span>
+    </span>
+    <button type="button" class="btn btn-quiet" id="open-settings">Endpoint</button>
+  </div>
+</header>
+
+<main class="workbench">
+
+  <!-- ── console ───────────────────────────────────────────── -->
+  <section class="console" aria-label="Generation controls">
+    <form id="console-form" novalidate>
+
+      <div class="field">
+        <label class="eyebrow" for="prompt">Prompt</label>
+        <textarea id="prompt" rows="7" spellcheck="true"
+          placeholder="a cinematic photograph of a fox walking through fresh snow"></textarea>
+        <p class="counter"><span id="counter">0</span> / 4000</p>
+      </div>
+
+      <div class="field">
+        <span class="eyebrow" id="size-label">Size</span>
+        <div class="segments" role="radiogroup" aria-labelledby="size-label" id="sizes"></div>
+        <span class="eyebrow" id="aspect-label">Aspect ratio</span>
+        <div class="aspects" role="radiogroup" aria-labelledby="aspect-label" id="aspects"></div>
+        <p class="fixed-note" id="preset-note">The preset list loads from the server once it is ready.</p>
+      </div>
+
+      <div class="field">
+        <span class="eyebrow" id="format-label">Format</span>
+        <div class="segments" role="radiogroup" aria-labelledby="format-label" id="formats"></div>
+      </div>
+
+      <div class="field">
+        <span class="eyebrow" id="seed-label">Seed</span>
+        <div class="seed" role="radiogroup" aria-labelledby="seed-label">
+          <label class="seed-mode">
+            <input type="radio" name="seed-mode" value="random" checked>
+            <span>New each time</span>
+          </label>
+          <label class="seed-mode">
+            <input type="radio" name="seed-mode" value="fixed">
+            <span>Fixed</span>
+          </label>
+          <input type="number" id="seed" class="seed-value" min="0" max="2147483647" step="1"
+            inputmode="numeric" placeholder="0 – 2147483647" aria-label="Seed value" disabled>
+        </div>
+      </div>
+
+      <button type="submit" class="btn btn-go" id="generate">
+        <span id="generate-label">Generate image</span>
+        <kbd>⌘ ⏎</kbd>
+      </button>
+
+      <p class="notice" id="notice" role="status" aria-live="polite" hidden></p>
+    </form>
+  </section>
+
+  <!-- ── stage ─────────────────────────────────────────────── -->
+  <section class="stage" aria-label="Result">
+    <div class="mat" id="mat" data-busy="false">
+      <img id="image" alt="" hidden>
+      <p class="mat-empty" id="mat-empty">
+        Nothing rendered yet. Write a prompt and the trace below fills in as the image arrives.
+      </p>
+    </div>
+
+    <!-- signature: the pipeline trace -->
+    <figure class="trace" id="trace" data-state="idle">
+      <figcaption class="eyebrow trace-head">
+        <span>Pipeline</span>
+        <span class="trace-total" id="trace-total">—</span>
+      </figcaption>
+      <div class="bar" id="bar" role="img" aria-label="Pipeline stage durations"></div>
+      <div class="legend" id="legend"></div>
+    </figure>
+
+    <div class="readout" id="readout" hidden>
+      <dl class="facts">
+        <div><dt>Seed</dt><dd id="fact-seed">—</dd></div>
+        <div><dt>Preset</dt><dd id="fact-preset">—</dd></div>
+        <div><dt>Size</dt><dd id="fact-size">—</dd></div>
+        <div><dt>Format</dt><dd id="fact-format">—</dd></div>
+        <div><dt>Id</dt><dd id="fact-id">—</dd></div>
+      </dl>
+      <div class="readout-actions">
+        <button type="button" class="btn btn-quiet" id="download">Download</button>
+        <button type="button" class="btn btn-quiet" id="restore">Use these settings</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── session strip ─────────────────────────────────────── -->
+  <section class="session" id="session" aria-label="This session" hidden>
+    <h2 class="eyebrow session-head">
+      <span>This session</span>
+      <span class="session-count" id="session-count"></span>
+    </h2>
+    <ol class="strip" id="strip"></ol>
+  </section>
+
+</main>
+
+<dialog id="settings" class="sheet">
+  <form method="dialog" id="settings-form">
+    <h2 class="sheet-title">Endpoint</h2>
+
+    <label class="eyebrow" for="endpoint">Server address</label>
+    <input type="url" id="endpoint" class="text" placeholder="http://localhost:8000" spellcheck="false">
+
+    <label class="eyebrow" for="token">Bearer token</label>
+    <input type="password" id="token" class="text" placeholder="KREA2_API_TOKEN" spellcheck="false"
+      autocomplete="off">
+
+    <p class="sheet-note">
+      Both values stay in this browser's local storage. Anyone with access to this
+      browser profile can read the token.
+    </p>
+
+    <div class="sheet-actions">
+      <button type="button" class="btn btn-quiet" id="forget">Forget token</button>
+      <button type="submit" class="btn btn-go btn-compact" value="save">Save</button>
+    </div>
+  </form>
+</dialog>
+
+<script src="app.js"></script>
+</body>
+</html>

@@ -49,6 +49,7 @@ training = ["accelerate", "datasets", "protobuf", "tensorboard", "Jinja2"]
 test = [
     "compel",
     "datasets",
+    "httpx",
     "Jinja2",
     "invisible-watermark",
     "k-diffusion",
@@ -67,7 +68,7 @@ test = [
 torch = ["torch", "accelerate"]
 flax = ["jax", "jaxlib", "flax"]
 dev = [
-    "urllib3", "black", "isort", "ruff", "hf-doc-builder", "compel", "datasets", "Jinja2", 
+    "urllib3", "black", "isort", "ruff", "hf-doc-builder", "compel", "datasets", "httpx", "Jinja2", 
     "invisible-watermark", "k-diffusion", "librosa", "omegaconf", "parameterized", "pytest", 
     "pytest-timeout", "pytest-xdist", "requests-mock", "safetensors", "sentencepiece", "scipy", 
     "torchvision", "accelerate", "protobuf", "tensorboard", "torch", "jax", "jaxlib", "flax"
@@ -80,6 +81,7 @@ Repository = "https://github.com/AI-Hypercomputer/maxdiffusion.git"
 [project.scripts]
 maxdiffusion-cli = "maxdiffusion.commands.maxdiffusion_cli:main"
 install_maxdiffusion_github_deps = "install_maxdiffusion_extra_deps.install_github_deps:main"
+krea2-api = "maxdiffusion.serve_krea2:main"
 
 [tool.hatch.metadata]
 allow-direct-references = true

@@ -6,6 +6,7 @@ av
 chex
 datasets
 einops
+fastapi>=0.115.0
 flax
 ftfy
 google-cloud-storage
@@ -38,6 +39,7 @@ tokamax
 tokenizers
 torchax>=0.0.11
 transformers<5.0.0
+uvicorn>=0.30.0
 
 # pinning torch and torchvision to specific versions to avoid
 # installing GPU versions from PyPI when running seed-env

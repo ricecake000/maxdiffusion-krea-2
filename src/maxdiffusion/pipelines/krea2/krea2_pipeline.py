@@ -58,6 +58,27 @@ def vae_decode_pass(graphdef, state, rest_of_state, latents):
   return wan_vae.decode(latents, AutoencoderKLWanCache(wan_vae), return_dict=False)[0]
 
 
+def resolve_latent_seed(seed: Optional[int], config) -> int:
+  """Picks the initial-noise seed: `seed`, else `config.seed`, else the current time.
+
+  Args:
+    seed: per-call seed (None = not given).
+    config: object with an optional `seed` attribute (None = not set).
+
+  Returns:
+    A non-negative int seed.
+  """
+  if seed is not None:
+    return int(seed)
+  config_seed = getattr(config, "seed", None)
+  if config_seed is not None:
+    return int(config_seed)
+  return int(time.time()) & 0x7FFFFFFF
+
+
+KREA2_OUTPUT_TYPES = ("file", "pil")
+
+
 def is_classifier_free_guidance_enabled(guidance_scale: float, enabled: Optional[bool] = None) -> bool:
   """Resolves the explicit CFG switch while preserving direct-call defaults."""
   if enabled is None:
@@ -578,18 +599,21 @@ class FlaxKrea2Pipeline:
     prompt_embeds_mask = attention_mask[:, prefix_idx:].astype(jnp.bool_)
     return prompt_embeds, prompt_embeds_mask
 
-  def _prepare_latents(self, batch_size, height, width):
+  def _prepare_latents(self, batch_size, height, width, seed=None):
+    """Draws packed initial noise `(B, (H/16)*(W/16), 64)`; `seed` resolves via `resolve_latent_seed`.
+
+    Uses a private `np.random.RandomState(seed)`, which yields the same sequence
+    as the former `np.random.seed(seed); np.random.randn(...)` without touching
+    numpy's global RNG (safe for concurrent callers).
+    """
     num_channels_latents = 16
     latent_height = height // 8
     latent_width = width // 8
     latent_shape = (batch_size, num_channels_latents, latent_height, latent_width)
 
-    seed_val = getattr(self._config, "seed", None)
-    if seed_val is None:
-      seed_val = int(time.time()) & 0x7FFFFFFF
+    seed_val = resolve_latent_seed(seed, self._config)
     max_logging.log(f"Generating gaussian noise with seed: {seed_val} and unpacked shape: {latent_shape}...")
-    np.random.seed(seed_val)
-    latents_unpacked = np.random.randn(*latent_shape).astype(np.float32)
+    latents_unpacked = np.random.RandomState(seed_val).randn(*latent_shape).astype(np.float32)
     # Pack 2x2 latent patches into the channel dim: (B, (H/16)*(W/16), 64)
     return pack_latents(latents_unpacked)
 
@@ -610,17 +634,27 @@ class FlaxKrea2Pipeline:
       save_outputs: bool = True,
       do_classifier_free_guidance: Optional[bool] = None,
       min_text_tokens: int = 0,
+      seed: Optional[int] = None,
+      output_type: str = "file",
   ):
     """`min_text_tokens` forces the compacted text bucket to at least this many
     tokens (rounded up to the compaction multiple, clipped to the text length)
     for the prompt and the negative prompt, so the precompile mode can compile
-    longer text buckets from one short prompt. No effect without compaction."""
-    self._setup_jit_functions()
+    longer text buckets from one short prompt. No effect without compaction.
+
+    `seed` seeds the initial noise (None = `config.seed`, else the time; ignored
+    when `latents` is given); the resolved seed is `trace["seed"]` (None with
+    custom latents). `output_type="file"` writes PNGs to `output_dir` and returns
+    their paths; `"pil"` writes nothing and returns the PIL images (process 0
+    only; other processes return `[]`). With `save_outputs=False` the call
+    returns `([], trace)` before any host transfer, whatever `output_type`."""
+    if output_type not in KREA2_OUTPUT_TYPES:
+      raise ValueError(f"output_type must be one of {KREA2_OUTPUT_TYPES}, got {output_type!r}.")
 
     if isinstance(prompt, str):
       prompts = [prompt] * batch_size
     else:
-      prompts = prompt
+      prompts = list(prompt)
 
     do_classifier_free_guidance = is_classifier_free_guidance_enabled(
         guidance_scale, do_classifier_free_guidance
@@ -630,7 +664,13 @@ class FlaxKrea2Pipeline:
     if isinstance(negative_prompt, str):
       negative_prompts = [negative_prompt] * batch_size
     else:
-      negative_prompts = negative_prompt
+      negative_prompts = list(negative_prompt)
+    if len(prompts) != batch_size:
+      raise ValueError(f"Got {len(prompts)} prompt(s) for batch_size {batch_size}.")
+    if len(negative_prompts) != batch_size:
+      raise ValueError(f"Got {len(negative_prompts)} negative prompt(s) for batch_size {batch_size}.")
+
+    self._setup_jit_functions()
 
     # The VAE downsamples 8x and latents are packed into 2x2 patches, so height
     # and width must be multiples of 16. Round up (with a warning) like the
@@ -654,8 +694,10 @@ class FlaxKrea2Pipeline:
       latents_jax = jnp.array(latents)
       if latents_jax.ndim == 4:
         latents_jax = pack_latents(np.asarray(latents_jax))
+      seed_used = None
     else:
-      latents_jax = self._prepare_latents(batch_size, height, width)
+      seed_used = resolve_latent_seed(seed, self._config)
+      latents_jax = self._prepare_latents(batch_size, height, width, seed=seed_used)
 
     img_ids_val = prepare_krea2_image_ids(batch_size, grid_height, grid_width)
 
@@ -679,7 +721,7 @@ class FlaxKrea2Pipeline:
         sigmas=sigmas_custom,
     )
 
-    trace = {}
+    trace = {"seed": seed_used}
 
     with self.mesh, nn_partitioning.axis_rules(self._config.logical_axis_rules):
       # -----------------------------------------------------------------
@@ -872,15 +914,20 @@ class FlaxKrea2Pipeline:
     else:
       images_numpy = np.array(images)
 
-    # Only process 0 writes files: on multihost every process holds the full
-    # gathered batch, and concurrent writes to a shared filesystem would race.
+    # Only process 0 writes files (or returns images): on multihost every
+    # process holds the full gathered batch, and concurrent writes to a shared
+    # filesystem would race.
     saved_paths = []
+    pil_images = []
     if jax.process_index() == 0:
       for b_idx in range(batch_size):
         image_np = np.array(images_numpy[b_idx] * 255.0, dtype=np.uint8)
         if image_np.shape[0] == 3:
           image_np = image_np.transpose(1, 2, 0)
         img = Image.fromarray(image_np)
+        if output_type == "pil":
+          pil_images.append(img)
+          continue
 
         if batch_size > 1:
           batch_output_name = output_name.replace(".png", f"_b{b_idx}.png")
@@ -891,4 +938,6 @@ class FlaxKrea2Pipeline:
         max_logging.log(f" -> Saved image: {output_png_path} | Prompt: '{prompts[b_idx]}'")
         saved_paths.append(output_png_path)
 
+    if output_type == "pil":
+      return pil_images, trace
     return saved_paths, trace

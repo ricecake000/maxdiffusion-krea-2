@@ -69,6 +69,7 @@ import time
 _PROCESS_T0 = time.time()
 
 import atexit
+import copy
 import dataclasses
 import gc
 import inspect
@@ -78,7 +79,7 @@ import math
 import os
 import threading
 from contextlib import ExitStack
-from typing import List, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 from absl import app
 import jax
@@ -849,6 +850,36 @@ def resolve_generation_size(config) -> Tuple[int, int, str]:
   return resolution.height, resolution.width, description
 
 
+def resolve_text_buckets(
+    raw_tokens, text_compaction_multiple, max_sequence_length, name="krea2_precompile_text_tokens"
+) -> List[int]:
+  """Text buckets (ascending, unique) the pipeline's compaction makes of the token counts `raw_tokens`.
+
+  `raw_tokens` is a positive int or a list/tuple of them (None or [] means
+  [128]); each is rounded up to `text_compaction_multiple` and clipped to
+  `max_sequence_length` like the pipeline's compaction. Without compaction
+  (`text_compaction_multiple <= 0`) the text always has the full length, the
+  only bucket. Raises ValueError (naming `name`) on an entry that is not a
+  positive int.
+  """
+  from maxdiffusion.models.krea2.util import round_up_to_multiple
+
+  if raw_tokens is None:
+    raw_tokens = []
+  tokens = list(raw_tokens) if isinstance(raw_tokens, (list, tuple)) else [raw_tokens]
+  for value in tokens:
+    # bool is an int subclass; True would silently mean a 1-token bucket.
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+      raise ValueError(f"{name} entries must be positive ints, got {value!r} in {raw_tokens!r}.")
+  if not tokens:
+    tokens = [128]
+
+  max_length = int(max_sequence_length)
+  if text_compaction_multiple <= 0:
+    return [max_length]
+  return sorted({min(round_up_to_multiple(value, text_compaction_multiple), max_length) for value in tokens})
+
+
 def resolve_precompile_plan(config, text_compaction_multiple) -> List[Tuple[Krea2Resolution, int]]:
   """Every (resolution, text bucket) to compile, in order: resolutions in spec order, buckets ascending.
 
@@ -859,8 +890,6 @@ def resolve_precompile_plan(config, text_compaction_multiple) -> List[Tuple[Krea
   only bucket. Raises ValueError on a bad spec, a bad bucket, or a non-empty
   spec without `aot_cache_dir` (nothing could be saved).
   """
-  from maxdiffusion.models.krea2.util import round_up_to_multiple
-
   spec = getattr(config, "krea2_precompile", "")
   resolutions = parse_krea2_precompile("" if spec is None else spec)
   if not resolutions:
@@ -868,22 +897,11 @@ def resolve_precompile_plan(config, text_compaction_multiple) -> List[Tuple[Krea
   if not getattr(config, "aot_cache_dir", ""):
     raise ValueError("krea2_precompile needs aot_cache_dir: the compiled executables are only kept in the AOT cache.")
 
-  raw_tokens = getattr(config, "krea2_precompile_text_tokens", None)
-  if raw_tokens is None:
-    raw_tokens = []
-  tokens = list(raw_tokens) if isinstance(raw_tokens, (list, tuple)) else [raw_tokens]
-  for value in tokens:
-    # bool is an int subclass; True would silently mean a 1-token bucket.
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-      raise ValueError(f"krea2_precompile_text_tokens entries must be positive ints, got {value!r} in {raw_tokens!r}.")
-  if not tokens:
-    tokens = [128]
-
-  max_length = int(config.max_sequence_length)
-  if text_compaction_multiple <= 0:
-    buckets = [max_length]
-  else:
-    buckets = sorted({min(round_up_to_multiple(value, text_compaction_multiple), max_length) for value in tokens})
+  buckets = resolve_text_buckets(
+      getattr(config, "krea2_precompile_text_tokens", None),
+      text_compaction_multiple,
+      config.max_sequence_length,
+  )
   return [(resolution, bucket) for resolution in resolutions for bucket in buckets]
 
 
@@ -985,7 +1003,208 @@ def log_precompile_summary(records) -> None:
   max_logging.log("=" * 80)
 
 
-def main(argv):
+# Trace entries summed into a pass's time; swap-in entries are only present for offloaded components.
+KREA2_TIMED_PHASES = (
+    "text_encoder_swap_in",
+    "prompt_encoding",
+    "transformer_swap_in",
+    "denoise_loop",
+    "vae_decode",
+)
+
+
+@dataclasses.dataclass
+class Krea2Runtime:
+  """A loaded Krea 2 pipeline that serves many generations (built by `create_runtime`).
+
+  Every method that calls the pipeline enters the LoRA interceptors around
+  that one call (a no-op interceptor without adapters), so any (re)trace of
+  the jitted transformer sees the configured adapters, exactly like the CLI.
+  The runtime is not thread-safe for pipeline calls: run `generate`,
+  `warmup_default` and `precompile` from one thread at a time. `text_bucket`
+  may run concurrently with them (it tokenizes with a private tokenizer copy).
+
+  Attributes:
+    config: the pyconfig config the runtime was built from.
+    pipeline: the `FlaxKrea2Pipeline`.
+    params: transformer params (device tree, or host tree when offloaded).
+    qwen3_params: text encoder params (device tree, or host tree when offloaded).
+    lora_interceptors: flax method interceptors of the configured LoRA adapters.
+    default_prompts: the config's prompts (`prompt` / `prompt_file`), `batch_size` of them.
+    default_latents: custom starting noise from `latents_path`, else None.
+    default_height: the config's output height (presets applied).
+    default_width: the config's output width (presets applied).
+    load_time: seconds of model loading and device placement.
+    timeline: the process startup timeline.
+    precompile_plan: the `krea2_precompile` plan (empty unless precompile mode).
+    text_compaction_multiple: the generate-side mirror of the pipeline's compaction multiple.
+    timed_phases: trace entries summed into a pass's time.
+    load_trace: per-stage load seconds.
+  """
+
+  config: Any
+  pipeline: Any
+  params: Any
+  qwen3_params: Any
+  lora_interceptors: tuple
+  default_prompts: List[str]
+  default_latents: Any
+  default_height: int
+  default_width: int
+  load_time: float
+  timeline: "StartupTimeline"
+  precompile_plan: list
+  text_compaction_multiple: int
+  timed_phases: tuple = KREA2_TIMED_PHASES
+  load_trace: dict = dataclasses.field(default_factory=dict)
+  _bucket_tokenizer: Any = dataclasses.field(default=None, init=False, repr=False, compare=False)
+  _bucket_lock: Any = dataclasses.field(default_factory=threading.Lock, init=False, repr=False, compare=False)
+
+  def call_kwargs(self, *, height, width, seed=None, output_type="pil", latents=None) -> dict:
+    """Keyword arguments of one pipeline call (everything but the prompt and the output name)."""
+    config = self.config
+    return {
+        "params": self.params,
+        "qwen3_params": self.qwen3_params,
+        "height": height,
+        "width": width,
+        "num_inference_steps": config.num_inference_steps,
+        "guidance_scale": config.guidance_scale,
+        "do_classifier_free_guidance": config.do_classifier_free_guidance,
+        "negative_prompt": config.negative_prompt,
+        "batch_size": config.batch_size,
+        "latents": latents,
+        "output_dir": config.output_dir,
+        "seed": seed,
+        "output_type": output_type,
+    }
+
+  def _interceptors(self) -> ExitStack:
+    """An ExitStack that has entered every LoRA interceptor; use it as a context manager."""
+    stack = ExitStack()
+    try:
+      for interceptor in self.lora_interceptors:
+        stack.enter_context(nn.intercept_methods(interceptor))
+    except BaseException:
+      stack.close()
+      raise
+    return stack
+
+  def precompile(self, plan) -> List[dict]:
+    """Compiles (or loads) every `(resolution, text bucket)` of `plan` into the AOT cache; see `run_precompile`.
+
+    The executables depend on the text bucket, not on the prompt text, so a
+    fixed short prompt and an empty negative prompt leave the bucket to the
+    plan entry alone (a long configured prompt would force a larger one).
+    """
+    call_kwargs = self.call_kwargs(height=self.default_height, width=self.default_width, latents=None)
+    with self._interceptors():
+      return run_precompile(
+          self.pipeline,
+          plan,
+          {**call_kwargs, "negative_prompt": ""},
+          [KREA2_PRECOMPILE_PROMPT] * self.config.batch_size,
+      )
+
+  def serving_plan(self, presets_spec: str, text_tokens: Sequence[int]) -> List[Tuple[Krea2Resolution, int]]:
+    """Every `(resolution, text bucket)` a server warms: `presets_spec` resolutions x the buckets of `text_tokens`.
+
+    `presets_spec` uses the `krea2_precompile` syntax ("all", "2k", "1k@16:9",
+    comma-separated); `text_tokens` are positive ints ([] means [128]) rounded
+    to buckets exactly like `resolve_precompile_plan`. Raises ValueError on a
+    bad or empty spec or a bad token count.
+    """
+    resolutions = parse_krea2_precompile(presets_spec)
+    if not resolutions:
+      raise ValueError(f"The serving preset spec {presets_spec!r} selects no resolution.")
+    buckets = resolve_text_buckets(
+        list(text_tokens), self.text_compaction_multiple, self.config.max_sequence_length, name="text_tokens"
+    )
+    return [(resolution, bucket) for resolution in resolutions for bucket in buckets]
+
+  def warmup_default(self) -> dict:
+    """The CLI's warmup pass at the default prompts, size and latents, then a synchronous AOT save; returns its trace."""
+    max_logging.log("Running compile warmup (zero-execution when AOT cache is enabled)...")
+    call_kwargs = self.call_kwargs(
+        height=self.default_height, width=self.default_width, output_type="file", latents=self.default_latents
+    )
+    with self._interceptors():
+      with aot_cache.warmup_mode():
+        _, trace = self.pipeline(
+            prompt=self.default_prompts,
+            output_name="krea2_warmup.png",
+            save_outputs=False,
+            **call_kwargs,
+        )
+    # Persist newly-seen shape signatures synchronously. Saving in the
+    # background competes with the first real request for CPU and disk I/O.
+    aot_cache.save_pending()
+    return trace
+
+  def generate(
+      self,
+      prompts: List[str],
+      *,
+      height: int,
+      width: int,
+      seed: Optional[int] = None,
+      output_type: str = "pil",
+      output_name: Optional[str] = None,
+      latents=None,
+  ) -> Tuple[list, dict]:
+    """One pipeline call for exactly `batch_size` prompts; returns `(outputs, trace)`.
+
+    `outputs` are PIL images (`output_type="pil"`) or the saved PNG paths
+    (`"file"`, written to `config.output_dir` as `output_name`, default
+    `config.output_name`). `trace` has the phase seconds (prompt_encoding,
+    denoise_loop, vae_decode), the text buckets and the resolved `seed` (None
+    with custom `latents`).
+    """
+    call_kwargs = self.call_kwargs(height=height, width=width, seed=seed, output_type=output_type, latents=latents)
+    with self._interceptors():
+      return self.pipeline(prompt=list(prompts), output_name=output_name or self.config.output_name, **call_kwargs)
+
+  def text_bucket_for_tokens(self, valid_tokens: int) -> int:
+    """The text bucket the pipeline's compaction picks for `valid_tokens` valid text tokens."""
+    from maxdiffusion.models.krea2.util import round_up_to_multiple
+
+    max_length = int(self.config.max_sequence_length)
+    multiple = int(self.pipeline.text_compaction_multiple)
+    if multiple <= 0:
+      return max_length
+    return min(round_up_to_multiple(max(int(valid_tokens), 1), multiple), max_length)
+
+  def text_bucket(self, prompts: List[str]) -> int:
+    """The text bucket (= text executable) the pipeline would pick for `prompts`, without touching a device.
+
+    Tokenizes like `FlaxKrea2Pipeline.encode_prompt` and counts the valid
+    tokens after the template's system prefix like `compact_text_embeddings`.
+    A private copy of the tokenizer is used: Hugging Face fast tokenizers raise
+    "Already borrowed" when one instance is used by two threads at once.
+    """
+    from maxdiffusion.models.krea2.util import KREA2_PROMPT_TEMPLATE_START_IDX
+    from maxdiffusion.pipelines.krea2.krea2_pipeline import tokenize_krea2_prompts
+
+    with self._bucket_lock:
+      if self._bucket_tokenizer is None:
+        self._bucket_tokenizer = copy.deepcopy(self.pipeline.tokenizer)
+      _, attention_mask, _ = tokenize_krea2_prompts(
+          self._bucket_tokenizer, list(prompts), int(self.config.max_sequence_length)
+      )
+    valid = np.asarray(attention_mask)[:, KREA2_PROMPT_TEMPLATE_START_IDX:].astype(bool).sum(axis=1)
+    return self.text_bucket_for_tokens(int(valid.max()) if valid.size else 0)
+
+
+def create_runtime(argv) -> Optional["Krea2Runtime"]:
+  """Loads config, model and pipeline exactly like the CLI and returns the long-lived runtime.
+
+  `argv` is the CLI's (`argv[0]` ignored, then an optional config path and
+  `key=value` overrides). Everything up to the first pipeline call runs here:
+  config, resolution and precompile plan, mesh, weights, tokenizer, pipeline
+  and AOT cache install (the startup timeline's "pipeline" mark), plus the
+  custom latents of `latents_path`. Returns None in weight-cache build-only
+  mode, which ends before any device placement.
+  """
   process_t0, process_t0_origin = resolve_process_t0(os.environ.get("KREA2_PROCESS_T0"), _PROCESS_T0)
   timeline = StartupTimeline(process_t0)
   timeline.mark("imports")
@@ -1528,7 +1747,7 @@ def main(argv):
           )
           timeline.mark("load_done")
           timeline.log()
-          return
+          return None
 
         params = flax.core.freeze(params)
         qwen3_params = flax.core.freeze(qwen3_params)
@@ -1660,80 +1879,70 @@ def main(argv):
     latents_to_use = np.load(config.latents_path)
     max_logging.log(f" -> Custom latents shape: {latents_to_use.shape}")
 
-  call_kwargs = {
-      "params": params,
-      "qwen3_params": qwen3_params,
-      "height": height,
-      "width": width,
-      "num_inference_steps": config.num_inference_steps,
-      "guidance_scale": config.guidance_scale,
-      "do_classifier_free_guidance": config.do_classifier_free_guidance,
-      "negative_prompt": config.negative_prompt,
-      "batch_size": config.batch_size,
-      "latents": latents_to_use,
-      "output_dir": config.output_dir,
-  }
-
-  # Swap-in entries are only present for offloaded components.
-  timed_phases = (
-      "text_encoder_swap_in",
-      "prompt_encoding",
-      "transformer_swap_in",
-      "denoise_loop",
-      "vae_decode",
+  return Krea2Runtime(
+      config=config,
+      pipeline=pipeline,
+      params=params,
+      qwen3_params=qwen3_params,
+      lora_interceptors=tuple(lora_interceptors),
+      default_prompts=list(active_prompts),
+      default_latents=latents_to_use,
+      default_height=height,
+      default_width=width,
+      load_time=load_time,
+      timeline=timeline,
+      precompile_plan=list(precompile_plan),
+      text_compaction_multiple=text_compaction_multiple,
+      load_trace=load_trace,
   )
 
-  def log_swap(trace, component, label):
-    if f"{component}_swap_in" in trace:
-      swap_gib = trace[f"{component}_swap_bytes"] / 1024**3
-      max_logging.log(f"   - {label}: {trace[f'{component}_swap_in']:.2f}s ({swap_gib:.2f} GiB)")
 
-  # One interceptor context spans both passes so every (re)trace of the jitted
-  # transformer step sees the LoRA interceptors.
-  with ExitStack() as stack:
-    for interceptor in lora_interceptors:
-      stack.enter_context(nn.intercept_methods(interceptor))
+def _log_swap(trace, component, label):
+  if f"{component}_swap_in" in trace:
+    swap_gib = trace[f"{component}_swap_bytes"] / 1024**3
+    max_logging.log(f"   - {label}: {trace[f'{component}_swap_in']:.2f}s ({swap_gib:.2f} GiB)")
 
-    if precompile_plan:
-      # Compile and save only: no warmup/timed pass, no image, no profile. The
-      # executables depend on the text bucket, not on the prompt text, so a
-      # fixed short prompt and an empty negative prompt leave the bucket to the
-      # plan entry alone (a long configured prompt would force a larger one).
-      precompile_records = run_precompile(
-          pipeline,
-          precompile_plan,
-          {**call_kwargs, "negative_prompt": ""},
-          [KREA2_PRECOMPILE_PROMPT] * config.batch_size,
+
+def main(argv):
+  runtime = create_runtime(argv)
+  if runtime is None:
+    # Weight-cache build-only mode: create_runtime already logged its summary.
+    return
+  config = runtime.config
+  timeline = runtime.timeline
+  timed_phases = runtime.timed_phases
+
+  # Each runtime call enters the LoRA interceptors around its pipeline call, so
+  # every (re)trace of the jitted transformer step sees them.
+  if runtime.precompile_plan:
+    # Compile and save only: no warmup/timed pass, no image, no profile.
+    precompile_records = runtime.precompile(runtime.precompile_plan)
+    log_precompile_summary(precompile_records)
+    timeline.mark("precompile_done")
+    timeline.log()
+    max_logging.log(f"SUCCESS! Precompile complete for {len(precompile_records)} resolution/text combination(s)!")
+    return
+
+  warmup_trace = runtime.warmup_default()
+  timeline.mark("warmup_done")
+  warmup_time = sum(warmup_trace.get(k, 0.0) for k in timed_phases)
+
+  max_logging.log("Running timed pass at full device speed...")
+  with max_utils.Profiler(config, session_name="krea2_timed"):
+    with jax.profiler.StepTraceAnnotation("krea2_generate", step_num=0):
+      _, main_trace = runtime.generate(
+          runtime.default_prompts,
+          height=runtime.default_height,
+          width=runtime.default_width,
+          output_type="file",
+          output_name=config.output_name,
+          latents=runtime.default_latents,
       )
-      log_precompile_summary(precompile_records)
-      timeline.mark("precompile_done")
-      timeline.log()
-      max_logging.log(f"SUCCESS! Precompile complete for {len(precompile_records)} resolution/text combination(s)!")
-      return
-
-    max_logging.log("Running compile warmup (zero-execution when AOT cache is enabled)...")
-    with aot_cache.warmup_mode():
-      _, warmup_trace = pipeline(
-          prompt=active_prompts,
-          output_name="krea2_warmup.png",
-          save_outputs=False,
-          **call_kwargs,
-      )
-    # Persist newly-seen shape signatures synchronously. Saving in the
-    # background competes with the first real request for CPU and disk I/O.
-    aot_cache.save_pending()
-    timeline.mark("warmup_done")
-    warmup_time = sum(warmup_trace.get(k, 0.0) for k in timed_phases)
-
-    max_logging.log("Running timed pass at full device speed...")
-    with max_utils.Profiler(config, session_name="krea2_timed"):
-      with jax.profiler.StepTraceAnnotation("krea2_generate", step_num=0):
-        _, main_trace = pipeline(prompt=active_prompts, output_name=config.output_name, **call_kwargs)
-    # The pipeline call that decodes also saves the image: timed_done is the end of its VAE decode.
-    if "vae_decode_done_at" in main_trace:
-      timeline.mark("timed_done", at=main_trace["vae_decode_done_at"])
-    timeline.mark("saved")
-    main_time = sum(main_trace.get(k, 0.0) for k in timed_phases)
+  # The pipeline call that decodes also saves the image: timed_done is the end of its VAE decode.
+  if "vae_decode_done_at" in main_trace:
+    timeline.mark("timed_done", at=main_trace["vae_decode_done_at"])
+  timeline.mark("saved")
+  main_time = sum(main_trace.get(k, 0.0) for k in timed_phases)
 
   if getattr(config, "enable_profiler", False) and jax.process_index() == 0:
     profile_dir = os.path.join(config.tensorboard_dir, "krea2_timed")
@@ -1758,17 +1967,17 @@ def main(argv):
   max_logging.log("=" * 80)
   max_logging.log("KREA 2 LATENCY & TIMING BREAKDOWN")
   max_logging.log("=" * 80)
-  max_logging.log(f"1) Total Model Loading & Placement Time:  {load_time:.2f} seconds")
+  max_logging.log(f"1) Total Model Loading & Placement Time:  {runtime.load_time:.2f} seconds")
   max_logging.log(f"2) Cold-Start / Warmup Pass (XLA Compilation): {warmup_time:.2f} seconds")
-  log_swap(warmup_trace, "text_encoder", "Qwen3-VL Swap-in ")
+  _log_swap(warmup_trace, "text_encoder", "Qwen3-VL Swap-in ")
   max_logging.log(f"   - Qwen3-VL Encoding: {warmup_trace.get('prompt_encoding', 0.0):.2f}s")
-  log_swap(warmup_trace, "transformer", "Krea2 Swap-in    ")
+  _log_swap(warmup_trace, "transformer", "Krea2 Swap-in    ")
   max_logging.log(f"   - Krea2 Denoising:   {warmup_trace.get('denoise_loop', 0.0):.2f}s")
   max_logging.log(f"   - VAE Decoding:      {warmup_trace.get('vae_decode', 0.0):.2f}s")
   max_logging.log(f"3) Main Warmed-Up Pass: {main_time:.2f} seconds")
-  log_swap(main_trace, "text_encoder", "Qwen3-VL Swap-in ")
+  _log_swap(main_trace, "text_encoder", "Qwen3-VL Swap-in ")
   max_logging.log(f"   - Qwen3-VL Encoding: {main_trace.get('prompt_encoding', 0.0):.2f}s")
-  log_swap(main_trace, "transformer", "Krea2 Swap-in    ")
+  _log_swap(main_trace, "transformer", "Krea2 Swap-in    ")
   max_logging.log(f"   - Krea2 Denoising:   {main_trace.get('denoise_loop', 0.0):.2f}s")
   max_logging.log(f"   - VAE Decoding:      {main_trace.get('vae_decode', 0.0):.2f}s")
   max_logging.log("=" * 80)
