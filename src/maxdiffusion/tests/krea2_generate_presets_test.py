@@ -18,15 +18,23 @@ limitations under the License.
 # No model and no checkpoint: configs are SimpleNamespaces and the pipeline is
 # a fake callable.
 
+import contextlib
+import os
+import tempfile
+import threading
+import time
 import types
 import unittest
 from unittest import mock
+
+import yaml
 
 from maxdiffusion import aot_cache, max_logging
 from maxdiffusion.generate_krea2 import (
     log_precompile_summary,
     resolve_generation_size,
     resolve_precompile_plan,
+    resolve_precompile_workers,
     run_precompile,
 )
 from maxdiffusion.models.krea2.resolution_presets import (
@@ -337,6 +345,340 @@ class RunPrecompileTest(unittest.TestCase):
       self.assertEqual(run_precompile(pipeline, [], self.call_kwargs, ["a fox"]), [])
     self.assertEqual(pipeline.calls, [])
     self.assertEqual(save.call_count, 0)
+
+
+class _ThreadedFakePipeline:
+  """A thread-safe fake pipeline for the parallel precompile path.
+
+  Records each call's kwargs, thread and warmup flag; `gate(index, kwargs)`
+  runs inside the call (block, sleep, raise), `trace_fn(kwargs)` replaces the
+  trace like in _FakePipeline. `events` interleaves ("start"/"end", index) of
+  calls with ("save", active calls) of the patched save.
+  """
+
+  def __init__(self, plan, gate=None, trace_fn=None, tokenizer=None):
+    self.plan = plan
+    self.gate = gate
+    self.trace_fn = trace_fn
+    self.tokenizer = tokenizer
+    self.offload_components = frozenset()
+    self.lock = threading.Lock()
+    self.calls = []
+    self.events = []
+    self.active = 0
+    self.setups = []
+
+  def _setup_jit_functions(self):
+    with self.lock:
+      self.setups.append((threading.current_thread().name, len(self.calls)))
+
+  def _index(self, kwargs):
+    for index, (resolution, requested) in enumerate(self.plan, start=1):
+      if (resolution.height, resolution.width, requested) == (kwargs["height"], kwargs["width"], kwargs["min_text_tokens"]):
+        return index
+    raise AssertionError(f"not a plan entry: {kwargs}")
+
+  def __call__(self, **kwargs):
+    index = self._index(kwargs)
+    with self.lock:
+      self.calls.append(
+          {
+              "index": index,
+              "kwargs": kwargs,
+              "thread": threading.current_thread().name,
+              "warmup_only": aot_cache._STATE.warmup_only,
+              "tokenizer": self.tokenizer,
+          }
+      )
+      self.events.append(("start", index))
+      self.active += 1
+    try:
+      if self.gate is not None:
+        self.gate(index, kwargs)
+      if self.trace_fn is not None:
+        return [], self.trace_fn(kwargs)
+      return [], {"prompt_encoding": 0.1, "text_tokens": kwargs["min_text_tokens"]}
+    finally:
+      with self.lock:
+        self.active -= 1
+        self.events.append(("end", index))
+
+  def started(self):
+    return sorted(call["index"] for call in self.calls)
+
+
+class RunPrecompileParallelTest(unittest.TestCase):
+
+  def setUp(self):
+    patcher = mock.patch.object(aot_cache._STATE, "enabled", True)
+    patcher.start()
+    self.addCleanup(patcher.stop)
+    self.addCleanup(setattr, aot_cache._STATE, "warmup_only", False)
+    self.plan = [
+        (resolve_krea2_resolution("16:9", "2k"), 128),
+        (resolve_krea2_resolution("16:9", "2k"), 256),
+        (resolve_krea2_resolution("2:3", "1k"), 128),
+        (resolve_krea2_resolution("1:1", "1k"), 128),
+    ]
+    self.call_kwargs = {
+        "params": "params",
+        "qwen3_params": "qwen3_params",
+        "height": 1024,
+        "width": 1024,
+        "num_inference_steps": 8,
+        "guidance_scale": 0.0,
+        "latents": "latents for 1024x1024 only",
+        "output_dir": "output/",
+    }
+    self.saves = []
+
+  def _run(self, pipeline, plan=None, **kwargs):
+    """run_precompile with the save and the log patched; returns (records or exception, log lines)."""
+
+    def save_pending():
+      with pipeline.lock:
+        pipeline.events.append(("save", pipeline.active))
+      self.saves.append(aot_cache._STATE.warmup_only)
+      return 2
+
+    with (
+        mock.patch.object(aot_cache, "save_pending", side_effect=save_pending),
+        mock.patch.object(aot_cache, "warmup_mode", wraps=aot_cache.warmup_mode) as self.warmup_mode,
+        mock.patch.object(max_logging, "log") as log,
+    ):
+      try:
+        result = run_precompile(pipeline, self.plan if plan is None else plan, self.call_kwargs, ["a fox"], **kwargs)
+      except Exception as e:  # noqa: BLE001 - returned to the test
+        result = e
+    return result, [call.args[0] for call in log.call_args_list]
+
+  def test_every_entry_runs_concurrently_and_records_keep_plan_order(self):
+    # All four calls meet at the barrier (so they run at once), then finish in reverse plan order.
+    barrier = threading.Barrier(4, timeout=60)
+
+    def gate(index, kwargs):
+      barrier.wait()
+      time.sleep(0.05 * (len(self.plan) - index))
+
+    pipeline = _ThreadedFakePipeline(self.plan, gate=gate)
+    records, lines = self._run(pipeline, workers=4)
+
+    self.assertIsInstance(records, list)
+    self.assertEqual(pipeline.started(), [1, 2, 3, 4])
+    self.assertEqual(
+        [(r["label"], r["requested_text_tokens"], r["text_tokens"]) for r in records],
+        [("2k@16:9", 128, 128), ("2k@16:9", 256, 256), ("1k@2:3", 128, 128), ("1k@1:1", 128, 128)],
+    )
+    for record in records:
+      self.assertEqual(record["saved"], 2)
+      self.assertGreaterEqual(record["seconds"], 0.0)
+    for call in pipeline.calls:
+      self.assertTrue(call["warmup_only"])
+      self.assertTrue(call["thread"].startswith("krea2-precompile"))
+      self.assertIs(call["kwargs"]["save_outputs"], False)
+      self.assertIsNone(call["kwargs"]["latents"])
+      self.assertEqual(call["kwargs"]["prompt"], ["a fox"])
+    self.assertEqual(self.call_kwargs["latents"], "latents for 1024x1024 only")
+    # One warmup context around the whole pool, left once every thread is done.
+    self.assertEqual(self.warmup_mode.call_count, 1)
+    self.assertFalse(aot_cache._STATE.warmup_only)
+    # One save after every completed entry, while the flag is still set.
+    self.assertEqual(self.saves, [True] * 4)
+    ends = 0
+    for event in pipeline.events:
+      ends += event[0] == "end"
+      if event[0] == "save":
+        self.assertGreaterEqual(ends, 1)
+    self.assertEqual(lines[0], "[precompile] parallel: 4 entries, 4 workers")
+    entry_lines = lines[1:]
+    self.assertEqual(len(entry_lines), 4)
+    # Completion order (reverse), with the per-entry format of the sequential path.
+    self.assertTrue(entry_lines[0].startswith("[precompile 4/4] 1k@1:1 1024x1024 text 128: "))
+    self.assertTrue(entry_lines[3].startswith("[precompile 1/4] 2k@16:9 2688x1536 text 128: "))
+    self.assertTrue(all(line.endswith("s, 2 executable(s) saved") for line in entry_lines))
+    # The jitted entries were built once, on the calling thread, before any call.
+    self.assertEqual(pipeline.setups, [(threading.current_thread().name, 0)])
+
+  def test_workers_are_capped_by_the_plan(self):
+    pipeline = _ThreadedFakePipeline(self.plan[:2])
+    records, lines = self._run(pipeline, plan=self.plan[:2], workers=8)
+    self.assertEqual(len(records), 2)
+    self.assertEqual(lines[0], "[precompile] parallel: 2 entries, 2 workers")
+
+  def test_one_entry_or_one_worker_takes_the_sequential_path(self):
+    for plan, workers in ((self.plan[:1], 8), (self.plan, 1)):
+      with self.subTest(entries=len(plan), workers=workers):
+        pipeline = _ThreadedFakePipeline(plan)
+        self.saves = []
+        records, lines = self._run(pipeline, plan=plan, workers=workers)
+        self.assertEqual(len(records), len(plan))
+        self.assertFalse(any("parallel" in line or "workers" in line for line in lines))
+        self.assertTrue(all(call["thread"] == threading.current_thread().name for call in pipeline.calls))
+        self.assertEqual(self.saves, [False] * len(plan))
+        self.assertEqual(pipeline.setups, [])
+
+  def test_empty_plan_does_nothing(self):
+    pipeline = _ThreadedFakePipeline([])
+    records, lines = self._run(pipeline, plan=[], workers=4)
+    self.assertEqual(records, [])
+    self.assertEqual((pipeline.calls, lines, self.saves), ([], [], []))
+
+  def _assert_sequential_fallback(self, pipeline, reason):
+    records, lines = self._run(pipeline, workers=4)
+    self.assertEqual(len(records), 4)
+    self.assertEqual(lines[0], f"[precompile] 4 workers requested, compiling one entry after the other: {reason}")
+    self.assertFalse(any("parallel:" in line for line in lines))
+    self.assertEqual(len(lines), 5)
+    self.assertTrue(all(call["thread"] == threading.current_thread().name for call in pipeline.calls))
+    self.assertEqual(pipeline.started(), [1, 2, 3, 4])
+
+  def test_aot_cache_off_falls_back_to_sequential(self):
+    pipeline = _ThreadedFakePipeline(self.plan)
+    with mock.patch.object(aot_cache._STATE, "enabled", False):
+      self._assert_sequential_fallback(pipeline, "the AOT cache is off, so warmup calls execute")
+    # Warmup mode is a no-op without the cache: the calls executed.
+    self.assertFalse(any(call["warmup_only"] for call in pipeline.calls))
+
+  def test_offloaded_components_fall_back_to_sequential(self):
+    pipeline = _ThreadedFakePipeline(self.plan)
+    pipeline.offload_components = frozenset({"transformer", "text_encoder"})
+    self._assert_sequential_fallback(pipeline, "offloaded components text_encoder, transformer")
+
+  def test_bucket_mismatch_cancels_waiting_entries_saves_and_raises(self):
+    # Entry 1 compiles a larger bucket; entry 2 is still running when it fails; the next entry a free
+    # worker may pick up runs slowly, so the remaining ones are still queued when the failure cancels them.
+    entry_2_running = threading.Event()
+
+    def gate(index, kwargs):
+      if index == 1:
+        self.assertTrue(entry_2_running.wait(timeout=60))
+      elif index == 2:
+        entry_2_running.set()
+        time.sleep(0.3)
+      else:
+        time.sleep(0.5)
+
+    def trace_fn(kwargs):
+      if kwargs["min_text_tokens"] == 128 and kwargs["height"] == 1536:
+        return {"text_tokens": 256}
+      return {"text_tokens": kwargs["min_text_tokens"]}
+
+    plan = self.plan + [(resolve_krea2_resolution("3:2", "1k"), 128), (resolve_krea2_resolution("4:3", "1k"), 128)]
+    pipeline = _ThreadedFakePipeline(plan, gate=gate, trace_fn=trace_fn)
+    error, lines = self._run(pipeline, plan=plan, workers=2)
+
+    self.assertIsInstance(error, RuntimeError)
+    # The sequential path's message.
+    self.assertIn("[precompile 1/6] 2k@16:9 2688x1536: requested text bucket 128", str(error))
+    self.assertIn("prompt 256", str(error))
+    self.assertIn("2 executable(s) were saved", str(error))
+    # Entries 1 and 2 ran, a free worker took at most one more; the rest were cancelled.
+    started = pipeline.started()
+    self.assertEqual(started[:2], [1, 2])
+    self.assertLessEqual(len(started), 3)
+    # Saved after the failing entry, and once more after every running entry had finished.
+    self.assertGreaterEqual(len(self.saves), 2)
+    self.assertEqual(pipeline.events[-1], ("save", 0))
+    self.assertEqual(sum(event[0] == "end" for event in pipeline.events), len(started))
+    self.assertEqual(self.warmup_mode.call_count, 1)
+    self.assertFalse(aot_cache._STATE.warmup_only)
+
+  def test_entry_exception_saves_and_raises(self):
+    def gate(index, kwargs):
+      if index == 3:
+        raise RuntimeError("compile failed")
+
+    pipeline = _ThreadedFakePipeline(self.plan, gate=gate)
+    error, _ = self._run(pipeline, workers=2)
+    self.assertIsInstance(error, RuntimeError)
+    self.assertEqual(str(error), "compile failed")
+    self.assertEqual(pipeline.events[-1], ("save", 0))
+    self.assertFalse(aot_cache._STATE.warmup_only)
+
+  def test_missing_negative_bucket_raises_like_the_sequential_path(self):
+    pipeline = _ThreadedFakePipeline(self.plan)
+    self.call_kwargs.update(guidance_scale=1.5, do_classifier_free_guidance=True)
+    error, _ = self._run(pipeline, workers=2)
+    self.assertIsInstance(error, RuntimeError)
+    self.assertIn("'negative_text_tokens'", str(error))
+
+  def test_call_context_is_entered_on_each_worker_thread(self):
+    depth = threading.local()
+    seen = []
+
+    @contextlib.contextmanager
+    def call_context():
+      depth.value = getattr(depth, "value", 0) + 1
+      try:
+        yield
+      finally:
+        depth.value -= 1
+
+    def gate(index, kwargs):
+      seen.append((threading.current_thread().name, getattr(depth, "value", 0)))
+
+    pipeline = _ThreadedFakePipeline(self.plan, gate=gate)
+    records, _ = self._run(pipeline, workers=3, call_context=call_context)
+    self.assertEqual(len(records), 4)
+    self.assertEqual(len(seen), 4)
+    for thread, value in seen:
+      self.assertNotEqual(thread, threading.current_thread().name)
+      self.assertEqual(value, 1)
+
+  def test_each_worker_thread_gets_its_own_tokenizer_copy(self):
+    tokenizer = {"vocab": ["a", "fox"]}
+    pipeline = _ThreadedFakePipeline(self.plan, gate=lambda index, kwargs: time.sleep(0.05), tokenizer=tokenizer)
+    records, _ = self._run(pipeline, workers=2)
+    self.assertEqual(len(records), 4)
+    by_thread = {}
+    for call in pipeline.calls:
+      self.assertIsNot(call["tokenizer"], tokenizer)
+      self.assertEqual(call["tokenizer"], tokenizer)
+      by_thread.setdefault(call["thread"], set()).add(id(call["tokenizer"]))
+    # One copy per worker thread, reused for its next entries, never shared between threads.
+    self.assertTrue(all(len(ids) == 1 for ids in by_thread.values()))
+    self.assertEqual(len(set().union(*by_thread.values())), len(by_thread))
+    self.assertIs(pipeline.tokenizer, tokenizer)
+
+
+class PrecompileWorkersConfigTest(unittest.TestCase):
+
+  _CONFIG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "configs")
+
+  def test_values(self):
+    self.assertEqual(resolve_precompile_workers(types.SimpleNamespace()), 1)
+    for value, expected in ((None, 1), ("", 1), (1, 1), (8, 8)):
+      self.assertEqual(resolve_precompile_workers(types.SimpleNamespace(krea2_precompile_workers=value)), expected)
+    for value in (0, -1, "x", "8", True, 2.0):
+      with self.subTest(value=value):
+        with self.assertRaisesRegex(ValueError, "krea2_precompile_workers must be an integer >= 1"):
+          resolve_precompile_workers(types.SimpleNamespace(krea2_precompile_workers=value))
+
+  def test_configs_default_to_one(self):
+    for name in ("base_krea2.yml", "base_krea2_turbo.yml", "base_krea2_turbo_v6e1.yml"):
+      with open(os.path.join(self._CONFIG_DIR, name), encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+      self.assertIs(type(config["krea2_precompile_workers"]), int, name)
+      self.assertEqual(config["krea2_precompile_workers"], 1, name)
+
+  def test_command_line_override_through_pyconfig(self):
+    from maxdiffusion import pyconfig  # pylint: disable=import-outside-toplevel
+
+    prev = (pyconfig._config, pyconfig.config)  # pylint: disable=protected-access
+    self.addCleanup(lambda: setattr(pyconfig, "_config", prev[0]) or setattr(pyconfig, "config", prev[1]))
+    for overrides, expected in (((), 1), (("krea2_precompile_workers=8",), 8)):
+      with self.subTest(overrides=overrides), tempfile.TemporaryDirectory() as out:
+        pyconfig.initialize(
+            [
+                None,
+                os.path.join(self._CONFIG_DIR, "base_krea2_turbo_v6e1.yml"),
+                "run_name=t",
+                f"output_dir={out}/",
+                "skip_jax_distributed_system=True",
+                *overrides,
+            ]
+        )
+        self.assertEqual(resolve_precompile_workers(pyconfig.config), expected)
 
 
 if __name__ == "__main__":

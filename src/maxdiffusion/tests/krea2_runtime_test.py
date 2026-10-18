@@ -229,6 +229,35 @@ class WarmupAndPrecompileTest(_RuntimeTestCase):
     for interceptor in self.interceptors:
       self.assertEqual((interceptor.enters, interceptor.exits), (1, 1))
 
+  def test_precompile_passes_the_workers_and_the_interceptors_to_threads(self):
+    runtime = self._runtime(krea2_precompile_workers=4)
+    plan = [(list_krea2_resolutions("1k")[0], 128)]
+    seen = {}
+
+    def fake_run_precompile(pipeline, run_plan, call_kwargs, prompts, workers=1, call_context=None):
+      seen.update(workers=workers, call_context=call_context)
+      seen["active"] = [i.active for i in self.interceptors]
+      # What a worker thread enters around its pipeline call (flax keeps interceptors per thread).
+      with call_context():
+        seen["active_in_context"] = [i.active for i in self.interceptors]
+      return []
+
+    with mock.patch.object(generate_krea2, "run_precompile", side_effect=fake_run_precompile):
+      runtime.precompile(plan)
+    self.assertEqual(seen["workers"], 4)
+    self.assertEqual(seen["active"], [1, 1])
+    # The fakes count globally; real flax interceptors are per thread, so a worker sees exactly one.
+    self.assertEqual(seen["active_in_context"], [2, 2])
+    for interceptor in self.interceptors:
+      self.assertEqual((interceptor.enters, interceptor.exits), (2, 2))
+
+  def test_precompile_rejects_bad_workers_before_compiling(self):
+    runtime = self._runtime(krea2_precompile_workers=0)
+    with mock.patch.object(generate_krea2, "run_precompile") as run:
+      with self.assertRaisesRegex(ValueError, "krea2_precompile_workers"):
+        runtime.precompile([(list_krea2_resolutions("1k")[0], 128)])
+    run.assert_not_called()
+
 
 class ServingPlanTest(_RuntimeTestCase):
 

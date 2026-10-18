@@ -721,6 +721,51 @@ class Krea2PrecompileRoundTripTest(unittest.TestCase):
     np.testing.assert_allclose(run_seen["latents_5d"], reference_seen["latents_5d"], rtol=1e-5, atol=1e-5)
     np.testing.assert_allclose(run_seen["images"], reference_seen["images"], rtol=1e-5, atol=1e-5)
 
+  def test_parallel_precompile_compiles_each_signature_once_and_a_later_run_loads_it(self):
+    reference_pipeline, reference_seen = self._pipeline(self._RUN_MASK)
+    self._run(reference_pipeline)
+
+    # Two text buckets of one resolution on two threads: they share the VAE signature (and the
+    # transformer_step and text_context entries), each thread enters the pipeline's mesh itself.
+    precompile_pipeline, _ = self._pipeline(self._SHORT_MASK)
+    # With a tokenizer each thread runs a shallow copy of the pipeline (private tokenizer copy) that
+    # must share the jitted entries: the compile-once and file checks below cover that path.
+    precompile_pipeline.tokenizer = object()
+    aot_cache.install(self.cache_dir, self._META, _mesh())
+    aot_cache.wait_for_loads()
+    plan = [(self.resolution, 4), (self.resolution, 6)]
+    real_compile = aot_cache._AotEntry._compile_and_record
+    with mock.patch.object(
+        aot_cache._AotEntry, "_compile_and_record", autospec=True, side_effect=real_compile
+    ) as compiles:
+      records = generate_krea2.run_precompile(precompile_pipeline, plan, self._call_kwargs(), ["a fox"], workers=2)
+    self.assertEqual([(r["text_tokens"], r["negative_text_tokens"]) for r in records], [(4, 4), (6, 6)])
+    compiled = [(call.args[0].name, call.args[1]) for call in compiles.call_args_list]
+    self.assertEqual(len(compiled), len(set(compiled)), "a signature compiled twice")
+    self.assertFalse(aot_cache._STATE.warmup_only)
+    entries = self._entries(precompile_pipeline)
+    expected_files = {"transformer_step": 2, "text_context": 2, "vae_decode": 1}
+    for name, entry in entries.items():
+      paths = glob.glob(os.path.join(self.cache_dir, f"{entry.name}-*.aotx"))
+      self.assertEqual(len(paths), expected_files[name], name)
+      self.assertEqual(entry._pending, {}, name)
+      self.assertEqual(entry._inflight, {}, name)
+
+    # A later lazy-loading run at bucket 4 loads everything and compiles nothing.
+    run_pipeline, run_seen = self._pipeline(self._RUN_MASK)
+    aot_cache.install(self.cache_dir, self._META, _mesh(), lazy_load=True)
+
+    def no_compile(*args, **kwargs):
+      raise AssertionError("cache miss: the run tried to jit or compile")
+
+    with (
+        mock.patch.object(aot_cache._AotEntry, "_adapter_for", side_effect=no_compile),
+        mock.patch.object(aot_cache._AotEntry, "_compile_and_record", side_effect=no_compile),
+    ):
+      run_trace = self._run(run_pipeline)
+    self.assertEqual((run_trace["text_tokens"], run_trace["negative_text_tokens"]), (4, 4))
+    np.testing.assert_allclose(run_seen["images"], reference_seen["images"], rtol=1e-5, atol=1e-5)
+
 
 if __name__ == "__main__":
   unittest.main()

@@ -58,6 +58,10 @@ minus the torch interop):
     process, so wrappers of the same name in independent pipelines share
     one download); a missing object or any failure is a miss (compile as
     without the file). The URL is not part of the fingerprint.
+  * ``warmup_mode()`` may be used by several threads at once (parallel
+    precompile): concurrent warmup calls of one signature share one compile
+    (``_AotEntry._warmup_compile``), and ``save_pending()`` may run on one
+    thread while others still compile.
 
 Usage::
 
@@ -346,6 +350,9 @@ class _AotEntry:
     self._logged_nested_fallback = False
     # Signatures a lazy install already tried to load (hit, miss or failure).
     self._lazy_tried: set[str] = set()
+    # Warmup compiles in progress, by signature: concurrent warmup callers of one
+    # signature (parallel precompile threads) wait for the one compile.
+    self._inflight: dict[str, threading.Event] = {}
     self._lock = threading.Lock()
     # Serializes lazy loads of this fn; never taken on the fast path.
     self._lazy_lock = threading.Lock()
@@ -445,9 +452,78 @@ class _AotEntry:
     shapes_dtypes = [(tuple(x.shape), jnp.dtype(x.dtype)) for x in info_leaves]
     out_shardings = jax.tree_util.tree_leaves(compiled.output_shardings)
     with self._lock:
-      self._compiled[signature] = compiled
+      # Out specs first: an unlocked `signature in self._compiled` then implies them (see _warmup_compile).
       self._out_specs[signature] = (out_treedef, shapes_dtypes, out_shardings)
+      self._compiled[signature] = compiled
     return compiled
+
+  def _record_out_specs(self, signature: str, compiled: Any, arg_lists: tuple, treedefs: tuple, static: dict) -> None:
+    """Captures the out specs of an executable loaded from a file without them (lowering only, no compile).
+
+    Older files carry no ``out_shapes_dtypes``; warmup mode needs the specs to
+    return zeros instead of executing. Shapes and dtypes come from lowering the
+    adapter (a trace, no compile), shardings from the loaded executable.
+    """
+    lowered = self._adapter_for(signature, treedefs, static).lower(*arg_lists)
+    info_leaves, out_treedef = jax.tree_util.tree_flatten(lowered.out_info)
+    shapes_dtypes = [(tuple(x.shape), jnp.dtype(x.dtype)) for x in info_leaves]
+    out_shardings = jax.tree_util.tree_leaves(compiled.output_shardings)
+    if len(out_shardings) != len(shapes_dtypes):
+      raise ValueError(f"{len(shapes_dtypes)} outputs lowered, but the loaded executable has {len(out_shardings)}")
+    with self._lock:
+      self._out_specs[signature] = (out_treedef, shapes_dtypes, out_shardings)
+
+  def _warmup_compile(self, signature: str, arg_lists: tuple, treedefs: tuple, static: dict) -> None:
+    """Makes one signature ready for warmup mode (executable and out specs), once across concurrent callers.
+
+    Every warmup call goes through here: readiness (both ``_compiled`` and
+    ``_out_specs`` hold the signature) is decided under ``_lock``, which every
+    writer of the two holds while publishing them, so a load or compile on
+    another thread is never seen half-published. The first caller of a signature
+    that is not ready registers an Event under ``_lock`` and, outside it, either
+    compiles (and records the signature in ``_pending``) or, for an executable
+    loaded from a file without out specs, captures them by lowering; it sets
+    the Event in a ``finally``. Other callers of the same signature wait for that
+    Event (outside the lock) and re-check: the signature is then ready, or the
+    owner failed and the first waiter to get the lock tries itself (its own
+    error surfaces, nothing hangs). Distinct signatures compile concurrently.
+    ``_compile_and_record`` and ``_adapter_for`` take ``_lock`` themselves, so
+    the compile never runs with it held.
+    """
+    while True:
+      with self._lock:
+        if signature in self._compiled and signature in self._out_specs:
+          return
+        loaded = self._compiled.get(signature)
+        event = self._inflight.get(signature)
+        owner = event is None
+        if owner:
+          event = self._inflight[signature] = threading.Event()
+      if not owner:
+        event.wait()
+        continue
+      try:
+        if loaded is not None:
+          try:
+            self._record_out_specs(signature, loaded, arg_lists, treedefs, static)
+          except Exception as e:  # noqa: BLE001 - re-raised with what it means for warmup
+            raise RuntimeError(
+                f"{self.name}: the executable loaded for signature {signature} has no output specs and "
+                f"they cannot be derived ({e!r}); warmup mode refuses to execute it"
+            ) from e
+        else:
+          self._compile_and_record(signature, arg_lists, treedefs, static)
+          with self._lock:
+            if signature not in self._on_disk:
+              self._pending[signature] = (arg_lists, treedefs, static)
+      finally:
+        # Unregistered before the Event is set, so a woken waiter of a failed
+        # compile finds no owner and becomes the next one.
+        with self._lock:
+          if self._inflight.get(signature) is event:
+            del self._inflight[signature]
+        event.set()
+      return
 
   # ---------------------------------------------------------------- call
   def _call_optioned(self, call: Callable, fallback: Callable):
@@ -489,14 +565,14 @@ class _AotEntry:
       # Compilation only needs avals; skip the (possibly seconds-long)
       # real execution and hand back correctly-shaped/sharded zeros so
       # downstream executables still warm against faithful inputs.
-      if signature not in self._compiled:
-        self._compile_and_record(signature, arg_lists, treedefs, static)
-        with self._lock:
-          if signature not in self._on_disk:
-            self._pending[signature] = (arg_lists, treedefs, static)
+      # Always through _warmup_compile: an unlocked check could see an executable whose
+      # out specs another thread has not published yet and fall through to executing it.
+      self._warmup_compile(signature, arg_lists, treedefs, static)
       zeros = self._zeros_output(signature)
-      if zeros is not None:
-        return zeros
+      if zeros is None:
+        # Only an install() between the two calls clears the specs; never execute in warmup mode.
+        raise RuntimeError(f"{self.name}: no output specs for signature {signature} in warmup mode")
+      return zeros
     compiled = self._compiled.get(signature)
     if compiled is not None:
       aligned = self._align_inputs(compiled, arg_lists)
@@ -633,15 +709,16 @@ class _AotEntry:
           stale = True
         else:
           stale = False
-          self._compiled[signature] = compiled
-          self._on_disk.add(signature)
           if "out_shapes_dtypes" in blob:
-            # Out specs let warmup mode return zeros instead of executing.
+            # Out specs let warmup mode return zeros instead of executing; published before the
+            # executable (an older file without them gets them in _warmup_compile).
             self._out_specs[signature] = (
                 blob["out_tree"],
                 [(tuple(shape), jnp.dtype(dtype)) for shape, dtype in blob["out_shapes_dtypes"]],
                 jax.tree_util.tree_leaves(compiled.output_shardings),
             )
+          self._compiled[signature] = compiled
+          self._on_disk.add(signature)
       if stale:
         max_logging.log(f"[aot] {self.name}: dropped {os.path.basename(path)}; it belongs to a previous install")
         return False
@@ -820,6 +897,11 @@ def install(cache_dir: str, meta: dict[str, Any], mesh: Any, lazy_load: bool = F
     _LOAD_THREADS.append(thread)
 
 
+def is_enabled() -> bool:
+  """Whether ``install()`` enabled the cache (so ``warmup_mode()`` compiles without executing)."""
+  return _STATE.enabled
+
+
 def wait_for_loads() -> None:
   """Blocks until background deserialization finishes (call before timing)."""
   for thread in _LOAD_THREADS:
@@ -830,7 +912,13 @@ def wait_for_loads() -> None:
 def save_pending() -> int:
   """Serializes all recorded shapes across wrapped fns. Call after warmup,
   synchronously -- a background save competes with the first real request
-  (DiffusionServing PR#39 first-generation-stall lesson)."""
+  (DiffusionServing PR#39 first-generation-stall lesson).
+
+  It does not depend on ``warmup_mode()``, so one thread may call it while
+  other threads compile in warmup mode (parallel precompile): each entry's
+  ``_pending`` is swapped under its lock, a signature is recorded there only
+  after its executable is in ``_compiled``, and one recorded meanwhile stays
+  for the next call. Only one thread may save at a time."""
   if not _STATE.enabled:
     return 0
   return sum(entry.save_pending() for entry in _REGISTRY)
@@ -847,6 +935,9 @@ def warmup_mode():
   shardings, so downstream executables (scheduler step, VAE decode) still
   compile against faithful inputs. Outputs of a warmup pass are garbage by
   design; callers must discard them. No-op when the cache is disabled.
+
+  The flag is process-global, not per thread: threads that warm up
+  concurrently share one ``warmup_mode()`` entered around all of them.
   """
   _STATE.warmup_only = _STATE.enabled
   try:

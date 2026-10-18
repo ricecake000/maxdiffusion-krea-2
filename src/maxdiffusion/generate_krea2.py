@@ -73,12 +73,12 @@ import copy
 import dataclasses
 import gc
 import inspect
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import math
 import os
 import threading
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from typing import Any, List, Optional, Sequence, Tuple
 
 from absl import app
@@ -905,8 +905,92 @@ def resolve_precompile_plan(config, text_compaction_multiple) -> List[Tuple[Krea
   return [(resolution, bucket) for resolution in resolutions for bucket in buckets]
 
 
-def run_precompile(pipeline, plan, call_kwargs, prompts) -> List[dict]:
-  """Compiles every plan entry in warmup mode and saves after each one. Returns one record per entry.
+def resolve_precompile_workers(config) -> int:
+  """`krea2_precompile_workers` as an int >= 1 (1 when the key is missing or empty); ValueError otherwise."""
+  value = getattr(config, "krea2_precompile_workers", 1)
+  if value is None or value == "":
+    return 1
+  if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+    raise ValueError(
+        "krea2_precompile_workers must be an integer >= 1 (precompile entries compiled at once, 1 = one after "
+        f"the other), got {value!r}"
+    )
+  return value
+
+
+def _precompile_record(entry, resolution, requested, trace, seconds, saved, guidance) -> dict:
+  """Checks one finished precompile entry's trace, logs its line and returns its record (see `run_precompile`)."""
+  if "text_tokens" not in trace:
+    raise RuntimeError(
+        f"{entry}: the pipeline did not report its text bucket (no 'text_tokens' in its trace), so the "
+        f"requested bucket {requested} cannot be confirmed; {saved} executable(s) were saved."
+    )
+  if guidance and "negative_text_tokens" not in trace:
+    raise RuntimeError(
+        f"{entry}: classifier-free guidance is on but the pipeline did not report the negative prompt's text "
+        f"bucket (no 'negative_text_tokens' in its trace), so the requested bucket {requested} cannot be "
+        f"confirmed; {saved} executable(s) were saved."
+    )
+  record = {
+      "label": resolution.label,
+      "height": resolution.height,
+      "width": resolution.width,
+      "image_tokens": resolution.image_tokens,
+      "text_tokens": trace["text_tokens"],
+      "requested_text_tokens": requested,
+      "seconds": seconds,
+      "saved": saved,
+  }
+  buckets = f"text {record['text_tokens']}"
+  if "negative_text_tokens" in trace:
+    record["negative_text_tokens"] = trace["negative_text_tokens"]
+    buckets += f" (negative {record['negative_text_tokens']})"
+  max_logging.log(f"{entry} {buckets}: {seconds:.1f} s, {saved} executable(s) saved")
+  actual = {"prompt": record["text_tokens"]}
+  if "negative_text_tokens" in record:
+    # Checked whenever reported, also if guidance is off.
+    actual["negative prompt"] = record["negative_text_tokens"]
+  mismatched = {kind: tokens for kind, tokens in actual.items() if tokens != requested}
+  if mismatched:
+    found = ", ".join(f"{kind} {tokens}" for kind, tokens in mismatched.items())
+    raise RuntimeError(
+        f"{entry}: requested text bucket {requested}, but the pipeline compiled {found} (a prompt with more "
+        f"valid tokens than the bucket); {saved} executable(s) were saved, the requested bucket was not compiled."
+    )
+  return record
+
+
+def _precompile_entry_call(pipeline, resolution, requested, call_kwargs, prompts) -> dict:
+  """One plan entry's zero-execution pipeline call (inside warmup mode); returns its trace."""
+  # Custom latents fit only one resolution; every entry draws its own noise.
+  kwargs = {**call_kwargs, "height": resolution.height, "width": resolution.width, "latents": None}
+  _, trace = pipeline(
+      prompt=prompts,
+      output_name="krea2_precompile.png",
+      save_outputs=False,
+      min_text_tokens=requested,
+      **kwargs,
+  )
+  return trace
+
+
+def _parallel_precompile_fallback(pipeline) -> str:
+  """Why `run_precompile` with `workers` > 1 has to compile one entry after the other ('' when it need not)."""
+  if not aot_cache.is_enabled():
+    # Without the cache, warmup mode is a no-op: every entry would execute the pipeline for real, at once.
+    return "the AOT cache is off, so warmup calls execute"
+  if jax.process_count() > 1:
+    # The pipeline's cross-host barriers must run in the same order on every host.
+    return f"{jax.process_count()} processes"
+  offloaded = sorted(getattr(pipeline, "offload_components", None) or ())
+  if offloaded:
+    # Every concurrent call would swap in its own device copy of these weights.
+    return f"offloaded components {', '.join(offloaded)}"
+  return ""
+
+
+def run_precompile(pipeline, plan, call_kwargs, prompts, workers=1, call_context=None) -> List[dict]:
+  """Compiles every plan entry in warmup mode and saves after each one. Returns one record per entry, in plan order.
 
   Each entry is a zero-execution warmup call at the entry's resolution with the
   text bucket forced to at least its size. The cache is saved after every
@@ -919,6 +1003,15 @@ def run_precompile(pipeline, plan, call_kwargs, prompts) -> List[dict]:
   exactly like the pipeline does) a trace without `negative_text_tokens` raises
   too. Records carry the actual `text_tokens` (and `negative_text_tokens` with
   guidance) next to `requested_text_tokens`.
+
+  With `workers` > 1 (`krea2_precompile_workers`) up to that many entries
+  compile at once on threads (XLA compiles on the host and releases the GIL),
+  inside one warmup context around all of them; see `_run_precompile_parallel`.
+  `call_context` (a factory of context managers, e.g. the runtime's LoRA
+  interceptors, which flax keeps per thread) is entered around each threaded
+  pipeline call; the caller has already entered it for its own thread. One
+  worker, a plan of one entry, or a setup that cannot compile in parallel (see
+  `_parallel_precompile_fallback`) takes the one-after-the-other path above.
   """
   from maxdiffusion.pipelines.krea2.krea2_pipeline import FlaxKrea2Pipeline, is_classifier_free_guidance_enabled
 
@@ -928,61 +1021,101 @@ def run_precompile(pipeline, plan, call_kwargs, prompts) -> List[dict]:
       call_kwargs.get("guidance_scale", call_defaults["guidance_scale"].default),
       call_kwargs.get("do_classifier_free_guidance", call_defaults["do_classifier_free_guidance"].default),
   )
+  workers = min(workers, len(plan))
+  if workers > 1:
+    reason = _parallel_precompile_fallback(pipeline)
+    if reason:
+      max_logging.log(f"[precompile] {workers} workers requested, compiling one entry after the other: {reason}")
+      workers = 1
+  if workers > 1:
+    return _run_precompile_parallel(pipeline, plan, call_kwargs, prompts, workers, call_context, guidance)
+
   records = []
   for index, (resolution, requested) in enumerate(plan, start=1):
     entry = f"[precompile {index}/{len(plan)}] {resolution.label} {resolution.width}x{resolution.height}"
-    # Custom latents fit only one resolution; every entry draws its own noise.
-    kwargs = {**call_kwargs, "height": resolution.height, "width": resolution.width, "latents": None}
     t0 = time.perf_counter()
     with aot_cache.warmup_mode():
-      _, trace = pipeline(
-          prompt=prompts,
-          output_name="krea2_precompile.png",
-          save_outputs=False,
-          min_text_tokens=requested,
-          **kwargs,
-      )
+      trace = _precompile_entry_call(pipeline, resolution, requested, call_kwargs, prompts)
     # Save before any check below can raise, so the compiled work is kept.
     saved = aot_cache.save_pending()
     seconds = time.perf_counter() - t0
-    if "text_tokens" not in trace:
-      raise RuntimeError(
-          f"{entry}: the pipeline did not report its text bucket (no 'text_tokens' in its trace), so the "
-          f"requested bucket {requested} cannot be confirmed; {saved} executable(s) were saved."
-      )
-    if guidance and "negative_text_tokens" not in trace:
-      raise RuntimeError(
-          f"{entry}: classifier-free guidance is on but the pipeline did not report the negative prompt's text "
-          f"bucket (no 'negative_text_tokens' in its trace), so the requested bucket {requested} cannot be "
-          f"confirmed; {saved} executable(s) were saved."
-      )
-    record = {
-        "label": resolution.label,
-        "height": resolution.height,
-        "width": resolution.width,
-        "image_tokens": resolution.image_tokens,
-        "text_tokens": trace["text_tokens"],
-        "requested_text_tokens": requested,
-        "seconds": seconds,
-        "saved": saved,
-    }
-    buckets = f"text {record['text_tokens']}"
-    if "negative_text_tokens" in trace:
-      record["negative_text_tokens"] = trace["negative_text_tokens"]
-      buckets += f" (negative {record['negative_text_tokens']})"
-    records.append(record)
-    max_logging.log(f"{entry} {buckets}: {seconds:.1f} s, {saved} executable(s) saved")
-    actual = {"prompt": record["text_tokens"]}
-    if "negative_text_tokens" in record:
-      # Checked whenever reported, also if guidance is off.
-      actual["negative prompt"] = record["negative_text_tokens"]
-    mismatched = {kind: tokens for kind, tokens in actual.items() if tokens != requested}
-    if mismatched:
-      found = ", ".join(f"{kind} {tokens}" for kind, tokens in mismatched.items())
-      raise RuntimeError(
-          f"{entry}: requested text bucket {requested}, but the pipeline compiled {found} (a prompt with more "
-          f"valid tokens than the bucket); {saved} executable(s) were saved, the requested bucket was not compiled."
-      )
+    records.append(_precompile_record(entry, resolution, requested, trace, seconds, saved, guidance))
+  return records
+
+
+def _thread_pipeline(pipeline):
+  """The pipeline for one precompile worker thread: a shallow copy with a private tokenizer copy.
+
+  Hugging Face fast tokenizers raise "Already borrowed" when one instance
+  tokenizes on two threads at once (see `Krea2Runtime.text_bucket`). The copy
+  shares everything else, the jitted entries included, so concurrent calls of
+  one signature still share one compile. Without a tokenizer the pipeline
+  itself is used.
+  """
+  tokenizer = getattr(pipeline, "tokenizer", None)
+  if tokenizer is None:
+    return pipeline
+  clone = copy.copy(pipeline)
+  clone.tokenizer = copy.deepcopy(tokenizer)
+  return clone
+
+
+def _run_precompile_parallel(pipeline, plan, call_kwargs, prompts, workers, call_context, guidance) -> List[dict]:
+  """`run_precompile` with `workers` (> 1) threads; same records, checks and error messages.
+
+  `aot_cache.warmup_mode()` is entered once around the whole pool (its flag is
+  process-global; per-thread enters and exits would race) and left only after
+  every thread has finished. Each pipeline call enters its own mesh and axis
+  rules (thread-local in jax and flax), and `call_context` adds the caller's
+  per-thread contexts. The jitted entries are built once on this thread before
+  the pool starts, so the threads share them (and their in-flight compile
+  de-duplication). This thread saves after every entry that completes, while
+  others still compile (`aot_cache.save_pending` allows that), checks it like
+  the sequential path and logs its line, so lines come in completion order and
+  `seconds` is the entry's own call time. On the first failure (an exception
+  of an entry or a failed check) entries that have not started are cancelled,
+  running ones are waited for, everything compiled is saved, and the error is
+  raised.
+  """
+  max_logging.log(f"[precompile] parallel: {len(plan)} entries, {workers} workers")
+  setup_jit_functions = getattr(pipeline, "_setup_jit_functions", None)
+  if setup_jit_functions is not None:
+    # Lazily built on the first call; built concurrently, every thread would get its own entries.
+    setup_jit_functions()
+  local = threading.local()
+  # The tokenizer copies are made one at a time: no two threads read the shared tokenizer at once.
+  copy_lock = threading.Lock()
+
+  def run_entry(resolution, requested):
+    if getattr(local, "pipeline", None) is None:
+      with copy_lock:
+        local.pipeline = _thread_pipeline(pipeline)
+    t0 = time.perf_counter()
+    with call_context() if call_context is not None else nullcontext():
+      trace = _precompile_entry_call(local.pipeline, resolution, requested, call_kwargs, prompts)
+    return trace, time.perf_counter() - t0
+
+  records = [None] * len(plan)
+  with aot_cache.warmup_mode():
+    pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="krea2-precompile")
+    try:
+      futures = {
+          pool.submit(run_entry, resolution, requested): (index, resolution, requested)
+          for index, (resolution, requested) in enumerate(plan, start=1)
+      }
+      for future in as_completed(futures):
+        index, resolution, requested = futures[future]
+        entry = f"[precompile {index}/{len(plan)}] {resolution.label} {resolution.width}x{resolution.height}"
+        trace, seconds = future.result()
+        # Save before any check below can raise, so the compiled work is kept.
+        saved = aot_cache.save_pending()
+        records[index - 1] = _precompile_record(entry, resolution, requested, trace, seconds, saved, guidance)
+    except BaseException:
+      pool.shutdown(wait=True, cancel_futures=True)
+      # Also keeps what the entries still running at the failure compiled.
+      aot_cache.save_pending()
+      raise
+    pool.shutdown(wait=True)
   return records
 
 
@@ -1096,14 +1229,21 @@ class Krea2Runtime:
     The executables depend on the text bucket, not on the prompt text, so a
     fixed short prompt and an empty negative prompt leave the bucket to the
     plan entry alone (a long configured prompt would force a larger one).
+    With `krea2_precompile_workers` > 1 the entries compile on that many
+    threads; flax keeps the LoRA interceptors per thread, so each threaded
+    pipeline call enters them again.
     """
     call_kwargs = self.call_kwargs(height=self.default_height, width=self.default_width, latents=None)
+    workers = resolve_precompile_workers(self.config)
+    # One worker: the call (and the code path) of before the key existed.
+    parallel = {"workers": workers, "call_context": self._interceptors} if workers > 1 else {}
     with self._interceptors():
       return run_precompile(
           self.pipeline,
           plan,
           {**call_kwargs, "negative_prompt": ""},
           [KREA2_PRECOMPILE_PROMPT] * self.config.batch_size,
+          **parallel,
       )
 
   def serving_plan(self, presets_spec: str, text_tokens: Sequence[int]) -> List[Tuple[Krea2Resolution, int]]:
@@ -1304,6 +1444,8 @@ def create_runtime(argv) -> Optional["Krea2Runtime"]:
   # Before the precompile plan: its aot_cache_dir error would hide that the two modes exclude each other.
   build_only = resolve_weight_cache_build_only(config)
   precompile_plan = resolve_precompile_plan(config, text_compaction_multiple)
+  # Read again by Krea2Runtime.precompile (CLI precompile mode and serving warm-up); a bad value fails here.
+  resolve_precompile_workers(config)
   if precompile_plan:
     max_logging.log(
         f"Precompile mode: {len(precompile_plan)} resolution/text combination(s) into {config.aot_cache_dir}; "

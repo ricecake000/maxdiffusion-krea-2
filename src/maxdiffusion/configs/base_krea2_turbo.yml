@@ -395,6 +395,10 @@ krea2_image_size: ''
 # fixed short prompt and no negative prompt, so the configured prompts do not change the buckets.
 krea2_precompile: ''
 krea2_precompile_text_tokens: [128]
+# Precompile entries compiled at once, on threads (XLA compiles on the host), in the krea2_precompile mode
+# and the serving warm-up. 1 compiles them one after the other. Above 1 needs aot_cache_dir (warm-up calls
+# must not execute; without it they run one after the other). Not part of any cache key: same executables.
+krea2_precompile_workers: 1
 
 # VAE (Qwen-Image / Wan 2.1 architecture) mesh + sharding.
 # vae_spatial = -1 shards VAE spatial activations across all devices.

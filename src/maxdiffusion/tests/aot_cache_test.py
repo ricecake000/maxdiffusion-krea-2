@@ -21,6 +21,7 @@ import os
 import pickle
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -84,6 +85,35 @@ class _ObservedLock:
 
   def __exit__(self, *exc_info):
     return self._lock.__exit__(*exc_info)
+
+
+class _ObservedInflight(dict):
+  """The in-flight compile dict of an entry; signals once a caller finds a compile already in flight."""
+
+  def __init__(self):
+    super().__init__()
+    self.found_in_flight = threading.Event()
+
+  def get(self, key, default=None):
+    value = super().get(key, default)
+    if value is not None:
+      self.found_in_flight.set()
+    return value
+
+
+class _PausingDict(dict):
+  """A dict whose first assignment pauses (after storing) until ``release``; ``stored`` signals it."""
+
+  def __init__(self):
+    super().__init__()
+    self.stored = threading.Event()
+    self.release = threading.Event()
+
+  def __setitem__(self, key, value):
+    super().__setitem__(key, value)
+    if not self.stored.is_set():
+      self.stored.set()
+      self.release.wait(timeout=60)
 
 
 class AotCacheTest(unittest.TestCase):
@@ -562,6 +592,234 @@ class AotCacheTest(unittest.TestCase):
     self.assertEqual(len(calls), 1)
     self.assertFalse(entry._pending)
     self.assertEqual(aot_cache.save_pending(), 0)
+
+  # ------------------------------------------- concurrent warmup compiles
+  @contextlib.contextmanager
+  def _blocking_compile(self, entry, fail_first=False, fail_all=False):
+    """Makes entry._compile_and_record block in its first call until ``release``; yields (started, release, calls).
+
+    ``fail_first`` makes that first call raise after the release (a failed
+    owner), ``fail_all`` makes every call raise.
+    """
+    started, release = threading.Event(), threading.Event()
+    calls = []
+    real = entry._compile_and_record
+
+    def blocking(*args, **kwargs):
+      calls.append(threading.current_thread().name)
+      if len(calls) == 1:
+        started.set()
+        release.wait(timeout=60)
+        if fail_first:
+          raise RuntimeError("owner compile failed")
+      if fail_all:
+        raise RuntimeError("compile failed again")
+      return real(*args, **kwargs)
+
+    try:
+      with mock.patch.object(entry, "_compile_and_record", blocking):
+        yield started, release, calls
+    finally:
+      release.set()  # never leave a compile thread blocked behind a failed assertion
+
+  def _start_second_waiter(self, entry, inflight):
+    """Starts a second warmup call of _toy_fn(a, b, True) and waits until it found the first one's compile."""
+    second, out = self._start_call(_toy_fn, self._a, self._b, True)
+    self.assertTrue(inflight.found_in_flight.wait(timeout=60))
+    return second, out
+
+  def test_concurrent_warmup_of_one_signature_compiles_once(self):
+    self._install()
+    entry = self._entry("._toy_fn")
+    inflight = _ObservedInflight()
+    with (
+        aot_cache.warmup_mode(),
+        mock.patch.object(entry, "_inflight", inflight),
+        self._blocking_compile(entry) as (started, release, calls),
+    ):
+      first, out1 = self._start_call(_toy_fn, self._a, self._b, True)
+      self.assertTrue(started.wait(timeout=60))
+      second, out2 = self._start_second_waiter(entry, inflight)
+      release.set()
+      first.join(timeout=60)
+      second.join(timeout=60)
+    self.assertFalse(first.is_alive())
+    self.assertFalse(second.is_alive())
+    for out in (out1, out2):
+      self.assertNotIn("error", out)
+      np.testing.assert_allclose(out["result"], np.zeros((8, 8)))  # warmup zeros, nothing executed
+    self.assertEqual(len(calls), 1)
+    self.assertEqual(inflight, {})
+    self.assertEqual(list(entry._pending), [self._toy_signature(True)])
+    self.assertEqual(aot_cache.save_pending(), 1)
+    self.assertEqual(len(self._aotx_files()), 1)
+
+  def test_failed_owner_lets_a_waiter_compile(self):
+    self._install()
+    entry = self._entry("._toy_fn")
+    inflight = _ObservedInflight()
+    with (
+        aot_cache.warmup_mode(),
+        mock.patch.object(entry, "_inflight", inflight),
+        self._blocking_compile(entry, fail_first=True) as (started, release, calls),
+    ):
+      first, out1 = self._start_call(_toy_fn, self._a, self._b, True)
+      self.assertTrue(started.wait(timeout=60))
+      second, out2 = self._start_second_waiter(entry, inflight)
+      release.set()
+      first.join(timeout=60)
+      second.join(timeout=60)
+    self.assertFalse(first.is_alive())
+    self.assertFalse(second.is_alive())
+    self.assertIn("owner compile failed", str(out1["error"]))
+    # The waiter compiled the signature itself after the owner failed.
+    self.assertNotIn("error", out2)
+    np.testing.assert_allclose(out2["result"], np.zeros((8, 8)))
+    self.assertEqual(len(calls), 2)
+    self.assertEqual(inflight, {})
+    self.assertEqual(aot_cache.save_pending(), 1)
+
+  def test_failed_owner_and_waiter_both_raise(self):
+    self._install()
+    entry = self._entry("._toy_fn")
+    inflight = _ObservedInflight()
+    with (
+        aot_cache.warmup_mode(),
+        mock.patch.object(entry, "_inflight", inflight),
+        self._blocking_compile(entry, fail_first=True, fail_all=True) as (started, release, calls),
+    ):
+      first, out1 = self._start_call(_toy_fn, self._a, self._b, True)
+      self.assertTrue(started.wait(timeout=60))
+      second, out2 = self._start_second_waiter(entry, inflight)
+      release.set()
+      first.join(timeout=60)
+      second.join(timeout=60)
+    self.assertFalse(first.is_alive())
+    self.assertFalse(second.is_alive())
+    self.assertIn("owner compile failed", str(out1["error"]))
+    self.assertIn("compile failed again", str(out2["error"]))
+    self.assertEqual(len(calls), 2)
+    self.assertEqual(inflight, {})
+    self.assertNotIn(self._toy_signature(True), entry._compiled)
+    self.assertEqual(aot_cache.save_pending(), 0)
+
+  def test_distinct_signatures_compile_concurrently(self):
+    self._install()
+    entry = self._entry("._toy_fn")
+    # Each compile waits until the other one is in flight too: serialized compiles break the barrier.
+    barrier = threading.Barrier(2, timeout=60)
+    real = entry._compile_and_record
+    calls = []
+
+    def meeting(*args, **kwargs):
+      calls.append(threading.current_thread().name)
+      barrier.wait()
+      return real(*args, **kwargs)
+
+    with aot_cache.warmup_mode(), mock.patch.object(entry, "_compile_and_record", meeting):
+      first, out1 = self._start_call(_toy_fn, self._a, self._b, True)
+      second, out2 = self._start_call(_toy_fn, self._a, self._b, False)
+      first.join(timeout=60)
+      second.join(timeout=60)
+    self.assertFalse(first.is_alive())
+    self.assertFalse(second.is_alive())
+    for out in (out1, out2):
+      self.assertNotIn("error", out)
+    self.assertEqual(len(calls), 2)
+    self.assertEqual(aot_cache.save_pending(), 2)
+
+  def test_save_pending_while_another_signature_compiles(self):
+    self._install()
+    entry = self._entry("._toy_fn")
+    with aot_cache.warmup_mode():
+      _toy_fn(self._a, self._b, False)  # compiled and recorded before the concurrent one starts
+      with self._blocking_compile(entry) as (started, release, calls):
+        thread, out = self._start_call(_toy_fn, self._a, self._b, True)
+        self.assertTrue(started.wait(timeout=60))
+        # Saves what is recorded; the signature still compiling is neither saved nor lost.
+        self.assertEqual(aot_cache.save_pending(), 1)
+        self.assertNotIn(self._toy_signature(True), entry._on_disk)
+        release.set()
+        thread.join(timeout=60)
+      self.assertFalse(thread.is_alive())
+      self.assertNotIn("error", out)
+      self.assertEqual(aot_cache.save_pending(), 1)
+    self.assertEqual(aot_cache.save_pending(), 0)
+    self.assertEqual(len(calls), 1)
+    self.assertEqual(entry._on_disk, {self._toy_signature(True), self._toy_signature(False)})
+    self.assertEqual(len(self._aotx_files()), 2)
+
+  def test_warmup_reader_never_sees_a_half_published_lazy_load(self):
+    self._save_toy()
+    self._install_lazy()
+    entry = self._entry("._toy_fn")
+    # The load stores the executable, then pauses before its lock is released: a warm-up reader that
+    # checked `_compiled` without the lock would find no out specs and execute.
+    compiled = _PausingDict()
+    with (
+        aot_cache.warmup_mode(),
+        mock.patch.object(entry, "_compiled", compiled),
+        mock.patch.object(entry, "_align_inputs", side_effect=AssertionError("executed in warmup mode")),
+        mock.patch.object(entry, "_compile_and_record", side_effect=AssertionError("compiled")),
+    ):
+      try:
+        loader, out1 = self._start_call(_toy_fn, self._a, self._b, True)
+        self.assertTrue(compiled.stored.wait(timeout=60))
+        reader, out2 = self._start_call(_toy_fn, self._a, self._b, True)
+        time.sleep(0.3)  # let the reader reach the readiness check while the load is still publishing
+      finally:
+        compiled.release.set()
+      loader.join(timeout=60)
+      reader.join(timeout=60)
+    self.assertFalse(loader.is_alive())
+    self.assertFalse(reader.is_alive())
+    for out in (out1, out2):
+      self.assertNotIn("error", out)
+      np.testing.assert_allclose(out["result"], np.zeros((8, 8)))
+    self.assertEqual(aot_cache.save_pending(), 0)
+
+  def _strip_out_specs_from_saved_toy(self):
+    """Saves the toy executable, then rewrites its file like an older one without out_shapes_dtypes."""
+    path = self._save_toy()
+    with open(path, "rb") as f:
+      blob = pickle.load(f)
+    del blob["out_shapes_dtypes"]
+    with open(path, "wb") as f:
+      pickle.dump(blob, f)
+
+  def test_warmup_derives_out_specs_of_an_old_file_without_executing(self):
+    self._strip_out_specs_from_saved_toy()
+    for lazy in (False, True):
+      with self.subTest(lazy=lazy):
+        aot_cache.install(self._tmp.name, meta={"m": 1}, mesh=self._mesh, lazy_load=lazy)
+        aot_cache.wait_for_loads()
+        entry = self._entry("._toy_fn")
+        with (
+            aot_cache.warmup_mode(),
+            mock.patch.object(entry, "_align_inputs", side_effect=AssertionError("executed in warmup mode")),
+            mock.patch.object(entry, "_compile_and_record", side_effect=AssertionError("compiled")),
+        ):
+          warm = _toy_fn(self._a, self._b, True)
+        np.testing.assert_allclose(np.asarray(warm), np.zeros((8, 8)))
+        signature = self._toy_signature(True)
+        self.assertIn(signature, entry._on_disk)
+        self.assertIn(signature, entry._out_specs)
+        self.assertEqual(aot_cache.save_pending(), 0)
+        # Outside warmup mode the loaded executable runs for real.
+        np.testing.assert_allclose(np.asarray(_toy_fn(self._a, self._b, True)), self._a @ self._b + 1.0)
+
+  def test_warmup_refuses_to_execute_when_out_specs_cannot_be_derived(self):
+    self._strip_out_specs_from_saved_toy()
+    self._install()
+    entry = self._entry("._toy_fn")
+    with (
+        aot_cache.warmup_mode(),
+        mock.patch.object(entry, "_align_inputs", side_effect=AssertionError("executed in warmup mode")),
+        mock.patch.object(entry, "_adapter_for", side_effect=ValueError("lowering broke")),
+    ):
+      with self.assertRaisesRegex(RuntimeError, "no output specs.*lowering broke.*refuses to execute"):
+        _toy_fn(self._a, self._b, True)
+    self.assertEqual(entry._inflight, {})
 
   def test_compiler_options_default_to_none(self):
     self.assertIsNone(self._entry("._toy_fn").compiler_options)
