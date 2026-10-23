@@ -283,3 +283,108 @@ scoped VMEM 한도와 to_q(L 16512) 타일의 관계(단독 재현기, 컴파일
 v6e-1 실측(스팟 us-east1-d, 2026-10-04 20:16~20:58 UTC, 코드 57de17b, 같은 노드에서 한도만 바꾼 A/B, 같은 프롬프트·시드): 시간 측정 디노이즈 32 / 36 / 64 MiB — 1024² 0.956 / 0.937 / 0.960 s, 2048² 6.429 / 6.282 / 6.154 s. 36 MiB는 두 크기 모두 빠르다(−2.0 % / −2.3 %). 64 MiB는 2048²에서 더 빠르지만(−4.3 %) 1024²에서는 약간 느려 기본값으로 하지 않았다. xprof(2048², 36 MiB, 6.6/6.7과 같은 방식): 이미지당 장치 시간 6723.5 → 6530.3 ms. to_q 호출당 1.173 → 0.789 ms(모델 예측 약 0.95 ms보다 좋고, 복사가 있던 6.6의 0.809 ms보다도 빠르다), up_proj 2.676 → 2.483 ms, gate_proj 2.107 → 2.044 ms, 어텐션 커널 −1 %. 이미지: 한도가 다르면 비트 단위로 같지 않다(1024² 36 vs 32 MiB PSNR 19.2 dB, 2048² 22.7 dB; 2048² 36 vs 64 MiB는 동일). int8 matmul의 int32 합은 순서와 무관하지만 다시 타일링된 bf16 융합의 f32 누적 순서가 바뀌고, 8 스텝 디노이즈에서 커진다. 같은 장면이고 모자·후드 같은 세부만 다르며 화질 차이는 없다고 판단했다(사용자 미확인). 사전 컴파일(`pc`, 11분)과 업로드(`aotup`)는 같은 세션에서 36 MiB 기본값으로 다시 했으므로 버킷 `aot/`는 이 프리셋에서 적중한다.
 
 v6e-1 교차 컴파일 확인(128 토큰 텍스트 버킷 = 실행 시 형태, 블록 5 to_q): 2048² 기본 [6 헤드] 8 × 26 스텝 → 36 MiB [8] 6 × 26 → 64 MiB [16] 3 × 12; 1024² 기본 [6] 8 × 3 → 36 MiB [8] 6 × 4. 36 MiB에서 28개 to_q가 모두 바뀌고, 그 밖에 to_k/to_v/to_gate/to_out, gate/up/down_proj 융합도 2048²에서 약 170개, 1024²에서 약 190개 타일이 바뀐다(시간 영향 미확인). transformer_step의 MSA high-water 2048² 92.5 → 84.5(36 MiB) / 61.5 MiB(64 MiB), 1024² 93.8 → 90.8 MiB. HBM 피크 17.51 / 21.30 GiB는 그대로다. qwen3_forward, transformer_text_context, vae_decode의 최적화 HLO는 N = 0과 바이트 단위로 같고 덤프된 tpu_comp_env의 한도도 기본(−1)이다(프로그램별 적용). Pallas 커널의 블록 설정은 그대로다. 주의: 텍스트 512 토큰(L 16896, `compile_krea2.py`의 최악 길이)에서는 36 MiB에서도 2048² to_q가 6 헤드 / 8 패스로 남는다. TPU에서는 아직 측정하지 않았다.
+
+### 6.8 MFU 개선 후보의 로컬 검증 (2026-10-23)
+
+도구 `maxdiffusion.tools.krea2_kernel_tuning`은 가중치 없이 커널 후보만 돌린다. `compile`은 CPU 호스트에서 가상 v6e-1로 교차 컴파일하고, `interpret`는 CPU에서 Pallas 수치를 검사하며, `benchmark`만 실제 v6e-1에서 시간을 잰다. 결과 JSON은 세 모드를 구분하고 소스 SHA256, JAX/jaxlib/libtpu 버전, 실제 입력 형태, compiler options, 메모리 분석, 실패를 기록한다. 후보마다 별도 프로세스에서 순차 실행하고 시간 제한을 넘기면 종료하며, 출력 디렉터리가 이미 있으면 실행을 거부한다(이전 결과를 새 결과로 오인하지 않도록). 로컬 환경은 JAX 0.12.0.1 / libtpu 0.0.50, 결과는 `artifacts/krea2_local_tuning_20261023/`이다. 이 절과 6.9~6.10의 `artifacts/` 경로는 레포에 커밋하지 않은 로컬 기록이다(약 570 MB). 이 단계에서는 운영 프리셋과 자동 타일 선택을 바꾸지 않았다.
+
+| 실험 | 로컬 결과 | 의미 |
+|---|---|---|
+| Attention, L=4224/4352/16512/16640/16256/15808, 36 MiB | 39/39 컴파일 | 실제 48 Q / 12 KV 헤드, D=128 형태에서 컴파일 가능 |
+| Attention, L=16512, 큰 Q 타일, 36 MiB | 7개 중 5개 컴파일 | Q=2176/2304 가능, Q=2560/3072는 scoped VMEM 부족 |
+| 같은 큰 타일 후보, 64 MiB | 7/7 컴파일 | 속도는 6.9에서 측정 |
+| Attention CPU interpret | 기본 12개, 확장 7개 통과 | 5종 prefix mask, Q/KV 끝 타일과 Q 경계의 표본 행 검사 |
+| 양자화 4가지 식/폭 × row tile 8/16/32 × L=4224/16512 | 24/24 컴파일 | 기존 JAX 표현도 같은 compiler options로 함께 컴파일 |
+| 양자화 CPU interpret | 12/12 통과 | feature 폭 6144/16384 전체, INT8 값과 bf16 스케일이 JIT 기준과 일치 |
+
+Attention CPU 검사는 후보의 실제 타일 크기를 쓰되 형태를 4 Q / 1 KV 헤드, `Lq=block_q+17`, `Lkv=block_kv+17`로 줄인다. 모든 출력의 유한성을 확인하고 query 5개 위치를 float32 참조와 비교한다(`atol=rtol=0.02`). 전체 모델 길이에서 모든 행을 검증한 것은 아니다. BF16 Q는 `log2(e)/sqrt(128)`을 곱해 반올림한 값을 참조에도 똑같이 넣는다.
+
+2K 정사각형 후보(기본 Q/KV/compute 1664/2048/2048을 매번 대조군으로 포함): Q=1536은 256-lane strip의 마지막 반쪽 타일을 없애지만 Q 블록이 10 → 11개로 늘어 K/V 재읽기가 는다. 기본 Q에 KV/compute 1024/1024는 QK 타일 면적 / 유효 면적을 1.1249 → 1.0624로 줄이지만 KV 반복이 9 → 17회로 는다(이 비율은 속도 예측도 커널 전체 FLOP 수도 아니다; PV는 tail 처리가 따로 있다). Q=2176/2304는 36 MiB에 들어가는 더 큰 타일로 Q 블록이 10 → 8개로 줄고 패딩이 는다. Q=2560/3072는 64 MiB에서만 비교한다.
+
+`kernels/krea2_activation_quant.py`에는 일반 양자화, RMSNorm + modulation + 양자화, SiLU × up + 양자화 후보가 있고 BF16 표현과 스케일 반올림을 기존 식에 맞췄다. 일반 양자화는 6144와 16384 폭을 모두 비교한다: 후자는 기존 SiLU epilogue를 분리하지 않고 down_proj 직전 양자화만 바꾸는 후보다. CPU eager 실행은 BF16 중간값 반올림 때문에 JIT와 다를 수 있으므로 테스트는 실제 `Krea2RMSNorm`·SiLU 식을 JIT한 결과와 비교한다(eager 기준으로 실패한 초기 로그도 남겼다). L=16512, row tile 16의 독립 HLO에서 기존 JAX 표현은 일반 / RMS / SiLU에 융합 4 / 8 / 4개, Pallas 후보는 각각 custom call 1개다. 기존 RMS 표현은 absmax와 INT8 출력 융합에 norm/modulation 계산을 중복해 넣는다. 다만 실제 모델의 up_proj epilogue는 이미 SiLU와 absmax 일부를 흡수하므로, 독립 커널이 빠르다는 이유로 바꾸면 이 융합을 잃을 수 있다. 그래서 후보를 모델에 연결하지 않았다. 연결하려면 전체 block/step HLO와 시간, LoRA 및 부분 양자화 경로, AOT 핑거프린트, 같은 프롬프트·시드의 이미지를 검증해야 한다.
+
+재현 명령(각 `--out`은 새 경로, 무거운 작업은 순차 실행):
+
+```bash
+# CPU 로컬: attention 후보 교차 컴파일 / 마스크·경계 검사 / 양자화 후보 교차 컴파일
+JAX_PLATFORMS=cpu PYTHONPATH=src .venv-012/bin/python -m maxdiffusion.tools.krea2_kernel_tuning \
+  --mode compile --save-hlo --out artifacts/attention_compile_new
+JAX_PLATFORMS=cpu PYTHONPATH=src .venv-012/bin/python -m maxdiffusion.tools.krea2_kernel_tuning \
+  --mode interpret --out artifacts/attention_interpret_new
+JAX_PLATFORMS=cpu PYTHONPATH=src .venv-012/bin/python -m maxdiffusion.tools.krea2_kernel_tuning \
+  --kernel quant --mode compile --seq-lens 4224 16512 --save-hlo --out artifacts/quant_compile_new
+
+# 실제 v6e-1(소스만 옮기면 되고 가중치는 필요 없다)
+PYTHONPATH=src python -m maxdiffusion.tools.krea2_kernel_tuning \
+  --mode benchmark --warmup 3 --iterations 30 --out artifacts/attention_native_new
+PYTHONPATH=src python -m maxdiffusion.tools.krea2_kernel_tuning \
+  --mode benchmark --seq-lens 16512 --q-blocks 2176 2304 \
+  --warmup 3 --iterations 30 --out artifacts/attention_large_native_36m_new
+PYTHONPATH=src python -m maxdiffusion.tools.krea2_kernel_tuning \
+  --mode benchmark --seq-lens 16512 --q-blocks 2176 2304 2560 3072 \
+  --scoped-vmem-kib 65536 --warmup 3 --iterations 30 --out artifacts/attention_large_native_64m_new
+PYTHONPATH=src python -m maxdiffusion.tools.krea2_kernel_tuning \
+  --kernel quant --mode benchmark --seq-lens 4224 16512 \
+  --warmup 3 --iterations 30 --out artifacts/quant_native_new
+```
+
+Native benchmark는 매 반복 `block_until_ready`로 동기화하고 준비·컴파일·참조 검사 시간을 뺀다. Attention 시간은 이미 scale/pad한 Q/K와 평평한 V를 받는 bare kernel 시간이며, 양자화는 같은 입력·compiler options의 독립 JAX 표현 시간도 함께 기록한다. 둘 다 파이프라인 지연이나 MFU가 아니다. 그래서 attention 승자는 기존 `flash_block_sizes` 설정으로 전체 파이프라인을 다시 잰다: 36 / 64 MiB는 `krea2_transformer_scoped_vmem_limit_kib=36864/65536`으로 주고, 먼저 같은 타일로 한도의 효과를 분리한 뒤 타일을 바꾸며, 해상도와 함께 실제 컴파일된 텍스트 버킷 길이도 고정한다(6.10).
+
+### 6.9 v6e-1 커널 실측 (2026-10-23)
+
+Colab v6e-1(`TPU v6 lite` 1개), JAX/jaxlib 0.12.0.1, libtpu 0.0.50(venv의 libtpu가 로드됨을 프로세스 메모리 맵으로 확인). 원본 결과와 소스 해시는 `artifacts/krea2_native_20261023/results/`, 집계는 `artifacts/krea2_native_20261023/summary.json`에 있다.
+
+계획 108건 중 attention 72건이 수치 검사와 동기화 시간 측정을 통과했다. 양자화 24건은 수치 검사에서 탈락했고, 직사각형 두 길이(L=16256/15808)의 최종 반복 측정 12건은 25분 실험 상한으로 생략했다. Attention 초기 탐색은 여섯 길이 모두 끝났다. 아래는 bare kernel 호출당 시간(준비·패딩·컴파일 제외)이다.
+
+| 이미지 / 텍스트 버킷 | 기준 | 승자 | 반복 측정 중앙값 | 시간 감소 |
+|---|---|---|---|---|
+| 1K 정사각 / 128, L=4224 | Q=1408, 36 MiB | 기준 | 1.439 ms | 없음 |
+| 1K 정사각 / 256, L=4352 | Q=1536, 36 MiB | 기준 | 1.488 ms | 없음 |
+| 2K 정사각 / 128, L=16512 | Q=1664, 36 MiB | Q=2560, 64 MiB | 16.406 → 15.929 ms | 2.90 % |
+| 2K 정사각 / 256, L=16640 | Q=1664, 36 MiB | Q=1536, 36 MiB | 16.321 → 16.007 ms | 1.93 % |
+
+2K의 기준과 승자는 같은 칩에서 순서를 번갈아 각각 세 번 다시 쟀다: L=16512 기준 16.382~16.408 ms, 승자 15.883~15.931 ms; L=16640 기준 16.313~16.334 ms, 승자 15.994~16.019 ms. 1K는 승자가 기준과 같아 같은 설정을 여섯 번 쟀다. L=16640의 탐색에는 36 MiB 후보만 있었다(Q 1280~2048, KV/compute 1024 변형). 그래서 Q=2560 / 64 MiB는 이 길이에서 bare kernel로 재지 않았고 6.10 전체 파이프라인에서만 측정했다. L=16256/15808은 초기 탐색에서 기존 자동 Q=2048/1792가 최선(14.236 / 14.305 ms)이었지만 최종 반복은 하지 못했고, Q=2560은 재지 않았다.
+
+양자화 후보는 모두 INT8 값의 완전 일치 검사에서 탈락했다: 값의 1.24~3.09 %가 달랐고 최대 차이는 1 또는 2다. INT8 검사에서 먼저 멈춰 스케일의 완전 일치는 판정하지 못했다. 이 후보들의 시간은 성공 수치로 기록하지 않았고 모델에도 연결하지 않았다. CPU interpret 통과(6.8)를 native TPU 일치로 볼 수 없으며, 허용 오차를 넓혀 통과시키지 않는다.
+
+분석용 core utilization(8 스텝, batch 1, no CFG): `L=(height/16)*(width/16)+text_bucket`, `Pblock=434110464`로 `F8=2*L*Pblock*28*8`, `F16=4*L^2*6144*28*8`을 구하고 정밀도별 peak로 정규화한 `(F8/1836e12 + F16/918e12)/denoise_seconds`를 쓴다. vector 연산·prelude·final 등을 빼고 커널 내부 패딩도 유효 FLOP에 넣지 않은 값이므로 하드웨어 카운터 기반 MFU가 아니다.
+
+### 6.10 2K 전체 파이프라인 실측 (2026-10-23)
+
+같은 Colab v6e-1과 JAX/libtpu 버전에서 `krea2-turbo-ft3513-a100` 모델, batch 1, 8 스텝, no CFG, 기존 W8A8 경로로 2048²를 쟀다. 텍스트 버킷이 128 / 256(L=16512 / 16640)이 되는 프롬프트 두 개를 조건마다 시드 0/1/2/0으로 돌렸다(조건당 8장, 전체 32장; 조건당 고유 프롬프트·시드 6개). 디노이즈 시간은 버킷별 첫 호출을 뺀 3회의 중앙값이고, 프로파일은 별도의 워밍된 호출에서 떴다.
+
+| 조건 | 128 버킷 디노이즈 | 256 버킷 디노이즈 | 기준 대비 시간 감소 |
+|---|---|---|---|
+| 기본 Q 자동 선택, 36 MiB | 6.3391 s | 6.2926 s | 기준 |
+| 기본 Q 자동 선택, 64 MiB | 6.2014 s | 6.1663 s | 2.17 % / 2.01 % |
+| Q=1536, 36 MiB | 6.2702 s | 6.2288 s | 1.09 % / 1.01 % |
+| Q=2560, 64 MiB | 6.0928 s | 6.0471 s | 3.88 % / 3.90 % |
+
+3.9 % 이득은 두 부분이다: 64 MiB DiT scoped-VMEM 한도만으로 약 2.1 %(2.17 / 2.01 %, 이미지 바이트 동일), 그 위에 Q=2560이 약 1.7~1.9 %(128 버킷 1.71 %, 256 버킷 1.89 %, 기준 시간 대비). 워밍된 프로파일(기준 → Q=2560 + 64 MiB)에서 DiT 프로그램 시간은 6.3313 → 6.0848 s다. 중복 명령 그룹과 자식 명령을 이중 합산하지 않고 집계하면 attention 3.7240 → 3.6092 s, XProf convolution fusion 그룹 2.2238 → 2.0911 s, loop fusion 그룹 0.3783 → 0.3793 s로, 줄어든 약 0.246 s 중 attention이 약 0.115 s, convolution fusion이 약 0.133 s를 설명한다. 앞의 것은 Q=2560 몫, 뒤의 것은 64 MiB에서 바뀐 matmul 타일(6.7)의 몫으로 본다(조건별 프로파일 분리는 하지 않았다). 결과와 프로파일의 원본·집계는 `artifacts/krea2_native_20261023/pipeline_prep/`에 있다.
+
+이미지: 64 MiB만 바꾼 조건은 기준과 8/8장이 픽셀 단위로 같다(6.7의 2048² 36 vs 64 MiB 동일과 같은 결과). Q를 바꾼 두 조건은 기준과 0/8장 동일(PSNR 17.22~21.77 dB)이지만 서로는 8/8장 PNG가 바이트 단위로 같다. 모든 조건에서 반복한 시드 0의 이미지는 프롬프트마다 픽셀 단위로 같았다(결정적). 추정(미검증): 기본 Q=1664 = 6.5 × 256이라 hybrid 커널(block_q_strip 256, 6.5)에서 Q 블록마다 마지막 strip이 128행 반쪽이 되어 다른 계산 경로를 타고, 1536(6 × 256)과 2560(10 × 256)은 온전한 strip만 쓴다. 그렇다면 이미지 차이는 큰 타일의 화질 손실이 아니라 기본값의 반쪽 strip 경로를 반영한다. 기준과 Q=2560의 고유 6쌍(애니메이션 인물 프롬프트 2개 × 시드 3개)을 육안으로 비교하면 장면은 유지되고 얼굴 비율, 머리카락, 손, 옷의 주름·명암이 달라지지만 새로 생긴 이미지 붕괴나 전반적 화질 저하는 보이지 않았다. 작은 표본의 주관적 검토이며 실사·문자·복잡한 장면은 확인하지 않았다. PSNR은 화질 점수가 아니다.
+
+MFU: XProf overview의 device duty cycle은 두 조건 모두 99.1 %였지만 MXU·HBM utilization이 0.0 %로 나와 하드웨어 카운터 MFU는 얻지 못했다. 6.9의 분석용 core utilization은 128 버킷 53.38 → 55.54 %, 256 버킷 54.40 → 56.61 %(같은 계산량에 대한 상대 효율 +4.04~4.06 %)다.
+
+권장: `flash_block_sizes`와 `krea2_transformer_scoped_vmem_limit_kib`는 둘 다 프로세스 전역이고 서빙 프로세스는 1K와 2K 프리셋을 함께 돌리므로, 전역으로 주면 1K에도 걸린다(같은 탐색에서 L=4224 block_q 2048은 1.822 ms로 자동 1408의 1.455 ms보다 +25 %; 64 MiB는 1K 디노이즈 0.937 → 0.960 s, 6.7의 2026-10-04 측정). 다른 2K 종횡비에도 걸린다(L=16256/15808은 자동 2048/1792가 최선, Q=2560 미측정). 그래서 시퀀스 길이별 설정을 권장한다: L=16512와 16640(2048², 텍스트 버킷 128/256)에만 block_q 2560 + 64 MiB를 주고 나머지는 그대로 둔다. 사용자가 픽셀 완전 일치 대신 시각적으로 문제없는 결과를 허용했으므로 Q=2560을 택한다. 현재 출력과 바이트 동일이 필요하면 같은 두 길이에 64 MiB만 주는 것(약 −2.1 %)이 보수적 선택이다. 이 L별 설정은 설정 키 `krea2_seq_len_tuning`으로 구현했고 검증 결과는 6.11에 있다.
+
+비용: Colab v6e-1 세션 두 번(6.9 커널, 6.10 파이프라인), 2026-10-23, 1.65 + 0.86 = 2.51 CU.
+
+### 6.11 L별 설정 `krea2_seq_len_tuning` 검증 (2026-10-23)
+
+구현(커밋 21ca256): `krea2_seq_len_tuning`은 L → `{block_q, scoped_vmem_limit_kib}` 표다. `block_q`는 그 L에서 flash_custom의 자동 Q 선택만 대신하고(명시한 `flash_block_sizes.block_q`가 여전히 우선), `scoped_vmem_limit_kib`는 그 L의 DiT 실행 파일에만 `krea2_transformer_scoped_vmem_limit_kib` 대신 적용된다. 한도가 다른 L은 별도 `cached_jit` 항목(`transformer_step__svmem65536`)으로 컴파일되고, 기본 한도를 쓰는 항목의 이름과 실행 파일은 그대로다. 표가 비어 있으면 AOT 메타도 이전과 같다. 비어 있지 않으면 표가 메타에 들어가므로 v6e1 프리셋의 기존 AOT 캐시는 모두 다시 컴파일된다. v6e1 프리셋은 L=16512 / 16640에 `block_q 2560 + 65536 KiB`를 넣었다. 노트북 교차 컴파일에서 표를 켠 2K 실행 파일은 전역 Q=2560 + 64 MiB 실행 파일과, 표를 끈 실행 파일과 1K 실행 파일은 이전 커밋과 소스 위치 메타데이터를 빼고 같았다.
+
+Colab v6e-1(같은 JAX 0.12.0.1 / libtpu 0.0.50, 같은 병합 모델, 6.10과 다른 VM)에서 한 프로세스로 프리셋 기본값(`tuned`, 25장)을, 다른 프로세스로 `krea2_seq_len_tuning={}`(`untuned`, 8장)을 돌렸다.
+
+- `tuned`의 6.10 2048² 8장은 6.10의 Q=2560 + 64 MiB PNG와 8/8 바이트 동일, `untuned` 8장은 6.10의 기준 PNG와 8/8 바이트 동일했다(VM이 달라도 재현된다).
+- 표에 없는 L(1024² 4224/4352, 1344×768 4288, 2688×1536 16384, 1728×2304 15808)의 12장은 2026-10-22 같은 스택의 이전 커밋 출력과 12/12 바이트 동일, 표에 있는 2048² 5장은 5/5 달랐다(PSNR 17.7~21.3 dB, 6.10의 Q 변경 차이와 같은 크기).
+- 같은 프로세스에서 반복한 시드 0은 두 변형 모두 바이트 동일했다.
+
+| 2048² 디노이즈(첫 호출 제외 중앙값) | untuned | tuned | tuned/untuned | 6.10 같은 비율 |
+|---|---|---|---|---|
+| 128 버킷, L=16512 | 6.319 s | 6.078 s | 0.9620 (−3.8 %) | 0.9611 |
+| 256 버킷, L=16640 | 6.275 s | 6.033 s | 0.9615 (−3.9 %) | 0.9610 |
+
+표에 없는 모양의 디노이즈는 이전 커밋과 0.998~1.000배였다(1024² 128 버킷 0.924 vs 0.925 s, 2688×1536 5.856 vs 5.857 s 등). 따라서 6.10의 2K 정사각 이득은 그대로 얻고 다른 모양은 바뀌지 않는다.
+
+비용: Colab v6e-1 한 세션(사용자가 만든 런타임, 16:57~17:28 UTC, 작업 자체 12.6분), 잔액 기준 3.01 CU. 그 전 v6e-1 생성 시도 세 번은 할당되지 않아 0 CU.
