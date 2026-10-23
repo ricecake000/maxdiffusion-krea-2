@@ -31,6 +31,15 @@ limitations under the License.
 # krea2_transformer_scoped_vmem_limit_kib=<KiB> compiles the DiT block executables
 # with that scoped-VMEM limit, exactly as generate_krea2.py does (the options
 # travel with the pipeline's cached_jit entries); the JSON name gets _svmem-<KiB>.
+#
+# krea2_seq_len_tuning (block_q / scoped-VMEM limit per DiT sequence length L)
+# applies as in generate_krea2.py: the DiT executable is the pipeline's entry for
+# L = image tokens + max_sequence_length (`dit_entry_for_seq_len`), and the
+# flash_custom kernel reads the table's block_q at that L. A run's L uses its
+# compacted text bucket instead, so pass e.g. max_sequence_length=128 to compile
+# the L of a 128-token bucket (the default 512 rarely matches a table entry).
+# The report records the table, L, the entry for L (or none) and the scoped-VMEM
+# limit and block_q actually applied; the JSON name is unchanged.
 
 import json
 import math
@@ -345,6 +354,38 @@ def compile_executable(name, entry, param_args, activation_args, calls, hlo_dir=
   return record, outputs
 
 
+def attention_block_q_at(transformer, seq_len, config):
+  """(block_q, source) the flash_custom kernel uses at DiT length `seq_len`; (None, reason) when it does not run.
+
+  Same selection as the kernel wrapper (`select_krea2_block_sizes` with the
+  transformer's carrier on its mesh's device kind, operands in
+  `activations_dtype`). source: "flash_block_sizes" (an explicit block_q),
+  "krea2_seq_len_tuning" (the table's entry for `seq_len`) or "automatic".
+  """
+  # pylint: disable=import-outside-toplevel
+  from maxdiffusion.kernels.krea2_attention import select_krea2_block_sizes, seq_len_block_q
+  from maxdiffusion.models.attention_flax import _read_custom_block_sizes
+
+  if transformer.attention_kernel != "flash_custom":
+    return None, f"attention {transformer.attention_kernel}"
+  if seq_len < transformer.flash_min_seq_length:
+    return None, f"L below flash_min_seq_length {transformer.flash_min_seq_length}"
+  user = _read_custom_block_sizes(transformer.flash_block_sizes)
+  try:
+    sizes = select_krea2_block_sizes(
+        seq_len, user=user, device_kind=krea2_mesh_device_kind(transformer.mesh), dtype=config.activations_dtype
+    )
+  except ValueError as e:
+    return None, f"selection failed: {e}"
+  if user["block_q"]:
+    source = "flash_block_sizes"
+  elif seq_len_block_q(user, seq_len) is not None:
+    source = "krea2_seq_len_tuning"
+  else:
+    source = "automatic"
+  return sizes.block_q, source
+
+
 def add_retained(record, live_buffers, activation_args, outputs):
   """Adds the pipeline buffers live in __call__ during this executable that are not its own inputs/outputs."""
   if record["retained"] is not None:
@@ -395,12 +436,36 @@ def print_report(report):
   for r in report["executables"]:
     if r["retained_buffers"]:
       max_logging.log(f"  retained during {r['name']}: {', '.join(r['retained_buffers'])}")
-  optioned = [r["name"] for r in report["executables"] if r.get("compiler_options")]
+  # Each record's own options: a krea2_seq_len_tuning entry for L may replace the global limit.
+  optioned = [f"{r['name']} {r['compiler_options']}" for r in report["executables"] if r.get("compiler_options")]
   limit_kib = report.get("krea2_transformer_scoped_vmem_limit_kib")
+  dit_limit_kib = report.get("dit_scoped_vmem_limit_kib")
   if optioned:
-    max_logging.log(f"Scoped VMEM limit {limit_kib} KiB (compiler option) in: {', '.join(optioned)}; others: default.")
+    max_logging.log(f"Scoped VMEM limit (compiler option) in: {'; '.join(optioned)}; others: default.")
+  elif dit_limit_kib:
+    max_logging.log(f"The DiT scoped-VMEM limit at this L ({dit_limit_kib} KiB) was not applied (target is not a TPU).")
   elif limit_kib:
-    max_logging.log(f"krea2_transformer_scoped_vmem_limit_kib={limit_kib} was not applied (target is not a TPU).")
+    max_logging.log(
+        f"krea2_transformer_scoped_vmem_limit_kib={limit_kib} does not apply at L={report.get('dit_seq_len')}: "
+        "its krea2_seq_len_tuning entry sets the compiler's default limit there."
+    )
+  tuning = report.get("krea2_seq_len_tuning") or {}
+  if tuning:
+    entry = report.get("dit_seq_len_tuning_entry")
+    max_logging.log(
+        f"krea2_seq_len_tuning {json.dumps(tuning)}: DiT L={report['dit_seq_len']} "
+        f"(image {report['dit_seq_len'] - report['dit_text_len']} + text {report['dit_text_len']}) "
+        + (
+            f"-> entry {json.dumps(entry)}"
+            if entry
+            else "has no entry (a run's L uses its text bucket: pass max_sequence_length=<bucket> to compile it)"
+        )
+    )
+  if report.get("krea2_attention_block_q") is not None:
+    max_logging.log(
+        f"flash_custom block_q at L={report['dit_seq_len']}: {report['krea2_attention_block_q']} "
+        f"({report['krea2_attention_block_q_source']})."
+    )
   weights = report["resident_weights"]
   max_logging.log(report["text_encoder_residency"])
   max_logging.log(
@@ -522,7 +587,11 @@ def main(argv):
       KREA2_TEXT_CONTEXT_KEYS,
       FlaxKrea2Pipeline,
       is_classifier_free_guidance_enabled,
+      resolve_seq_len_tuning,
       resolve_transformer_scoped_vmem_limit_kib,
+      seq_len_scoped_vmem_limit_kib,
+      seq_len_tuning_entry,
+      seq_len_tuning_json,
   )
 
   config = pyconfig.config
@@ -532,6 +601,8 @@ def main(argv):
   attention_kernel_choice = resolve_krea2_attention_kernel(config)
   # Validated before anything compiles; the pipeline applies it to the DiT programs.
   scoped_vmem_limit_kib = resolve_transformer_scoped_vmem_limit_kib(config)
+  # Same for the per-sequence-length table (the pipeline and the transformer's carrier apply it).
+  seq_len_tuning = resolve_seq_len_tuning(config)
   # getattr defaults keep this script usable with configs that predate these keys.
   offload = tuple(getattr(config, "krea2_offload_components", None) or ())
   unknown = sorted(set(offload) - set(OFFLOADABLE_COMPONENTS))
@@ -597,6 +668,9 @@ def main(argv):
   )
   seq_txt_full = seq_txt + KREA2_PROMPT_TEMPLATE_START_IDX
   in_channels = transformer.in_channels
+  # The DiT joint sequence length [image | text] of the compiled step: the krea2_seq_len_tuning key.
+  dit_seq_len = seq_img + seq_txt
+  dit_tuning_entry = seq_len_tuning_entry(seq_len_tuning, dit_seq_len)
 
   key = jax.random.PRNGKey(config.seed if config.seed is not None else 0)
   key, qwen_key = jax.random.split(key)
@@ -741,7 +815,8 @@ def main(argv):
       block_args = (hidden_states, temb_mod, rotary_emb, attention_mask)
       record, hidden_states = compile_executable(
           "transformer_block",
-          pipeline._jitted_transformer_block,
+          # The entry a run uses at this L (krea2_seq_len_tuning may give it its own options).
+          pipeline.dit_entry_for_seq_len("transformer_block", hidden_states.shape[1]),
           (t_params["blocks_0"], {}),
           block_args,
           num_layers * steps * cfg_passes,
@@ -770,7 +845,8 @@ def main(argv):
     else:
       record, noise_pred = compile_executable(
           "transformer_step",
-          pipeline._jitted_transformer_step,
+          # The entry a run uses at this L (krea2_seq_len_tuning may give it its own options).
+          pipeline.dit_entry_for_seq_len("transformer_step", seq_img + text_hidden.shape[1]),
           (t_params,),
           step_inputs,
           steps * cfg_passes,
@@ -874,6 +950,11 @@ def main(argv):
     ideal_xla = sum(r["calls"] * r["flops_per_device"] for r in records) / peak_flops
     ideal_with_attention = ideal_xla + attention_flops / (peak_flops * len(devices))
 
+  # What the table applied at this L: the DiT record's scoped-VMEM option (None =
+  # the compiler's default / not a TPU) and the flash_custom kernel's block_q.
+  dit_record = next(r for r in records if r["name"] in ("transformer_step", "transformer_block"))
+  dit_scoped_vmem_applied = (dit_record["compiler_options"] or {}).get("xla_tpu_scoped_vmem_limit_kib")
+  attention_block_q, attention_block_q_source = attention_block_q_at(transformer, dit_seq_len, config)
   report = {
       "topology": topology,
       "topology_name": topology_name,
@@ -898,6 +979,17 @@ def main(argv):
       "krea2_attention_kernel": attention_kernel_choice,
       "krea2_attention_kernel_variant": attention_kernel_variant,
       "krea2_transformer_scoped_vmem_limit_kib": scoped_vmem_limit_kib,
+      "krea2_seq_len_tuning": json.loads(seq_len_tuning_json(seq_len_tuning)),
+      "dit_seq_len": dit_seq_len,
+      "dit_text_len": seq_txt,
+      "dit_seq_len_tuning_entry": json.loads(seq_len_tuning_json((dit_tuning_entry,)))[str(dit_seq_len)]
+      if dit_tuning_entry
+      else None,
+      # The limit the table / global key gives this L, and the option the DiT program was compiled with.
+      "dit_scoped_vmem_limit_kib": seq_len_scoped_vmem_limit_kib(seq_len_tuning, scoped_vmem_limit_kib, dit_seq_len),
+      "dit_scoped_vmem_limit_kib_applied": dit_scoped_vmem_applied,
+      "krea2_attention_block_q": attention_block_q,
+      "krea2_attention_block_q_source": attention_block_q_source,
       "attention_uses_kernel": uses_kernel,
       "flash_min_seq_length": transformer.flash_min_seq_length,
       "executables": records,

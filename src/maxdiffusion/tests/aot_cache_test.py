@@ -67,6 +67,26 @@ def _tpu_optioned_donating_fn(h, w):
   return h @ w
 
 
+def _named_fn(x, y):
+  return x @ y * 3.0
+
+
+def _named_fn_alt(x, y):
+  # Same parameters (so the same input signature), another program: a load that
+  # hands one entry the other's executable returns the wrong factor.
+  return x @ y * 5.0
+
+
+_NAMED_ALT = "aot_cache_test._named_fn__alt"
+
+
+def _named_entries():
+  """A default-named entry and a name-overridden one with other options; registered anew on each call."""
+  default = aot_cache.cached_jit(_named_fn)
+  override = aot_cache.cached_jit(_named_fn_alt, compiler_options=_CPU_OPTIONS, name=_NAMED_ALT)
+  return default, override
+
+
 class _ObservedLock:
   """Wraps a lock and signals once a second caller tries to enter it."""
 
@@ -920,6 +940,49 @@ class AotCacheTest(unittest.TestCase):
       np.testing.assert_allclose(np.asarray(plain(self._a)), self._a + 1.0)
       np.testing.assert_allclose(np.asarray(jax.jit(lambda: empty(self._a))()), self._a + 2.0)
     aot_cache._REGISTRY[registered:] = []
+
+  def test_name_override(self):
+    registered = len(aot_cache._REGISTRY)
+    self.addCleanup(lambda: aot_cache._REGISTRY.__delitem__(slice(registered, None)))
+    default, override = _named_entries()
+    self.assertEqual(default.name, "aot_cache_test._named_fn")
+    self.assertEqual(aot_cache.default_entry_name(_named_fn), "aot_cache_test._named_fn")
+    self.assertEqual(override.name, _NAMED_ALT)
+    self.assertEqual(override.compiler_options, _CPU_OPTIONS)
+    expected = {default.name: np.asarray(self._a @ self._b * 3.0), override.name: np.asarray(self._a @ self._b * 5.0)}
+    # Disabled cache: both run like jit.
+    for entry in (default, override):
+      np.testing.assert_allclose(np.asarray(entry(self._a, self._b)), expected[entry.name])
+    self._install()
+    default(self._a, self._b)
+    override(self._a, self._b)
+    self.assertEqual(aot_cache.save_pending(), 2)
+    default_files = glob.glob(os.path.join(self._tmp.name, "aot_cache_test._named_fn-*.aotx"))
+    override_files = glob.glob(os.path.join(self._tmp.name, f"{_NAMED_ALT}-*.aotx"))
+    self.assertEqual((len(default_files), len(override_files)), (1, 1))
+    # Same input signature, distinct files.
+    self.assertEqual(default_files[0].rsplit("-", 1)[1], override_files[0].rsplit("-", 1)[1])
+    # A later process (fresh entries of both names), eager and lazy: each entry runs the executable of its own file.
+    for lazy in (False, True):
+      with self.subTest(lazy_load=lazy):
+        fresh = _named_entries()
+        aot_cache.install(self._tmp.name, meta={"m": 1}, mesh=self._mesh, lazy_load=lazy)
+        aot_cache.wait_for_loads()
+        for entry in fresh:
+          self.assertEqual(len(entry._compiled), 0 if lazy else 1, entry.name)
+          out = np.asarray(entry(self._a, self._b))
+          # Loaded from disk (not a jit fallback, which would compute the right value from the entry's own fn).
+          self.assertEqual(len(entry._on_disk), 1, entry.name)
+          self.assertEqual(len(entry._pending), 0, entry.name)
+          np.testing.assert_allclose(out, expected[entry.name], err_msg=entry.name)
+
+  def test_name_override_is_validated(self):
+    registered = len(aot_cache._REGISTRY)
+    for name in ("", "a-b", "a/b", "a*", "a b", "x[1]", 7):
+      with self.subTest(name=name):
+        with self.assertRaisesRegex(ValueError, "cached_jit name"):
+          aot_cache.cached_jit(_named_fn, name=name)
+    self.assertEqual(len(aot_cache._REGISTRY), registered)  # nothing registered
 
   def test_signature_deterministic_across_processes(self):
     # Signatures live in filenames; a process-dependent component (e.g.

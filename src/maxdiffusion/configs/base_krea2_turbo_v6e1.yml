@@ -101,6 +101,22 @@
 #   0.789 ms per call, up_proj 2.676 -> 2.483 ms, device time 6723 -> 6530 ms.
 #   Images are not bit-identical across limits (retiled bf16 fusions change the
 #   f32 accumulation order): same scene, small detail changes.
+# - krea2_seq_len_tuning: 2048x2048 with the 128 / 256-token text buckets only
+#   (DiT sequence length L 16512 / 16640) runs the flash_custom kernel with
+#   block_q 2560 (automatic: 1664) and the DiT program with a 64 MiB scoped-VMEM
+#   limit instead of 36 MiB. Colab v6e-1 2026-10-23 (jax 0.12.0.1, libtpu
+#   0.0.50, merged Turbo model, batch 1, 8 steps, no CFG), timed denoise with
+#   the 128 / 256 bucket: 6.339 -> 6.093 s / 6.293 -> 6.047 s (-3.9 %). The
+#   64 MiB part alone gives 6.201 / 6.166 s with byte-identical images; block_q
+#   2560 changes the images (same scene, accepted visually) and does not compile
+#   under 36 MiB. Every other L keeps the defaults: at 1024x1024 64 MiB was
+#   slower (0.937 -> 0.960 s, the 32 / 36 / 64 MiB A/B above) and a larger
+#   block_q costs kernel time (block_q 2048 +25 % against the automatic 1408 at
+#   L 4224); at the other 2k aspect ratios (L 16256 / 15808) the automatic
+#   block_q 2048 / 1792 measured fastest. The table is part of the AOT key; L 16512 / 16640 run a second DiT
+#   entry, saved as krea2_pipeline.transformer_step__svmem65536-<fp>-<sig>.aotx.
+#   Off: krea2_seq_len_tuning={} (pyconfig parses the value as JSON, so the
+#   quotes must not reach it; '' is a JSON error).
 # - krea2_text_compaction_multiple 128: valid prompt tokens are gathered to the
 #   front and the text is truncated to a 128-token bucket (exact); typical
 #   prompts use 128 instead of 512 text tokens.
@@ -504,9 +520,16 @@ krea2_attention_kernel: 'auto'
 # xla_tpu_scoped_vmem_limit_kib on a TPU only (never on CPU). 0 = the compiler's
 # default (32 MiB on v6e); otherwise an int in [16384, 131072]. A larger limit
 # lets fusions use bigger tiles but leaves less of the 128 MiB VMEM to MSA
-# placements. 36864 (36 MiB) here: see the header. Command-line override:
+# placements. 36864 (36 MiB) here: see the header; krea2_seq_len_tuning below
+# replaces it at the 2048x2048 sequence lengths. Command-line override:
 # krea2_transformer_scoped_vmem_limit_kib=65536.
 krea2_transformer_scoped_vmem_limit_kib: 36864
+# Per-sequence-length DiT settings (block_q of the flash_custom kernel and/or
+# the DiT scoped-VMEM limit at one L = image tokens + compiled text bucket; see
+# base_krea2_turbo.yml for the format). Here only 2048x2048 with the 128 / 256-
+# token text buckets (L 16512 / 16640): block_q 2560 and 64 MiB, see the header.
+# Off (every L on the defaults above): krea2_seq_len_tuning={}.
+krea2_seq_len_tuning: {"16512": {"block_q": 2560, "scoped_vmem_limit_kib": 65536}, "16640": {"block_q": 2560, "scoped_vmem_limit_kib": 65536}}
 # RoPE layout of the DiT blocks: "interleaved" (checkpoint order, rotates
 # (2i, 2i+1) pairs) or "rotate_half" (q/k head dims are permuted at load time so
 # RoPE rotates the two 64-lane halves; identical outputs, cheaper on TPU).

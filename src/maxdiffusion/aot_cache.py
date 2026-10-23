@@ -46,6 +46,8 @@ minus the torch interop):
     wrapped fn only: they go to its own ``jax.jit`` and to its per-signature
     adapter, so the jit fallback, ``lower().compile()`` and the serialized
     executable all carry them while other programs keep the defaults.
+    Two entries of one fn with different options take distinct
+    ``cached_jit(name=...)`` names, so their files never collide.
   * ``install(..., lazy_load=True)`` starts no background loads: a
     signature's file is deserialized on its first call instead (one
     ``os.path.exists`` per shape, one attempt per install), so a cache
@@ -238,7 +240,7 @@ def _download_from_gcs(fn_name: str, path: str, gcs_prefix: str) -> bool:
 def _resolve_trace_state_clean():
   """jax's "no transformation is tracing" predicate, or None when this jax lacks it.
 
-  ``trace_state_clean`` is private jax API (present in jax 0.11.1 and 0.11.2).
+  ``trace_state_clean`` is private jax API (present in jax 0.11.1 through 0.12.0.1).
   Resolved once at import: entries with compiler options depend on it (see
   ``_outer_trace_active``) and refuse to be built without it.
   """
@@ -315,7 +317,8 @@ class _AotEntry:
       raise RuntimeError(
           f"{name}: compiler_options {self.compiler_options} need jax._src.core.trace_state_clean, which jax "
           f"{jax.__version__} does not provide. Set krea2_transformer_scoped_vmem_limit_kib=0 (the compiler's "
-          "default limit) to run without compiler options."
+          "default limit) and no krea2_seq_len_tuning scoped_vmem_limit_kib other than 0 to run without compiler "
+          "options."
       )
     overlap = set(self.static_argnames) & set(self.donate_argnames)
     if overlap:
@@ -803,11 +806,25 @@ _REGISTRY: list[_AotEntry] = []
 _LOAD_THREADS: list[threading.Thread] = []
 
 
+# Accepted ``cached_jit(name=...)`` overrides: the name is the first field of
+# "<name>-<fingerprint>-<signature>.aotx" and of the glob that loads them, so
+# no "-", path separator or glob metacharacter.
+_ENTRY_NAME_RE = re.compile(r"[A-Za-z0-9_.]+")
+
+
+def default_entry_name(fn: Callable) -> str:
+  """The on-disk name ``cached_jit`` gives ``fn`` without a ``name`` override: "<module tail>.<fn name>"."""
+  # Qualify by module: same-named fns (e.g. the VACE and base
+  # transformer_forward_pass) must not glob each other's files.
+  return f"{fn.__module__.rsplit('.', 1)[-1]}.{fn.__name__}"
+
+
 def cached_jit(
     fn: Callable,
     static_argnames: tuple = (),
     donate_argnames: tuple = (),
     compiler_options: dict[str, Any] | None = None,
+    name: str | None = None,
 ) -> Callable:
   """Drop-in replacement for ``jax.jit`` with an optional AOT layer.
 
@@ -827,10 +844,19 @@ def cached_jit(
   executables only. They are not part of the on-disk key: the caller puts
   whatever selects them into the ``install()`` meta. A call under an outer
   trace inlines without them (jax allows them on top-level jits only).
+
+  ``name`` (None = ``default_entry_name(fn)``) replaces the name the entry's
+  files are stored and loaded under. Two entries of one fn that compile
+  different programs for the same input signature (e.g. the same DiT step
+  with another scoped-VMEM limit) need distinct names, since the signature
+  only covers the inputs. Letters, digits, '_' and '.' only (ValueError
+  otherwise): no '-', which separates the name from the fingerprint, and
+  nothing a path or glob would interpret.
   """
-  # Qualify by module: same-named fns (e.g. the VACE and base
-  # transformer_forward_pass) must not glob each other's files.
-  name = f"{fn.__module__.rsplit('.', 1)[-1]}.{fn.__name__}"
+  if name is None:
+    name = default_entry_name(fn)
+  elif not isinstance(name, str) or not _ENTRY_NAME_RE.fullmatch(name):
+    raise ValueError(f"cached_jit name must match {_ENTRY_NAME_RE.pattern} (no '-', '/' or glob characters), got {name!r}")
   entry = _AotEntry(name, fn, static_argnames, donate_argnames, compiler_options)
   _REGISTRY.append(entry)
   return entry

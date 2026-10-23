@@ -421,19 +421,27 @@ def resolve_krea2_attention_kernel(config) -> str:
 
 
 def krea2_flash_block_sizes(config):
-  """`max_utils.get_flash_block_sizes(config)` plus, for flash_custom, the kernel choice in its `kernel` field.
+  """`max_utils.get_flash_block_sizes(config)` plus, for flash_custom, the kernel choice and the per-L block_q table.
 
-  flash_custom reads the choice from the carrier ("auto" picks the hybrid
-  kernel variant on a TPU v6e, flash elsewhere); a carrier is built when
-  `flash_block_sizes` is empty. Other attention kernels get the carrier as is.
+  flash_custom reads the choice from the carrier's `kernel` field ("auto"
+  picks the hybrid kernel variant on a TPU v6e, flash elsewhere) and the
+  block_q entries of `krea2_seq_len_tuning` from `block_q_by_seq_len` (None
+  without such entries, so a config without a table builds the same carrier as
+  before); a carrier is built when `flash_block_sizes` is empty. Other
+  attention kernels get the carrier as is (the pipeline logs that their table
+  block_q entries are ignored).
   """
+  # pylint: disable-next=import-outside-toplevel
+  from maxdiffusion.pipelines.krea2.krea2_pipeline import resolve_seq_len_tuning, seq_len_block_q_table
+
   carrier = max_utils.get_flash_block_sizes(config)
   if config.attention != "flash_custom":
     return carrier
   kernel = resolve_krea2_attention_kernel(config)
+  block_q_by_seq_len = seq_len_block_q_table(resolve_seq_len_tuning(config))
   if carrier is None:
-    return max_utils.CustomFlashBlockSizes(kernel=kernel)
-  return dataclasses.replace(carrier, kernel=kernel)
+    return max_utils.CustomFlashBlockSizes(kernel=kernel, block_q_by_seq_len=block_q_by_seq_len)
+  return dataclasses.replace(carrier, kernel=kernel, block_q_by_seq_len=block_q_by_seq_len)
 
 
 def build_krea2_transformer(transformer_cfg, config, mesh, quant_targets=None):
@@ -566,6 +574,24 @@ def transformer_scoped_vmem_aot_meta(limit_kib) -> dict:
   if not limit_kib:
     return {}
   return {"krea2_transformer_scoped_vmem_limit_kib": int(limit_kib)}
+
+
+def seq_len_tuning_aot_meta(tuning) -> dict:
+  """AOT cache meta entry for `krea2_seq_len_tuning` (a resolved table); empty for no table.
+
+  The table changes the DiT programs at its sequence lengths (the kernel's
+  block_q, the scoped-VMEM compile option), so its canonical JSON
+  (`seq_len_tuning_json`) is part of the fingerprint. Without a table no key is
+  added, so the fingerprint of a setup without one and its cached executables
+  stay valid. Like the scoped-VMEM key, the whole cache misses when the table
+  changes, also the programs it does not touch (compiled again once).
+  """
+  # pylint: disable-next=import-outside-toplevel
+  from maxdiffusion.pipelines.krea2.krea2_pipeline import seq_len_tuning_json
+
+  if not tuning:
+    return {}
+  return {"krea2_seq_len_tuning": seq_len_tuning_json(tuning)}
 
 
 def krea2_mesh_device_kind(mesh):
@@ -1408,7 +1434,11 @@ def create_runtime(argv) -> Optional["Krea2Runtime"]:
   )
   from maxdiffusion.models.flux.util import cast_dict_to_bfloat16_inplace
   from maxdiffusion.schedulers.scheduling_flow_match_flax import FlaxFlowMatchScheduler
-  from maxdiffusion.pipelines.krea2.krea2_pipeline import FlaxKrea2Pipeline, resolve_transformer_scoped_vmem_limit_kib
+  from maxdiffusion.pipelines.krea2.krea2_pipeline import (
+      FlaxKrea2Pipeline,
+      resolve_seq_len_tuning,
+      resolve_transformer_scoped_vmem_limit_kib,
+  )
   from maxdiffusion.loaders.krea2_lora_pipeline import (
       apply_diff_updates,
       insert_lora_params,
@@ -1428,6 +1458,9 @@ def create_runtime(argv) -> Optional["Krea2Runtime"]:
   attention_kernel_choice = resolve_krea2_attention_kernel(config)
   # Same for the DiT programs' scoped-VMEM limit (the pipeline parses it again).
   transformer_scoped_vmem_limit_kib = resolve_transformer_scoped_vmem_limit_kib(config)
+  # And the per-sequence-length table (block_q / scoped-VMEM limit per L; the
+  # transformer's carrier and the pipeline parse it again).
+  seq_len_tuning = resolve_seq_len_tuning(config)
   # The cold-start knobs, too.
   aot_cache_gcs = resolve_aot_cache_gcs(config)
   weight_cache_wait_s = resolve_weight_cache_wait_s(config)
@@ -2003,6 +2036,8 @@ def create_runtime(argv) -> Optional["Krea2Runtime"]:
           ),
           # Conditional key: only a non-default scoped-VMEM limit of the DiT programs misses older caches.
           **transformer_scoped_vmem_aot_meta(transformer_scoped_vmem_limit_kib),
+          # Conditional key: only a non-empty krea2_seq_len_tuning misses older caches.
+          **seq_len_tuning_aot_meta(seq_len_tuning),
           "lora_compile_spec": lora_compile_spec,
           "jax": jax.__version__,
       },

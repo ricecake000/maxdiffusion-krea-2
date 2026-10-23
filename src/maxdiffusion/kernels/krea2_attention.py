@@ -87,6 +87,8 @@ Selection (`select_krea2_block_sizes`): the user carrier's `kernel` field
 picks the variant; "auto" is "hybrid" on a TPU v6e ("TPU v6 lite") and "flash"
 everywhere else (`resolve_kernel_variant`). kv block sizes default per
 (variant, chip) from `_DEFAULT_KV_BLOCKS`, each field overridable by the user.
+block_q is the user's, else the carrier's `block_q_by_seq_len` entry for the
+sequence length (`krea2_seq_len_tuning`), else automatic.
 """
 
 import dataclasses
@@ -157,7 +159,8 @@ KREA2_BLOCK_SELECTION_REVISION = 4
 
 # Budget for `_estimated_vmem_bytes` per device kind, ~8 % under the smallest
 # estimate that failed to compile. Compile-only calibration with bfloat16
-# q/k/v (jax 0.11.2, libtpu 0.0.48, no vmem_limit_bytes); wider operands need
+# q/k/v (jax 0.11.2, libtpu 0.0.48, no vmem_limit_bytes; every point below
+# compiles / fails the same on jax 0.12.0.1, libtpu 0.0.50); wider operands need
 # more VMEM, so other dtypes keep the base maximum. Largest OK / smallest
 # failing block_q for block_kv/block_kv_compute/block_kv_compute_in:
 #   v6e: 1024/512/256 8832/9088, 2048/512/256 8320/8832, 1024/1024/256 5632/5888,
@@ -171,7 +174,8 @@ _VMEM_BUDGET_BYTES = {"TPU v6 lite": 36_000_000, "TPU v5 lite": 18_500_000}
 # Hybrid variant: budget for `_estimated_hybrid_vmem_bytes` per device kind,
 # `_HYBRID_VMEM_SAFETY` times the chip's default scoped VMEM limit (a user
 # vmem_limit_bytes replaces the limit, same factor). Compile-only calibration
-# (jax 0.11.2, libtpu 0.0.48, bf16 q/k/v, block_kv 2048, block_kv_compute_in
+# (jax 0.11.2, libtpu 0.0.48; unchanged on jax 0.12.0.1, libtpu 0.0.50;
+# bf16 q/k/v, block_kv 2048, block_kv_compute_in
 # min(1024, block_kv_compute), block_kv_pv 256, block_q_strip 256); largest OK
 # / smallest failing block_q per block_kv_compute, with the estimate / limit:
 #   v6e (32 MiB): 2048: 2176 / 2304 (0.848 / 0.893), 1024: 3328 / 3456 (0.848 / 0.878);
@@ -349,6 +353,46 @@ def max_hybrid_block_q(device_kind, block_kv: int, block_kv_compute: int, vmem_l
   return block_q
 
 
+def block_q_vmem_estimate_fits(
+    variant: str,
+    device_kind,
+    block_q: int,
+    block_kv: int,
+    block_kv_compute: int,
+    vmem_limit_bytes=None,
+    dtype=None,
+):
+  """Whether the VMEM estimate of `variant` at these block sizes fits its budget; None when no budget is known.
+
+  Uncapped, unlike `max_hybrid_block_q` / `max_auto_block_q` (which never go
+  past 2048 for the automatic choice), so it can check a user block_q above
+  2048. hybrid: `_estimated_hybrid_vmem_bytes` against `_hybrid_vmem_budget`
+  (`_HYBRID_VMEM_SAFETY` times `vmem_limit_bytes`, else times the chip's
+  default scoped limit; None for an unknown chip without a limit). flash:
+  `_estimated_vmem_bytes` against the chip's `_VMEM_BUDGET_BYTES` (calibrated
+  at the default limit), scaled by `vmem_limit_bytes` over the chip's default
+  limit when one is given; None for a chip without both, and for non-bfloat16
+  operands (not calibrated). An estimate only: the compile decides.
+  """
+  if variant not in KERNEL_VARIANTS:
+    raise ValueError(f"variant={variant!r} must be one of {list(KERNEL_VARIANTS)}.")
+  if variant == "hybrid":
+    budget = _hybrid_vmem_budget(device_kind, vmem_limit_bytes)
+    if budget is None:
+      return None
+    itemsize = 2 if dtype is None else jnp.dtype(dtype).itemsize
+    return _estimated_hybrid_vmem_bytes(block_q, block_kv, block_kv_compute, itemsize) <= budget
+  budget = _VMEM_BUDGET_BYTES.get(device_kind)
+  if budget is None or not (dtype is None or jnp.dtype(dtype) == jnp.bfloat16):
+    return None
+  if vmem_limit_bytes:
+    default_limit = _SCOPED_VMEM_LIMIT_BYTES.get(device_kind)
+    if default_limit is None:
+      return None
+    budget = budget * vmem_limit_bytes / default_limit
+  return _estimated_vmem_bytes(block_q, block_kv, block_kv_compute) <= budget
+
+
 def max_auto_block_q(
     device_kind,
     block_kv: int,
@@ -402,6 +446,22 @@ def _default_block_q(seq_len: int, max_block_q: int = _BLOCK_Q_BASE_MAX) -> int:
   return best[1]
 
 
+def seq_len_block_q(user, seq_len: int):
+  """The block_q the carrier's `block_q_by_seq_len` table (`krea2_seq_len_tuning`) sets for `seq_len`; None when unset.
+
+  The table is ((seq_len, block_q), ...) (a `CustomFlashBlockSizes` field) or
+  a {seq_len: block_q} dict; a missing or empty table means None.
+  """
+  table = _user_block_value(user, "block_q_by_seq_len")
+  if not table:
+    return None
+  pairs = table.items() if isinstance(table, dict) else table
+  for table_seq_len, block_q in pairs:
+    if int(table_seq_len) == int(seq_len):
+      return block_q
+  return None
+
+
 def select_krea2_block_sizes(seq_len: int, user=None, device_kind=None, dtype=None) -> Krea2BlockSizes:
   """Selects the kernel variant and block sizes for a sequence of length `seq_len`.
 
@@ -414,7 +474,9 @@ def select_krea2_block_sizes(seq_len: int, user=None, device_kind=None, dtype=No
       block_kv_pv / block_q_strip override the variant's defaults for the chip
       (`default_kv_block_sizes`); block_kv_pv / block_q_strip with the flash
       variant raise ValueError. A non-None vmem_limit_bytes keeps the flash
-      automatic block_q at most 2048 and sets the hybrid VMEM budget.
+      automatic block_q at most 2048 and sets the hybrid VMEM budget. Its
+      `block_q_by_seq_len` (`seq_len_block_q`) gives the block_q for exactly
+      this `seq_len` when its block_q is None.
     device_kind: `device_kind` of the chip the kernel runs on (e.g.
       'TPU v6 lite'): picks the "auto" variant, the default kv sizes and the
       VMEM budgets; None means unknown (flash, fallback sizes, no budget).
@@ -429,7 +491,9 @@ def select_krea2_block_sizes(seq_len: int, user=None, device_kind=None, dtype=No
     the VMEM-budget extension (`AUTO_BLOCK_Q_BUDGET_EXTENSION`, off by default)
     is switched on; for hybrid it is 2048 capped by `max_hybrid_block_q`, and a
     ValueError names the sizes to lower when not even block_q 512 fits. A user
-    block_q is never capped (the compile decides).
+    block_q is never capped (the compile decides), and neither is a
+    `block_q_by_seq_len` entry, which applies only when the user block_q is
+    None.
   """
   variant = resolve_kernel_variant(_user_block_value(user, "kernel"), device_kind)
   defaults = default_kv_block_sizes(variant, device_kind)
@@ -456,7 +520,7 @@ def select_krea2_block_sizes(seq_len: int, user=None, device_kind=None, dtype=No
         "block_kv_pv": block_kv_pv,
         "block_q_strip": _user_block_value(user, "block_q_strip") or defaults["block_q_strip"],
     }
-  block_q = _user_block_value(user, "block_q")
+  block_q = _user_block_value(user, "block_q") or seq_len_block_q(user, seq_len)
   vmem_limit_bytes = _user_block_value(user, "vmem_limit_bytes")
   if not block_q:
     if variant == "flash":

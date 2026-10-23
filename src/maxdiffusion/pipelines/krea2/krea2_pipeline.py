@@ -17,9 +17,12 @@ limitations under the License.
 # End-to-end JAX inference pipeline for Krea 2 (K2) Raw and Turbo.
 
 import functools
+import json
 import os
+import re
 import time
-from typing import Any, List, Optional, Union
+from collections.abc import Mapping
+from typing import Any, List, NamedTuple, Optional, Union
 
 import jax
 import jax.numpy as jnp
@@ -173,6 +176,150 @@ def resolve_transformer_scoped_vmem_limit_kib(config) -> int:
   return value
 
 
+# krea2_seq_len_tuning: per-sequence-length DiT settings. The key of an entry
+# is L, the DiT joint sequence length (image tokens (height/16)*(width/16) plus
+# the compiled text bucket): the q length of the flash_custom kernel and the row
+# count of every DiT matmul, so the kernel's and the fusions' tilings depend on
+# L only. Fields an entry may set (at least one):
+#   block_q: the flash_custom kernel's block_q at L in place of its automatic
+#     choice (an explicit flash_block_sizes.block_q still wins);
+#   scoped_vmem_limit_kib: krea2_transformer_scoped_vmem_limit_kib for the DiT
+#     executables at L (0 = the compiler's default there).
+KREA2_SEQ_LEN_TUNING_KEY = "krea2_seq_len_tuning"
+KREA2_SEQ_LEN_TUNING_FIELDS = ("block_q", "scoped_vmem_limit_kib")
+# A table block_q is a multiple of the kernel's 128 lanes and at least the
+# automatic choice's minimum (krea2_attention: NUM_LANES, _BLOCK_Q_MIN).
+_SEQ_LEN_TUNING_BLOCK_Q_MULTIPLE = 128
+_SEQ_LEN_TUNING_BLOCK_Q_MIN = 512
+
+
+class Krea2SeqLenTuning(NamedTuple):
+  """One `krea2_seq_len_tuning` entry; a None field is not set for this sequence length."""
+
+  seq_len: int
+  block_q: Optional[int] = None
+  scoped_vmem_limit_kib: Optional[int] = None
+
+
+def _is_int(value) -> bool:
+  # bool is an int subclass; True must not mean 1.
+  return not isinstance(value, bool) and isinstance(value, (int, np.integer))
+
+
+def _parse_seq_len_tuning_key(raw):
+  """L of one table key: a positive int or decimal string (JSON / CLI keys are strings); ValueError otherwise."""
+  key = KREA2_SEQ_LEN_TUNING_KEY
+  if _is_int(raw):
+    seq_len = int(raw)
+  elif isinstance(raw, str) and re.fullmatch(r"\s*[0-9]+\s*", raw):
+    seq_len = int(raw)
+  else:
+    raise ValueError(f"{key}: keys must be sequence lengths (positive ints or decimal strings), got {raw!r}.")
+  if seq_len <= 0:
+    raise ValueError(f"{key}: keys must be positive sequence lengths, got {raw!r}.")
+  return seq_len
+
+
+def resolve_seq_len_tuning(config) -> tuple:
+  """Parsed `krea2_seq_len_tuning`: a tuple of `Krea2SeqLenTuning` sorted by seq_len (hashable; () = no table).
+
+  The value is a dict (YAML) or a JSON object string (a command-line override
+  such as `krea2_seq_len_tuning='{"16512": {"block_q": 2560}}'`; surrounding
+  whitespace and quotes are dropped, an empty string means no table). A
+  missing key (configs that predate it) and None mean no table. Keys are the
+  DiT joint sequence length L as an int or decimal string; values are dicts
+  with `block_q` (an int, a multiple of 128, >= 512) and/or
+  `scoped_vmem_limit_kib` (0 or an int in `KREA2_SCOPED_VMEM_LIMIT_KIB_RANGE`);
+  a field set to None counts as not set. Anything else (bad JSON, a bool, an
+  unknown field, an entry without a field, the same L twice such as 16512 and
+  "16512") is a ValueError naming the key, so a typo fails at startup instead
+  of after the model has loaded.
+  """
+  key = KREA2_SEQ_LEN_TUNING_KEY
+  value = getattr(config, key, None)
+  if value is None:
+    return ()
+  if isinstance(value, str):
+    text = value.strip()
+    while len(text) >= 2 and text[0] == text[-1] and text[0] in "'\"":
+      text = text[1:-1].strip()
+    if not text:
+      return ()
+    try:
+      value = json.loads(text)
+    except json.JSONDecodeError as e:
+      raise ValueError(f"{key} must be a dict or a JSON object string, got {value!r} ({e}).") from e
+  if not isinstance(value, Mapping):
+    raise ValueError(f"{key} must be a dict (or a JSON object string) of sequence length -> settings, got {value!r}.")
+  low, high = KREA2_SCOPED_VMEM_LIMIT_KIB_RANGE
+  entries = {}
+  for raw_seq_len, fields in value.items():
+    seq_len = _parse_seq_len_tuning_key(raw_seq_len)
+    where = f"{key}[{raw_seq_len!r}]"
+    if seq_len in entries:
+      raise ValueError(f"{where}: sequence length {seq_len} is given twice.")
+    if not isinstance(fields, Mapping):
+      raise ValueError(f"{where} must be a dict with {' and/or '.join(KREA2_SEQ_LEN_TUNING_FIELDS)}, got {fields!r}.")
+    unknown = sorted(str(name) for name in fields if name not in KREA2_SEQ_LEN_TUNING_FIELDS)
+    if unknown:
+      raise ValueError(f"{where}: unknown field(s) {unknown}; allowed: {list(KREA2_SEQ_LEN_TUNING_FIELDS)}.")
+    block_q = fields.get("block_q")
+    limit_kib = fields.get("scoped_vmem_limit_kib")
+    if block_q is None and limit_kib is None:
+      raise ValueError(f"{where} must set at least one of {list(KREA2_SEQ_LEN_TUNING_FIELDS)}, got {dict(fields)!r}.")
+    if block_q is not None:
+      if (
+          not _is_int(block_q)
+          or block_q < _SEQ_LEN_TUNING_BLOCK_Q_MIN
+          or block_q % _SEQ_LEN_TUNING_BLOCK_Q_MULTIPLE != 0
+      ):
+        raise ValueError(
+            f"{where}: block_q must be an int, a multiple of {_SEQ_LEN_TUNING_BLOCK_Q_MULTIPLE} and >= "
+            f"{_SEQ_LEN_TUNING_BLOCK_Q_MIN}, got {block_q!r}."
+        )
+      block_q = int(block_q)
+    if limit_kib is not None:
+      if not _is_int(limit_kib) or (limit_kib != 0 and not low <= limit_kib <= high):
+        raise ValueError(f"{where}: scoped_vmem_limit_kib must be 0 or an int in [{low}, {high}] (KiB), got {limit_kib!r}.")
+      limit_kib = int(limit_kib)
+    entries[seq_len] = Krea2SeqLenTuning(seq_len, block_q, limit_kib)
+  return tuple(entries[seq_len] for seq_len in sorted(entries))
+
+
+def seq_len_tuning_json(tuning) -> str:
+  """Canonical JSON of a resolved table: keys in ascending L, only the set fields ("{}" for no table)."""
+  return json.dumps(
+      {
+          str(entry.seq_len): {
+              name: getattr(entry, name) for name in KREA2_SEQ_LEN_TUNING_FIELDS if getattr(entry, name) is not None
+          }
+          for entry in tuning
+      },
+      separators=(",", ":"),
+  )
+
+
+def seq_len_tuning_entry(tuning, seq_len):
+  """The table's `Krea2SeqLenTuning` for `seq_len`, or None."""
+  for entry in tuning:
+    if entry.seq_len == int(seq_len):
+      return entry
+  return None
+
+
+def seq_len_block_q_table(tuning):
+  """`CustomFlashBlockSizes.block_q_by_seq_len` of a resolved table: ((L, block_q), ...); None without block_q entries."""
+  return tuple((entry.seq_len, entry.block_q) for entry in tuning if entry.block_q is not None) or None
+
+
+def seq_len_scoped_vmem_limit_kib(tuning, global_limit_kib, seq_len) -> int:
+  """The DiT scoped-VMEM limit (KiB, 0 = compiler default) at `seq_len`: the table's, else the global one."""
+  entry = seq_len_tuning_entry(tuning, seq_len)
+  if entry is not None and entry.scoped_vmem_limit_kib is not None:
+    return entry.scoped_vmem_limit_kib
+  return int(global_limit_kib)
+
+
 def _mesh_platform(mesh):
   """Platform ("tpu", "cpu", ...) of the mesh's first device, or None when it cannot be determined.
 
@@ -205,6 +352,102 @@ def transformer_compiler_options(limit_kib, mesh):
   if limit_kib <= 0 or _mesh_platform(mesh) != "tpu":
     return None
   return {"xla_tpu_scoped_vmem_limit_kib": int(limit_kib)}
+
+
+def _options_key(options):
+  """Hashable form of a compiler-options dict (None for the defaults)."""
+  return tuple(sorted(options.items())) if options else None
+
+
+def seq_len_tuning_block_q_warnings(
+    tuning, global_limit_kib, flash_block_sizes, device_kind, mesh, dtype=None, flash_min_seq_length=0
+):
+  """Warnings for table block_q entries whose flash_custom VMEM estimate exceeds the budget at their L.
+
+  A cheap startup check, not a verdict (the compile decides): for each entry
+  with a block_q, the kernel sizes `select_krea2_block_sizes` gives at that L
+  (the entry's block_q with the kv sizes and kernel choice of the carrier
+  `flash_block_sizes` on `device_kind`) are checked with
+  `krea2_attention.block_q_vmem_estimate_fits` under the scoped-VMEM limit the
+  kernel compiles with there: the carrier's vmem_limit_bytes if set, else the
+  L's effective DiT limit when it reaches the compile
+  (`transformer_compiler_options` on `mesh`), else the chip's default. An
+  explicit carrier block_q overrides the table, so nothing is checked then
+  (one log line says so). Entries whose L is below `flash_min_seq_length`
+  (the DiT attention falls back to dot-product there, so the kernel and its
+  block_q never run) are skipped with one log line each. Returns the warning
+  lines (also logged); empty when nothing is checked or every estimate fits.
+  """
+  # pylint: disable=import-outside-toplevel
+  from maxdiffusion.kernels import krea2_attention
+  from maxdiffusion.models.attention_flax import _read_custom_block_sizes
+
+  user = _read_custom_block_sizes(flash_block_sizes)
+  if user["block_q"]:
+    max_logging.log(
+        f"{KREA2_SEQ_LEN_TUNING_KEY}: block_q entries unused, flash_block_sizes.block_q={user['block_q']} applies "
+        "at every sequence length."
+    )
+    return []
+  warnings = []
+  for entry in tuning:
+    if entry.block_q is None:
+      continue
+    if entry.seq_len < flash_min_seq_length:
+      max_logging.log(
+          f"{KREA2_SEQ_LEN_TUNING_KEY}[{entry.seq_len}]: block_q {entry.block_q} unused, L is below "
+          f"flash_min_seq_length {flash_min_seq_length} (dot-product attention there)."
+      )
+      continue
+    try:
+      # The entry's block_q with the carrier's kv sizes, kernel choice and chip defaults.
+      sizes = krea2_attention.select_krea2_block_sizes(
+          entry.seq_len, user=dict(user, block_q=entry.block_q), device_kind=device_kind, dtype=dtype
+      )
+    except ValueError:
+      continue  # the kernel wrapper raises the same error when it traces
+    limit_kib = seq_len_scoped_vmem_limit_kib(tuning, global_limit_kib, entry.seq_len)
+    vmem_limit_bytes = user["vmem_limit_bytes"]
+    if not vmem_limit_bytes and transformer_compiler_options(limit_kib, mesh):
+      vmem_limit_bytes = limit_kib * 1024
+    fits = krea2_attention.block_q_vmem_estimate_fits(
+        sizes.variant,
+        device_kind,
+        sizes.block_q,
+        sizes.block_kv,
+        sizes.block_kv_compute,
+        vmem_limit_bytes=vmem_limit_bytes,
+        dtype=dtype,
+    )
+    if fits is False:
+      limit = f"{vmem_limit_bytes // 1024} KiB" if vmem_limit_bytes else "the default limit"
+      warnings.append(
+          f"Warning: {KREA2_SEQ_LEN_TUNING_KEY}[{entry.seq_len}] block_q {sizes.block_q} exceeds the {sizes.variant} "
+          f"kernel's VMEM estimate under {limit} on {device_kind} (block_kv {sizes.block_kv}, block_kv_compute "
+          f"{sizes.block_kv_compute}); its compile may fail. Raise scoped_vmem_limit_kib for that entry or lower block_q."
+      )
+  for line in warnings:
+    max_logging.log(line)
+  return warnings
+
+
+class SeqLenDispatch:
+  """Calls the DiT executable whose compiler options belong to the call's sequence length.
+
+  Used for `_jitted_transformer_step` / `_jitted_transformer_block` only when
+  `krea2_seq_len_tuning` gives some L other compiler options than the global
+  ones (otherwise the attribute is the single cached_jit entry, as before the
+  table existed). `seq_len_of(*args, **kwargs)` reads the static length from
+  the arguments' shapes, so the choice is the same for real arrays, warmup
+  zeros and tracers; `entry_for(seq_len)` maps it to an entry.
+  """
+
+  def __init__(self, entry_for, seq_len_of):
+    self.entry_for = entry_for
+    self.seq_len_of = seq_len_of
+
+  def __call__(self, *args, **kwargs):
+    return self.entry_for(self.seq_len_of(*args, **kwargs))(*args, **kwargs)
 
 
 # Transformer param subtrees used by the prompt-only text-context executable and
@@ -423,12 +666,19 @@ class FlaxKrea2Pipeline:
     self._jitted_transformer_prelude = None
     self._jitted_transformer_block = None
     self._jitted_transformer_final = None
+    # DiT executables per kind ("transformer_step" / "transformer_block") and
+    # compiler-options key, and the key of each krea2_seq_len_tuning L with a
+    # scoped-VMEM limit (see `dit_entry_for_seq_len`); set by _setup_jit_functions.
+    self._dit_entries = {}
+    self._dit_default_options_key = None
+    self._dit_options_key_by_seq_len = {}
 
   def _setup_jit_functions(self):
     if self._jitted_qwen3_forward is not None:
       return
 
     scoped_vmem_limit_kib = resolve_transformer_scoped_vmem_limit_kib(self._config)
+    seq_len_tuning = resolve_seq_len_tuning(self._config)
     dit_compiler_options = transformer_compiler_options(scoped_vmem_limit_kib, self.mesh)
     if dit_compiler_options:
       max_logging.log(f"DiT block executables compile with {dit_compiler_options} (other executables: defaults).")
@@ -437,8 +687,71 @@ class FlaxKrea2Pipeline:
           f"krea2_transformer_scoped_vmem_limit_kib={scoped_vmem_limit_kib} ignored: the mesh platform is "
           f"{_mesh_platform(self.mesh)}, not tpu."
       )
-    # Only the executables whose program contains the DiT blocks get the options.
-    dit_jit = functools.partial(aot_cache.cached_jit, compiler_options=dit_compiler_options)
+    # krea2_seq_len_tuning: the compiler options of the DiT executables at each
+    # L the table gives a scoped-VMEM limit. Every distinct options value other
+    # than the global one gets its own cached_jit entry (and on-disk name); the
+    # global one keeps today's entry and name. Off a TPU every value is None,
+    # so there is only that one entry.
+    options_by_seq_len = {
+        entry.seq_len: transformer_compiler_options(entry.scoped_vmem_limit_kib, self.mesh)
+        for entry in seq_len_tuning
+        if entry.scoped_vmem_limit_kib is not None
+    }
+    # Options key -> (limit KiB, options) of every value other than the global one.
+    extra_options = {}
+    for seq_len, options in options_by_seq_len.items():
+      if _options_key(options) != _options_key(dit_compiler_options):
+        limit_kib = seq_len_tuning_entry(seq_len_tuning, seq_len).scoped_vmem_limit_kib
+        extra_options.setdefault(_options_key(options), (limit_kib, options))
+    if seq_len_tuning:
+      max_logging.log(f"{KREA2_SEQ_LEN_TUNING_KEY}: {seq_len_tuning_json(seq_len_tuning)}")
+      if seq_len_block_q_table(seq_len_tuning) and self.transformer.attention_kernel != "flash_custom":
+        max_logging.log(
+            f"{KREA2_SEQ_LEN_TUNING_KEY}: block_q entries ignored, attention is {self.transformer.attention_kernel} "
+            "(only flash_custom reads them)."
+        )
+      elif seq_len_block_q_table(seq_len_tuning):
+        # pylint: disable-next=import-outside-toplevel
+        from maxdiffusion.models.attention_flax import _mesh_device_kind
+
+        # The chip the kernel wrapper sees (the transformer's mesh, like krea2_mesh_device_kind).
+        kernel_mesh = self.transformer.mesh if self.transformer.mesh is not None else self.mesh
+        seq_len_tuning_block_q_warnings(
+            seq_len_tuning,
+            scoped_vmem_limit_kib,
+            self.transformer.flash_block_sizes,
+            _mesh_device_kind(kernel_mesh),
+            self.mesh,
+            dtype=self.transformer.dtype,
+            # Below it Krea2Attention runs dot-product attention: the table's block_q is unused there.
+            flash_min_seq_length=self.transformer.flash_min_seq_length,
+        )
+    self._dit_default_options_key = _options_key(dit_compiler_options)
+    self._dit_options_key_by_seq_len = {seq_len: _options_key(options) for seq_len, options in options_by_seq_len.items()}
+
+    def build_dit_entries(fn, **jit_kwargs):
+      """Options key -> cached_jit entry of a DiT fn: the global options under fn's own name, the others suffixed."""
+      default = aot_cache.cached_jit(fn, compiler_options=dit_compiler_options, **jit_kwargs)
+      entries = {self._dit_default_options_key: default}
+      for key, (limit_kib, options) in extra_options.items():
+        # "__svmem<KiB>" (0 = the compiler's default): no "-", so the default
+        # entry's "<name>-<fingerprint>-*.aotx" glob never matches these files.
+        entries[key] = aot_cache.cached_jit(
+            fn, compiler_options=options, name=f"{default.name}__svmem{limit_kib}", **jit_kwargs
+        )
+      return entries
+
+    def dit_callable(kind, entries, seq_len_of):
+      """The attribute for a DiT kind: its only entry, or a SeqLenDispatch over its entries."""
+      self._dit_entries[kind] = entries
+      if len(entries) == 1:
+        return next(iter(entries.values()))
+      for seq_len, key in self._dit_options_key_by_seq_len.items():
+        if key != self._dit_default_options_key:
+          max_logging.log(f"{KREA2_SEQ_LEN_TUNING_KEY}: L={seq_len} runs {kind} as {entries[key].name}")
+      return SeqLenDispatch(functools.partial(self.dit_entry_for_seq_len, kind), seq_len_of)
+
+    self._dit_entries = {}
 
     @aot_cache.cached_jit
     def qwen3_forward(q_params, ids, mask, position_ids):
@@ -492,11 +805,10 @@ class FlaxKrea2Pipeline:
       # one hidden-state buffer per block. `transformer_step` rebinds
       # `hidden_states` to every block's output and never reads a donated one.
       if getattr(self._config, "krea2_staged_donate_hidden_states", True):
-        block_jit = functools.partial(dit_jit, donate_argnames=("hidden_states",))
+        block_jit_kwargs = {"donate_argnames": ("hidden_states",)}
       else:
-        block_jit = dit_jit
+        block_jit_kwargs = {}
 
-      @block_jit
       def transformer_block(block_params, lora_params, hidden_states, temb_mod, rotary_emb, attention_mask):
         return staged_block.apply(
             {"params": block_params},
@@ -506,6 +818,14 @@ class FlaxKrea2Pipeline:
             attention_mask=attention_mask,
             lora_params=lora_params,
         )
+
+      def block_seq_len(block_params, lora_params, hidden_states, temb_mod, rotary_emb, attention_mask):
+        # [image | text] residual stream: its length is the kernel's q length.
+        del block_params, lora_params, temb_mod, rotary_emb, attention_mask
+        return hidden_states.shape[1]
+
+      block_entries = build_dit_entries(transformer_block, **block_jit_kwargs)
+      transformer_block = dit_callable("transformer_block", block_entries, block_seq_len)
 
       @aot_cache.cached_jit
       def transformer_final(final_params, hidden_states, temb, text_mask):
@@ -527,12 +847,14 @@ class FlaxKrea2Pipeline:
         hidden_states, temb, temb_mod, rotary_emb, attention_mask = transformer_prelude(
             prelude_params, latents, text_hidden, text_mask, img_ids, txt_ids, t_vec
         )
+        # One entry for all blocks of this step (they share the sequence length).
+        block = self.dit_entry_for_seq_len("transformer_block", hidden_states.shape[1])
         for block_idx in range(self.transformer.num_layers):
           block_params = t_params[f"blocks_{block_idx}"]
           block_lora_params = build_staged_block_lora_params(
               block_params, self._staged_block_lora_specs[block_idx]
           )
-          hidden_states = transformer_block(
+          hidden_states = block(
               block_params,
               block_lora_params,
               hidden_states,
@@ -544,7 +866,6 @@ class FlaxKrea2Pipeline:
 
     else:
 
-      @dit_jit
       def transformer_step(t_params, latents, text_hidden, text_mask, img_ids, txt_ids, t_vec):
         return self.transformer.apply(
             {"params": t_params},
@@ -557,10 +878,34 @@ class FlaxKrea2Pipeline:
             method=self.transformer.forward_with_text_context,
         )
 
+      def step_seq_len(t_params, latents, text_hidden, text_mask, img_ids, txt_ids, t_vec):
+        # prepare_inputs concatenates [img_in(latents) | text_hidden] on axis 1:
+        # the DiT blocks' sequence length, the flash_custom kernel's q length.
+        del t_params, text_mask, img_ids, txt_ids, t_vec
+        return latents.shape[1] + text_hidden.shape[1]
+
+      transformer_step = dit_callable("transformer_step", build_dit_entries(transformer_step), step_seq_len)
+
     self._jitted_qwen3_forward = qwen3_forward
     self._jitted_transformer_text_context = transformer_text_context
     self._jitted_transformer_step = transformer_step
     self._jitted_vae_decode = vae_decode_pass
+
+  def dit_entry_for_seq_len(self, kind, seq_len):
+    """The cached_jit entry that runs the DiT blocks at joint sequence length `seq_len`.
+
+    `kind` is "transformer_step" (monolithic pipeline) or "transformer_block"
+    (staged). `seq_len` is L = image tokens + text bucket (the
+    `krea2_seq_len_tuning` key). The entry carries the compiler options the
+    table (or the global `krea2_transformer_scoped_vmem_limit_kib`) gives
+    that L; `_jitted_transformer_step` / `_jitted_transformer_block` call
+    the same entry, so compile_krea2 compiles what a run executes.
+    """
+    self._setup_jit_functions()
+    entries = self._dit_entries.get(kind)
+    if entries is None:
+      raise ValueError(f"No {kind} executables in this pipeline (it has {sorted(self._dit_entries)}).")
+    return entries[self._dit_options_key_by_seq_len.get(int(seq_len), self._dit_default_options_key)]
 
   def _swap_in(self, component, host_params, trace):
     """Places an offloaded component's host params on device, recording timing and bytes."""

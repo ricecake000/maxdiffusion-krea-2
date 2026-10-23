@@ -770,17 +770,23 @@ class Krea2PresetConfigTest(unittest.TestCase):
     # pylint: disable-next=import-outside-toplevel
     from maxdiffusion.generate_krea2 import krea2_flash_block_sizes, resolve_krea2_attention_kernel
 
-    for overrides, expected in (
-        ((), "auto"),
-        (("krea2_attention_kernel=flash",), "flash"),
-        (("krea2_attention_kernel=''",), "auto"),
-        (("krea2_attention_kernel=Hybrid",), "hybrid"),
+    # The preset's krea2_seq_len_tuning block_q entries travel in the carrier; '{}' removes them.
+    table = ((16512, 2560), (16640, 2560))
+    for overrides, expected, block_q_by_seq_len in (
+        ((), "auto", table),
+        (("krea2_attention_kernel=flash",), "flash", table),
+        (("krea2_attention_kernel=''",), "auto", table),
+        (("krea2_attention_kernel=Hybrid",), "hybrid", table),
+        (("krea2_seq_len_tuning={}",), "auto", None),
     ):
       with self.subTest(overrides=overrides):
         config = self._load_preset(*overrides)
         self.assertEqual(dict(config.flash_block_sizes), {})
         self.assertEqual(resolve_krea2_attention_kernel(config), expected)
-        self.assertEqual(krea2_flash_block_sizes(config), max_utils.CustomFlashBlockSizes(kernel=expected))
+        self.assertEqual(
+            krea2_flash_block_sizes(config),
+            max_utils.CustomFlashBlockSizes(kernel=expected, block_q_by_seq_len=block_q_by_seq_len),
+        )
 
   def test_invalid_kernel_fails_before_model_load(self):
     from maxdiffusion import generate_krea2, pyconfig  # pylint: disable=import-outside-toplevel
@@ -1150,15 +1156,18 @@ class Krea2MeshDeviceKindTest(unittest.TestCase):
       with self.subTest(kind=kind):
         self.assertEqual(attention_flax._mesh_device_kind(_abstract_mesh(self, kind)), kind)
 
-  def _trace_flash_custom(self, mesh, kernel, seq_len=4224):
-    """Traces the flash_custom wrapper under `mesh` (no compile) and returns the block sizes it built the kernel with."""
+  def _trace_flash_custom(self, mesh, kernel, seq_len=4224, carrier=None):
+    """Traces the flash_custom wrapper under `mesh` (no compile) and returns the block sizes it built the kernel with.
+
+    `carrier` replaces the default `CustomFlashBlockSizes(kernel=kernel)`.
+    """
     context = {
         "heads": 4,
         "dim_head": _D,
         "scale": 1.0 / math.sqrt(_D),
         "mesh": mesh,
         "attention_mask": None,
-        "flash_block_sizes": max_utils.CustomFlashBlockSizes(kernel=kernel),
+        "flash_block_sizes": carrier if carrier is not None else max_utils.CustomFlashBlockSizes(kernel=kernel),
         "axis_names_q": (attention_flax.BATCH, attention_flax.HEAD, attention_flax.LENGTH, attention_flax.D_KV),
         "axis_names_kv": (attention_flax.BATCH, attention_flax.HEAD, attention_flax.KV_LENGTH, attention_flax.D_KV),
     }
@@ -1169,6 +1178,19 @@ class Krea2MeshDeviceKindTest(unittest.TestCase):
       out = jax.eval_shape(lambda q, k, v: attention_flax.KERNEL_REGISTRY["flash_custom"](q, k, v, context), q, kv, kv)
     self.assertEqual(out.shape, (1, seq_len, 4 * _D))
     return made.call_args.args[0]
+
+  def test_seq_len_block_q_table_reaches_the_kernel(self):
+    # krea2_seq_len_tuning's block_q replaces the automatic choice at exactly its q length, uncapped.
+    mesh = _abstract_mesh(self, _V6E)
+    carrier = max_utils.CustomFlashBlockSizes(kernel="auto", block_q_by_seq_len=((4224, 2560),))
+    self.assertEqual(self._trace_flash_custom(mesh, "auto", carrier=carrier), _hybrid(2560, 2048, 2048, 1024, 256, 256))
+    automatic = krea2_attention.select_krea2_block_sizes(
+        4608, user=max_utils.CustomFlashBlockSizes(kernel="auto"), device_kind=_V6E
+    )
+    self.assertEqual(self._trace_flash_custom(mesh, "auto", seq_len=4608, carrier=carrier), automatic)
+    # An explicit block_q wins over the table.
+    explicit = dataclasses.replace(carrier, block_q=1024)
+    self.assertEqual(self._trace_flash_custom(mesh, "auto", carrier=explicit).block_q, 1024)
 
   def test_abstract_mesh_drives_the_kernel_choice(self):
     # An AbstractMesh (no concrete devices) keeps the chip through its abstract device.

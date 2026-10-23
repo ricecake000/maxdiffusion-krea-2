@@ -656,6 +656,11 @@ class CustomFlashBlockSizes:
   kernel: str | None = None
   block_kv_pv: int | None = None
   block_q_strip: int | None = None
+  # flash_custom (Krea 2) only: ((seq_len, block_q), ...) sorted by seq_len,
+  # the block_q entries of `krea2_seq_len_tuning`. They replace the kernel's
+  # automatic block_q at exactly that q length; a set block_q above wins. A
+  # tuple (not a dict) so the carrier stays hashable; None = no table.
+  block_q_by_seq_len: tuple[tuple[int, int], ...] | None = None
 
 
 def get_flash_block_sizes(config):
