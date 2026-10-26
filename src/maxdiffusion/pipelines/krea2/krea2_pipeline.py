@@ -981,6 +981,13 @@ class FlaxKrea2Pipeline:
       min_text_tokens: int = 0,
       seed: Optional[int] = None,
       output_type: str = "file",
+      hybrid_params=None,
+      hybrid_steps: int = 0,
+      hybrid_guidance: float = 1.5,
+      hybrid_negative_prompt: Optional[Union[str, List[str]]] = "",
+      offload_text_encoder: Optional[bool] = None,
+      hybrid_host_params=None,
+      hybrid_evict: bool = False,
   ):
     """`min_text_tokens` forces the compacted text bucket to at least this many
     tokens (rounded up to the compaction multiple, clipped to the text length)
@@ -992,9 +999,34 @@ class FlaxKrea2Pipeline:
     custom latents). `output_type="file"` writes PNGs to `output_dir` and returns
     their paths; `"pil"` writes nothing and returns the PIL images (process 0
     only; other processes return `[]`). With `save_outputs=False` the call
-    returns `([], trace)` before any host transfer, whatever `output_type`."""
+    returns `([], trace)` before any host transfer, whatever `output_type`.
+
+    Hybrid sampling (`hybrid_steps` = k > 0, Turbo configs only, the call's
+    own CFG off): the first k steps of the one denoise loop run the device
+    tree `hybrid_params` (same structure as `params`, so the same executables)
+    with Krea-convention CFG `hybrid_guidance` against `hybrid_negative_prompt`,
+    each from its own text context; steps k.. run `params` without CFG. The
+    scheduler state is the call's for every step, so this equals running the
+    k steps as one call (ending at sigma_k) and the rest as a second call from
+    its latents. `hybrid_evict` frees `hybrid_params`' device buffers after
+    step k - 1 (`hybrid_host_params` is its host source; the caller places it
+    again). `hybrid_steps=0` ignores every hybrid_* argument: today's call.
+
+    `offload_text_encoder`: None follows `offload_components`; True treats
+    `qwen3_params` as a host tree for this call (placed for prompt encoding
+    with `param_shardings["text_encoder"]`, then freed, like an offloaded text
+    encoder)."""
     if output_type not in KREA2_OUTPUT_TYPES:
       raise ValueError(f"output_type must be one of {KREA2_OUTPUT_TYPES}, got {output_type!r}.")
+    # None (the default) resolves at Phase A, as before the argument existed.
+    if offload_text_encoder is not None and not offload_text_encoder and "text_encoder" in self.offload_components:
+      raise ValueError("offload_text_encoder=False needs a resident text encoder; it is in offload_components.")
+    if offload_text_encoder and self.param_shardings.get("text_encoder") is None:
+      raise ValueError("offload_text_encoder=True needs param_shardings['text_encoder'].")
+    if isinstance(hybrid_steps, bool) or not isinstance(hybrid_steps, (int, np.integer)):
+      raise ValueError(f"hybrid_steps must be an int, got {hybrid_steps!r}.")
+    hybrid_steps = int(hybrid_steps)
+    hybrid = hybrid_steps != 0
 
     if isinstance(prompt, str):
       prompts = [prompt] * batch_size
@@ -1004,6 +1036,24 @@ class FlaxKrea2Pipeline:
     do_classifier_free_guidance = is_classifier_free_guidance_enabled(
         guidance_scale, do_classifier_free_guidance
     )
+    if hybrid:
+      if not 1 <= hybrid_steps < num_inference_steps:
+        raise ValueError(f"hybrid_steps must be in [1, {num_inference_steps - 1}] (or 0 = off), got {hybrid_steps}.")
+      if hybrid_params is None:
+        raise ValueError("hybrid_steps > 0 needs hybrid_params (the early steps' transformer tree).")
+      if not getattr(self._config, "is_distilled", False):
+        raise ValueError("hybrid_steps > 0 needs a Turbo config (is_distilled): one loop on the Turbo schedule.")
+      if do_classifier_free_guidance:
+        raise ValueError("hybrid_steps > 0 needs the call's own classifier-free guidance off.")
+      if "transformer" in self.offload_components:
+        raise ValueError("hybrid_steps > 0 needs a resident transformer ('transformer' in offload_components).")
+      if hybrid_evict and hybrid_host_params is None:
+        raise ValueError("hybrid_evict needs hybrid_host_params (the host tree the caller places again).")
+      # The CFG combine runs eagerly with a Python float, like the main CFG's guidance_scale.
+      hybrid_guidance = float(hybrid_guidance)
+      negative_prompt = "" if hybrid_negative_prompt is None else hybrid_negative_prompt
+    # Hybrid steps run CFG with E: the negative prompt is encoded as for the call's own CFG.
+    encode_negative = do_classifier_free_guidance or hybrid
     if negative_prompt is None:
       negative_prompt = ""
     if isinstance(negative_prompt, str):
@@ -1072,58 +1122,62 @@ class FlaxKrea2Pipeline:
       # -----------------------------------------------------------------
       # PHASE A: Encode prompts (Qwen3-VL text tower)
       # -----------------------------------------------------------------
-      offload_text_encoder = "text_encoder" in self.offload_components
+      if offload_text_encoder is None:
+        offload_text_encoder = "text_encoder" in self.offload_components
       if offload_text_encoder:
         host_qwen3_params = qwen3_params
         qwen3_params = self._swap_in("text_encoder", host_qwen3_params, trace)
 
-      max_logging.log(f"[PHASE A] Encoding {len(prompts)} prompt(s) with the Qwen3-VL text encoder...")
-      t0 = time.perf_counter()
+      # The swapped-in text encoder is freed here also when encoding fails (the traceback keeps this frame
+      # alive, and the next request would place another copy).
+      try:
+        max_logging.log(f"[PHASE A] Encoding {len(prompts)} prompt(s) with the Qwen3-VL text encoder...")
+        t0 = time.perf_counter()
 
-      with jax.profiler.TraceAnnotation("krea2_prompt_encoding"):
-        prompt_embeds, prompt_embeds_mask = self.encode_prompt(prompts, qwen3_params)
-        if do_classifier_free_guidance:
-          negative_prompt_embeds, negative_prompt_embeds_mask = self.encode_prompt(negative_prompts, qwen3_params)
-        prompt_embeds.block_until_ready()
-        if offload_text_encoder and do_classifier_free_guidance:
-          negative_prompt_embeds.block_until_ready()
+        with jax.profiler.TraceAnnotation("krea2_prompt_encoding"):
+          prompt_embeds, prompt_embeds_mask = self.encode_prompt(prompts, qwen3_params)
+          if encode_negative:
+            negative_prompt_embeds, negative_prompt_embeds_mask = self.encode_prompt(negative_prompts, qwen3_params)
+          prompt_embeds.block_until_ready()
+          if offload_text_encoder and encode_negative:
+            negative_prompt_embeds.block_until_ready()
 
-      # Gather valid text tokens to the front and truncate to a bucket: a
-      # shorter, tail-padded text sequence for every denoise step.
-      compaction_multiple = self.text_compaction_multiple
-      if compaction_multiple > 0:
-        full_len = prompt_embeds.shape[1]
-        # Only a forced minimum is passed, so the regular call (and anything
-        # that wraps compact_text_embeddings) stays exactly as before.
-        min_kwargs = {"min_tokens": min_text_tokens} if min_text_tokens > 0 else {}
-        prompt_embeds, prompt_embeds_mask = compact_text_embeddings(
-            prompt_embeds, prompt_embeds_mask, compaction_multiple, **min_kwargs
-        )
-        buckets = f"prompt {prompt_embeds.shape[1]}"
-        if do_classifier_free_guidance:
-          negative_prompt_embeds, negative_prompt_embeds_mask = compact_text_embeddings(
-              negative_prompt_embeds, negative_prompt_embeds_mask, compaction_multiple, **min_kwargs
+        # Gather valid text tokens to the front and truncate to a bucket: a
+        # shorter, tail-padded text sequence for every denoise step.
+        compaction_multiple = self.text_compaction_multiple
+        if compaction_multiple > 0:
+          full_len = prompt_embeds.shape[1]
+          # Only a forced minimum is passed, so the regular call (and anything
+          # that wraps compact_text_embeddings) stays exactly as before.
+          min_kwargs = {"min_tokens": min_text_tokens} if min_text_tokens > 0 else {}
+          prompt_embeds, prompt_embeds_mask = compact_text_embeddings(
+              prompt_embeds, prompt_embeds_mask, compaction_multiple, **min_kwargs
           )
-          buckets += f", negative prompt {negative_prompt_embeds.shape[1]}"
-        forced = f", forced minimum {min_text_tokens}" if min_text_tokens > 0 else ""
-        max_logging.log(
-            f"Text compaction (multiple {compaction_multiple}{forced}): text length {full_len} -> {buckets} tokens"
-        )
-      elif min_text_tokens > 0:
-        max_logging.log(
-            f"min_text_tokens={min_text_tokens} has no effect without text compaction: "
-            f"the text length is always {prompt_embeds.shape[1]}."
-        )
-      # Text lengths the denoise executables are built for (not timings): the
-      # precompile mode checks them against the bucket it asked for.
-      trace["text_tokens"] = int(prompt_embeds.shape[1])
-      txt_ids_val = prepare_krea2_text_ids(batch_size, prompt_embeds.shape[1])
-      if do_classifier_free_guidance:
-        trace["negative_text_tokens"] = int(negative_prompt_embeds.shape[1])
-        negative_txt_ids_val = prepare_krea2_text_ids(batch_size, negative_prompt_embeds.shape[1])
-
-      if offload_text_encoder:
-        qwen3_params = free_params(qwen3_params, host_qwen3_params)
+          buckets = f"prompt {prompt_embeds.shape[1]}"
+          if encode_negative:
+            negative_prompt_embeds, negative_prompt_embeds_mask = compact_text_embeddings(
+                negative_prompt_embeds, negative_prompt_embeds_mask, compaction_multiple, **min_kwargs
+            )
+            buckets += f", negative prompt {negative_prompt_embeds.shape[1]}"
+          forced = f", forced minimum {min_text_tokens}" if min_text_tokens > 0 else ""
+          max_logging.log(
+              f"Text compaction (multiple {compaction_multiple}{forced}): text length {full_len} -> {buckets} tokens"
+          )
+        elif min_text_tokens > 0:
+          max_logging.log(
+              f"min_text_tokens={min_text_tokens} has no effect without text compaction: "
+              f"the text length is always {prompt_embeds.shape[1]}."
+          )
+        # Text lengths the denoise executables are built for (not timings): the
+        # precompile mode checks them against the bucket it asked for.
+        trace["text_tokens"] = int(prompt_embeds.shape[1])
+        txt_ids_val = prepare_krea2_text_ids(batch_size, prompt_embeds.shape[1])
+        if encode_negative:
+          trace["negative_text_tokens"] = int(negative_prompt_embeds.shape[1])
+          negative_txt_ids_val = prepare_krea2_text_ids(batch_size, negative_prompt_embeds.shape[1])
+      finally:
+        if offload_text_encoder:
+          qwen3_params = free_params(qwen3_params, host_qwen3_params)
 
       trace["prompt_encoding"] = time.perf_counter() - t0
       max_logging.log(f" -> [TIMING] Prompt Encoding (Qwen3-VL): {trace['prompt_encoding']:.4f} seconds")
@@ -1145,7 +1199,7 @@ class FlaxKrea2Pipeline:
       prompt_embeds_mask = put_data_on_devices(prompt_embeds_mask, data_sharding)
       txt_ids_val = put_data_on_devices(txt_ids_val, data_sharding)
       img_ids_val = put_data_on_devices(img_ids_val, data_sharding)
-      if do_classifier_free_guidance:
+      if encode_negative:
         negative_prompt_embeds = put_data_on_devices(negative_prompt_embeds, data_sharding)
         negative_prompt_embeds_mask = put_data_on_devices(negative_prompt_embeds_mask, data_sharding)
         negative_txt_ids_val = put_data_on_devices(negative_txt_ids_val, data_sharding)
@@ -1161,57 +1215,102 @@ class FlaxKrea2Pipeline:
         host_params = params
         params = self._swap_in("transformer", host_params, trace)
 
-      max_logging.log(f"[PHASE B] Running {num_inference_steps}-step denoise loop ({cfg_note})...")
-      t0 = time.perf_counter()
+      # A failing step must not leave the swapped-in transformer on device (the traceback keeps this frame).
+      try:
+        max_logging.log(f"[PHASE B] Running {num_inference_steps}-step denoise loop ({cfg_note})...")
+        t0 = time.perf_counter()
 
-      # Prompt-only text context (text fusion + txt_in), once per prompt. The
-      # raw tapped-layer embeddings are dropped right after so their buffers
-      # can be freed before the denoise loop.
-      with jax.profiler.TraceAnnotation("krea2_text_context"):
-        text_params = {key: params[key] for key in KREA2_TEXT_CONTEXT_KEYS}
-        text_hidden = self._jitted_transformer_text_context(text_params, prompt_embeds, prompt_embeds_mask)
-        del prompt_embeds
-        if do_classifier_free_guidance:
-          negative_text_hidden = self._jitted_transformer_text_context(
-              text_params, negative_prompt_embeds, negative_prompt_embeds_mask
-          )
-          del negative_prompt_embeds
-        del text_params
-
-      for step_idx in range(num_inference_steps):
-        with jax.profiler.StepTraceAnnotation("krea2_denoise", step_num=step_idx):
-          timestep = scheduler_state.timesteps[step_idx]
-          t_vec = jnp.full((batch_size,), timestep / 1000.0, dtype=latents_jax.dtype)
-
-          noise_pred = self._jitted_transformer_step(
-              params, latents_jax, text_hidden, prompt_embeds_mask, img_ids_val, txt_ids_val, t_vec
-          )
-          if do_classifier_free_guidance:
-            neg_noise_pred = self._jitted_transformer_step(
-                params,
-                latents_jax,
-                negative_text_hidden,
-                negative_prompt_embeds_mask,
-                img_ids_val,
-                negative_txt_ids_val,
-                t_vec,
+        # Prompt-only text context (text fusion + txt_in), once per prompt. The
+        # raw tapped-layer embeddings are dropped right after so their buffers
+        # can be freed before the denoise loop.
+        with jax.profiler.TraceAnnotation("krea2_text_context"):
+          text_params = {key: params[key] for key in KREA2_TEXT_CONTEXT_KEYS}
+          text_hidden = self._jitted_transformer_text_context(text_params, prompt_embeds, prompt_embeds_mask)
+          if hybrid:
+            # The early steps' contexts come from E's own text fusion + txt_in.
+            hybrid_text_params = {key: hybrid_params[key] for key in KREA2_TEXT_CONTEXT_KEYS}
+            hybrid_text_hidden = self._jitted_transformer_text_context(
+                hybrid_text_params, prompt_embeds, prompt_embeds_mask
             )
-            # Krea 2 guidance convention: cond + g * (cond - uncond); equals standard
-            # CFG with scale (1 + g).
-            noise_pred = noise_pred + guidance_scale * (noise_pred - neg_noise_pred)
-
-          prev_sample, _ = self.scheduler.step(
-              state=scheduler_state,
-              model_output=noise_pred.astype(latents_jax.dtype),
-              timestep=timestep,
-              sample=latents_jax,
-              return_dict=False,
+            hybrid_negative_text_hidden = self._jitted_transformer_text_context(
+                hybrid_text_params, negative_prompt_embeds, negative_prompt_embeds_mask
+            )
+            del hybrid_text_params, negative_prompt_embeds
+          del prompt_embeds
+          if do_classifier_free_guidance:
+            negative_text_hidden = self._jitted_transformer_text_context(
+                text_params, negative_prompt_embeds, negative_prompt_embeds_mask
+            )
+            del negative_prompt_embeds
+          del text_params
+        if hybrid:
+          trace["hybrid_steps"] = hybrid_steps
+          trace["hybrid_guidance"] = hybrid_guidance
+          max_logging.log(
+              f"[PHASE B] Hybrid: steps 0..{hybrid_steps - 1} run the hybrid tree with CFG scale {hybrid_guidance}, "
+              f"steps {hybrid_steps}..{num_inference_steps - 1} the main tree ({cfg_note})."
           )
-          latents_jax = prev_sample
 
-      latents_jax.block_until_ready()
-      if offload_transformer:
-        params = free_params(params, host_params)
+        for step_idx in range(num_inference_steps):
+          with jax.profiler.StepTraceAnnotation("krea2_denoise", step_num=step_idx):
+            timestep = scheduler_state.timesteps[step_idx]
+            t_vec = jnp.full((batch_size,), timestep / 1000.0, dtype=latents_jax.dtype)
+
+            if step_idx < hybrid_steps:
+              noise_pred = self._jitted_transformer_step(
+                  hybrid_params, latents_jax, hybrid_text_hidden, prompt_embeds_mask, img_ids_val, txt_ids_val, t_vec
+              )
+              neg_noise_pred = self._jitted_transformer_step(
+                  hybrid_params,
+                  latents_jax,
+                  hybrid_negative_text_hidden,
+                  negative_prompt_embeds_mask,
+                  img_ids_val,
+                  negative_txt_ids_val,
+                  t_vec,
+              )
+              # The main CFG's convention and expression (below), with E's guidance.
+              noise_pred = noise_pred + hybrid_guidance * (noise_pred - neg_noise_pred)
+            else:
+              noise_pred = self._jitted_transformer_step(
+                  params, latents_jax, text_hidden, prompt_embeds_mask, img_ids_val, txt_ids_val, t_vec
+              )
+              if do_classifier_free_guidance:
+                neg_noise_pred = self._jitted_transformer_step(
+                    params,
+                    latents_jax,
+                    negative_text_hidden,
+                    negative_prompt_embeds_mask,
+                    img_ids_val,
+                    negative_txt_ids_val,
+                    t_vec,
+                )
+                # Krea 2 guidance convention: cond + g * (cond - uncond); equals standard
+                # CFG with scale (1 + g).
+                noise_pred = noise_pred + guidance_scale * (noise_pred - neg_noise_pred)
+
+            prev_sample, _ = self.scheduler.step(
+                state=scheduler_state,
+                model_output=noise_pred.astype(latents_jax.dtype),
+                timestep=timestep,
+                sample=latents_jax,
+                return_dict=False,
+            )
+            latents_jax = prev_sample
+
+            if step_idx == hybrid_steps - 1:
+              # E's last step: its text contexts are done.
+              del hybrid_text_hidden, hybrid_negative_text_hidden
+              if hybrid_evict:
+                # Like the offloaded transformer below: the last step that reads E is done before its buffers go.
+                latents_jax.block_until_ready()
+                hybrid_params = free_params(hybrid_params, hybrid_host_params)
+                trace["hybrid_evicted"] = True
+
+        latents_jax.block_until_ready()
+      finally:
+        if offload_transformer:
+          params = free_params(params, host_params)
       multihost_utils.sync_global_devices("krea2_phase_b_complete")
 
       trace["denoise_loop"] = time.perf_counter() - t0

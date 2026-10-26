@@ -343,6 +343,28 @@ krea2_staged_donate_hidden_states: True
 # freed. Lowers peak HBM at the cost of a host->device transfer per generation.
 # Allowed entries: "text_encoder", "transformer".
 krea2_offload_components: []
+# Hybrid sampling (Turbo configs only, off by default): a request's hybrid_steps = k (serve_krea2) runs the
+# first k of the denoise steps with a second, resident transformer tree E with CFG (Krea convention, scale
+# krea2_hybrid_guidance, against krea2_hybrid_negative_prompt), the remaining steps with the main tree as usual,
+# on the one Turbo schedule. E is read (after the warm-up) from the weight cache root
+# krea2_hybrid_weight_cache_dir: component "transformer" under the main transformer's cache meta with model and
+# snapshot set to krea2_hybrid_model_id (required with the dir). E shares the main tree's executables (no AOT
+# key); it needs a resident transformer and no LoRA. A request may ask up to krea2_hybrid_max_steps (1-7, fewer
+# than num_inference_steps). Empty dir means off.
+krea2_hybrid_weight_cache_dir: ''
+krea2_hybrid_model_id: ''
+krea2_hybrid_max_steps: 3
+krea2_hybrid_guidance: 1.5
+krea2_hybrid_negative_prompt: ''
+# Per-request residency (no AOT key). A request with width * height >= krea2_text_encoder_offload_min_pixels
+# runs with the text encoder offloaded (freed before it, placed for its prompt encoding from a host copy, then
+# freed); the next smaller request places it again (~0.15 s on v6e-1). Ignored when "text_encoder" is in
+# krea2_offload_components. 0 means never.
+krea2_text_encoder_offload_min_pixels: 0
+# Hybrid sampling fallback: a request with width * height >= krea2_hybrid_evict_min_pixels frees E's device
+# copy after its steps (a request without hybrid steps: before the call) and places it again from a host copy
+# after the request (~2.3 s for 12.5 GiB on v6e-1). 0 means never (and no host copy of E).
+krea2_hybrid_evict_min_pixels: 0
 # attention 'flash_custom' only: kernel variant of the Krea 2 Pallas kernel.
 # 'auto' (default): 'hybrid' on a TPU v6e, 'flash' on every other chip;
 # 'flash' / 'hybrid' force a variant (hybrid needs more VMEM: on v5e its

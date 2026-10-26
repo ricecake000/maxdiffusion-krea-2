@@ -49,6 +49,13 @@
         <div class="segments" role="radiogroup" aria-labelledby="format-label" id="formats"></div>
       </div>
 
+      <!-- shown only when GET /v1/presets reports hybrid sampling as available -->
+      <div class="field" id="hybrid-field" hidden>
+        <span class="eyebrow" id="hybrid-label" lang="ko">다양성</span>
+        <div class="segments" role="radiogroup" aria-labelledby="hybrid-label" id="hybrid"></div>
+        <p class="fixed-note" id="hybrid-note"></p>
+      </div>
+
       <div class="field">
         <span class="eyebrow" id="seed-label">Seed</span>
         <div class="seed" role="radiogroup" aria-labelledby="seed-label">
@@ -99,6 +106,7 @@
         <div><dt>Preset</dt><dd id="fact-preset">—</dd></div>
         <div><dt>Size</dt><dd id="fact-size">—</dd></div>
         <div><dt>Format</dt><dd id="fact-format">—</dd></div>
+        <div id="fact-hybrid-row" hidden><dt lang="ko">다양성</dt><dd id="fact-hybrid">—</dd></div>
         <div><dt>Id</dt><dd id="fact-id">—</dd></div>
       </dl>
       <div class="readout-actions">

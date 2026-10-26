@@ -8,7 +8,15 @@ const STAGES = [
   { key: "denoise_ms", name: "denoise", color: "var(--heat)" },
   { key: "vae_decode_ms", name: "decode", color: "#3f97a6" },
   { key: "encode_ms", name: "encode", color: "#2c6d79" },
+  // Weight moves the runtime reports for some requests (text encoder offload, hybrid tree re-place).
+  { key: "swap_ms", name: "swap", color: "#8b95a1" },
 ];
+const SWAP_KEYS = ["text_encoder_swap_ms", "text_encoder_replace_ms", "hybrid_replace_ms"];
+
+// Hybrid sampling ("다양성"): the first k of the Turbo steps run a second model with CFG.
+const TURBO_STEPS = 8;
+const HYBRID_CHOICES = [0, 2, 3];
+const DEFAULT_HYBRID = 2;
 
 // Turbo runs a fixed schedule, so the shape of a request barely moves within a
 // size. The first trace of each size replaces these; they only animate request one.
@@ -30,6 +38,7 @@ const STORE = {
   aspect: "krea2.aspect",
   size: "krea2.size",
   format: "krea2.format",
+  hybrid: "krea2.hybrid",
 };
 const HISTORY_LIMIT = 24;
 const MAX_PROMPT = 4000;
@@ -46,6 +55,9 @@ const ui = {
   aspects: el("aspects"),
   presetNote: el("preset-note"),
   formats: el("formats"),
+  hybridField: el("hybrid-field"),
+  hybrid: el("hybrid"),
+  hybridNote: el("hybrid-note"),
   seedModes: Array.from(document.querySelectorAll('input[name="seed-mode"]')),
   seed: el("seed"),
   generate: el("generate"),
@@ -63,6 +75,8 @@ const ui = {
   factPreset: el("fact-preset"),
   factSize: el("fact-size"),
   factFormat: el("fact-format"),
+  factHybridRow: el("fact-hybrid-row"),
+  factHybrid: el("fact-hybrid"),
   factId: el("fact-id"),
   download: el("download"),
   restore: el("restore"),
@@ -87,6 +101,11 @@ function stored(key, fallback) {
   }
 }
 
+function parseHybrid(value) {
+  const steps = Number(value);
+  return value !== null && value !== "" && Number.isInteger(steps) && steps >= 0 ? steps : null;
+}
+
 function store(key, value) {
   try {
     if (value === null || value === "") localStorage.removeItem(key);
@@ -102,11 +121,14 @@ const state = {
   aspect: stored(STORE.aspect, "1:1"),
   size: stored(STORE.size, "1k"),
   format: stored(STORE.format, null),
+  // null = never picked here: DEFAULT_HYBRID once a server offers hybrid sampling.
+  hybrid: parseHybrid(stored(STORE.hybrid, null)),
   busy: false,
   estimate: structuredClone(FALLBACK_TIMING),
   items: [],
   currentId: null,
-  // null until GET /v1/presets answers; then { presets, formats, defaultFormat, maxQueue, timeoutS }.
+  // null until GET /v1/presets answers; then { presets, formats, defaultFormat, maxQueue, timeoutS, hybrid }, where
+  // hybrid is { maxSteps, guidance } or null when the server does not offer hybrid sampling.
   server: null,
   // Bumped whenever the endpoint or token changes. GET /v1/presets and /readyz replies that were requested under
   // an older generation are discarded, so a late answer from the old endpoint cannot overwrite the new one's state.
@@ -126,6 +148,8 @@ const formatMs = (value) =>
   value < 1000 ? `${Math.round(value)} ms` : `${(value / 1000).toFixed(2)} s`;
 
 const presetLabel = (size, aspect) => `${size}@${aspect}`;
+
+const hybridLabel = (steps) => (steps > 0 ? `${steps} / ${TURBO_STEPS} steps` : "끔");
 
 /* ── notices ────────────────────────────────────────────── */
 
@@ -266,6 +290,8 @@ function renderPresets() {
     ui.sizes.replaceChildren();
     ui.aspects.replaceChildren();
     ui.formats.replaceChildren();
+    ui.hybrid.replaceChildren();
+    ui.hybridField.hidden = true;
     ui.presetNote.hidden = false;
     ui.presetNote.textContent = state.token
       ? "The preset list loads from the server once it is ready."
@@ -310,6 +336,8 @@ function renderPresets() {
     ),
   );
 
+  renderHybrid();
+
   const preset = currentPreset();
   ui.presetNote.hidden = false;
   ui.presetNote.textContent =
@@ -317,6 +345,56 @@ function renderPresets() {
     `queue ${server.maxQueue}, timeout ${server.timeoutS} s`;
   syncGenerate();
   if (!state.busy && state.currentId === null) showIdleTrace();
+}
+
+/* ── hybrid sampling ("다양성") ──────────────────────────── */
+
+// The step counts this server serves; [] hides the control (no hybrid model, or only "off" left).
+function hybridChoices() {
+  const hybrid = state.server && state.server.hybrid;
+  if (!hybrid) return [];
+  const choices = HYBRID_CHOICES.filter((steps) => steps <= hybrid.maxSteps);
+  return choices.length > 1 ? choices : [];
+}
+
+// The hybrid_steps a request sends now, or null when the control is hidden (the field is then left out: a server
+// without hybrid sampling rejects it as an unknown field).
+function activeHybrid() {
+  return hybridChoices().length > 0 ? state.hybrid : null;
+}
+
+function renderHybrid() {
+  const choices = hybridChoices();
+  ui.hybridField.hidden = choices.length === 0;
+  if (choices.length === 0) {
+    ui.hybrid.replaceChildren();
+    return;
+  }
+  if (!choices.includes(state.hybrid)) {
+    // First visit, or a value this server does not serve: the default, else the strongest it offers.
+    state.hybrid = choices.includes(DEFAULT_HYBRID) ? DEFAULT_HYBRID : choices[choices.length - 1];
+  }
+  store(STORE.hybrid, String(state.hybrid));
+  ui.hybrid.replaceChildren(
+    ...choices.map((steps) =>
+      segmentButton({
+        name: steps > 0 ? String(steps) : "끔",
+        note: steps > 0 ? "steps" : "fast",
+        checked: steps === state.hybrid,
+        onPick: () => setHybrid(steps),
+      }),
+    ),
+  );
+  ui.hybridNote.textContent =
+    state.hybrid > 0
+      ? `First ${state.hybrid} of ${TURBO_STEPS} steps on the hybrid model with CFG ` +
+        `${state.server.hybrid.guidance}: more varied images, a little slower.`
+      : "Fast path: every step on the main model.";
+}
+
+function setHybrid(steps) {
+  state.hybrid = steps;
+  renderPresets();
 }
 
 function setPreset(size, aspect) {
@@ -355,12 +433,18 @@ async function loadPresets() {
     if (!body || !Array.isArray(body.presets) || body.presets.length === 0 || !Array.isArray(body.formats)) {
       throw new Error("The preset response has an invalid shape.");
     }
+    const hybrid = body.hybrid;
     state.server = {
       presets: body.presets,
       formats: body.formats,
       defaultFormat: body.default_format || body.formats[0],
       maxQueue: body.max_queue,
       timeoutS: body.request_timeout_s,
+      // A server from before hybrid sampling has no hybrid block.
+      hybrid:
+        hybrid && hybrid.available === true && Number.isInteger(hybrid.max_steps) && hybrid.max_steps > 0
+          ? { maxSteps: hybrid.max_steps, guidance: Number(hybrid.guidance) }
+          : null,
     };
     renderPresets();
   } catch {
@@ -428,9 +512,17 @@ async function checkHealth() {
 
 /* ── the trace ──────────────────────────────────────────── */
 
+// The server reports up to three swap timings, each only when it happened; the bar shows them as one stage.
+const swapMs = (timing) => SWAP_KEYS.reduce((acc, key) => acc + Math.max(0, timing[key] || 0), 0);
+
 function segmentsFrom(timing) {
-  const segments = STAGES.map((stage) => ({ ...stage, ms: Math.max(0, timing[stage.key] || 0) })).filter(
-    (segment) => segment.key !== "queue_ms" || segment.ms > 40,
+  const swap = timing.swap_ms ?? swapMs(timing);
+  const segments = STAGES.map((stage) => ({
+    ...stage,
+    ms: Math.max(0, (stage.key === "swap_ms" ? swap : timing[stage.key]) || 0),
+  })).filter(
+    (segment) =>
+      (segment.key !== "queue_ms" || segment.ms > 40) && (segment.key !== "swap_ms" || segment.ms > 0),
   );
   const span = segments.reduce((acc, segment) => acc + segment.ms, 0) || 1;
   return segments.map((segment) => ({ ...segment, fraction: segment.ms / span }));
@@ -478,8 +570,15 @@ function paintLegend(segments, { withValues }) {
   );
 }
 
-function estimateFor(size) {
-  return state.estimate[size] || state.estimate["1k"];
+const estimateKey = (size, hybrid) => (hybrid > 0 ? `${size}+h${hybrid}` : size);
+
+function estimateFor(size, hybrid = activeHybrid()) {
+  const measured = state.estimate[estimateKey(size, hybrid)];
+  if (measured) return measured;
+  const base = state.estimate[size] || state.estimate["1k"];
+  if (!(hybrid > 0)) return base;
+  // Not measured yet: each hybrid step runs the transformer twice (CFG).
+  return { ...base, denoise_ms: (base.denoise_ms * (TURBO_STEPS + hybrid)) / TURBO_STEPS };
 }
 
 function showIdleTrace() {
@@ -563,6 +662,8 @@ function showItem(item) {
   ui.factPreset.textContent = presetLabel(item.size, item.aspect);
   ui.factSize.textContent = `${item.width} × ${item.height}`;
   ui.factFormat.textContent = item.mimeType;
+  ui.factHybridRow.hidden = item.hybridSteps === null;
+  ui.factHybrid.textContent = item.hybridSteps === null ? "—" : hybridLabel(item.hybridSteps);
   ui.factId.textContent = item.id.replace(/^img_/, "").slice(0, 8);
   ui.factId.title = item.id;
   ui.download.textContent = `Download ${extensionOf(item.mimeType).toUpperCase()}`;
@@ -617,7 +718,9 @@ function renderStrip() {
 
       const preset = document.createElement("span");
       preset.className = "shot-preset";
-      preset.textContent = `${presetLabel(item.size, item.aspect)} · ${extensionOf(item.mimeType)}`;
+      preset.textContent =
+        `${presetLabel(item.size, item.aspect)} · ${extensionOf(item.mimeType)}` +
+        (item.hybridSteps > 0 ? ` · 다양성 ${item.hybridSteps}` : "");
       caption.append(preset);
 
       button.append(thumb, meter, caption);
@@ -646,6 +749,8 @@ ui.restore.addEventListener("click", () => {
   state.size = item.size;
   state.aspect = item.aspect;
   state.format = item.format;
+  // An image made without hybrid_steps (server without hybrid sampling) was a fast-path image: restore it as 끔.
+  state.hybrid = item.hybridSteps ?? 0;
   renderPresets();
   ui.seedModes.find((input) => input.value === "fixed").checked = true;
   ui.seed.value = item.seed;
@@ -675,7 +780,7 @@ async function describeFailure(response) {
     }
     return typeof detail === "string"
       ? detail
-      : "The server rejected the request. Check the prompt length, preset, format, and seed.";
+      : "The server rejected the request. Check the prompt length, preset, format, seed, and 다양성.";
   }
   if (response.status === 429) {
     const wait = response.headers.get("Retry-After") || "5";
@@ -726,8 +831,10 @@ ui.form.addEventListener("submit", async (event) => {
   const size = state.size;
   const aspect = state.aspect;
   const format = state.format;
+  const hybrid = activeHybrid();
   const body = { prompt, aspect_ratio: aspect, image_size: size, response_format: format };
   if (seed !== null) body.seed = seed;
+  if (hybrid !== null) body.hybrid_steps = hybrid;
 
   clearNotice();
   setBusy(true);
@@ -782,13 +889,15 @@ ui.form.addEventListener("submit", async (event) => {
     url = URL.createObjectURL(new Blob([bytes], { type: mimeType }));
 
     const itemSize = result.image_size || size;
+    const itemHybrid = Number.isInteger(result.timing.hybrid_steps) ? result.timing.hybrid_steps : hybrid;
     // Queue time depends on other clients, not on this request's shape.
-    state.estimate[itemSize] = {
+    state.estimate[estimateKey(itemSize, itemHybrid)] = {
       queue_ms: 0,
       prompt_encoding_ms: result.timing.prompt_encoding_ms,
       denoise_ms: result.timing.denoise_ms,
       vae_decode_ms: result.timing.vae_decode_ms,
       encode_ms: result.timing.encode_ms,
+      swap_ms: swapMs(result.timing),
     };
 
     const item = {
@@ -797,6 +906,8 @@ ui.form.addEventListener("submit", async (event) => {
       aspect: result.aspect_ratio || aspect,
       size: itemSize,
       format: result.response_format || format,
+      // null: sent without hybrid_steps (the server has no hybrid sampling).
+      hybridSteps: hybrid === null ? null : itemHybrid,
       seed: result.seed,
       width: result.width,
       height: result.height,

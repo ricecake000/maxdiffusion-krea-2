@@ -13,6 +13,8 @@ generation at a time and returns one image per request as base64 JSON in AVIF, W
 - Inference steps, guidance and every other model setting come from the YAML config (`KREA2_CONFIG`)
 - LoRA: whatever `lora_config` the config carries is applied to every request, exactly as `generate_krea2`
   does on the command line. There is no LoRA field and no LoRA endpoint.
+- Hybrid sampling (optional, see [Hybrid sampling](#hybrid-sampling)): with a second transformer tree configured,
+  a request may ask for `hybrid_steps` > 0.
 
 Put the server behind HTTPS before its port is reachable from the internet.
 
@@ -22,9 +24,11 @@ At startup the server:
 
 1. loads the runtime (`generate_krea2.create_runtime`: model, weight cache, mesh, pipeline, AOT cache);
 2. builds the serving set from `KREA2_SERVE_PRESETS` x `KREA2_SERVE_TEXT_TOKENS`;
-3. compiles, or loads from the AOT cache, every (resolution, text bucket) executable of that set.
+3. compiles, or loads from the AOT cache, every (resolution, text bucket) executable of that set;
+4. loads the hybrid transformer tree when `krea2_hybrid_weight_cache_dir` is set (`Krea2Runtime.load_hybrid_params`;
+   after the warm-up, so the warm-up runs with the plain residency). A missing or invalid hybrid cache fails startup.
 
-`/livez` answers from the first second; `/readyz` answers `503` until step 3 has finished and `200` after. A
+`/livez` answers from the first second; `/readyz` answers `503` until step 4 has finished and `200` after. A
 failure in any step is logged with its traceback and stops the process with exit code 1 (exit code 3 when the
 `KREA2_*` settings themselves are invalid, for example an encoder quality outside 0–100), so a supervisor can
 restart it. Stopping the server during startup exits without waiting for the warmup.
@@ -35,6 +39,8 @@ Its text bucket must then be in `KREA2_SERVE_TEXT_TOKENS`, or startup fails with
 because an unwarmed bucket would compile in the request path. `negative_prompt` may be a string (empty or unset
 means no negative prompt) or a list with exactly one string; a list of any other length fails startup with exit
 code 1, with or without guidance, because the pipeline would reject it on every request (one image per request).
+With `krea2_hybrid_weight_cache_dir` set, the same check runs for `krea2_hybrid_negative_prompt` (empty by default,
+which needs the smallest bucket, 128), since every hybrid request encodes it.
 
 ### Shutdown
 
@@ -105,8 +111,10 @@ Authorization: Bearer <KREA2_API_TOKEN>
 | `image_size` | string | no | `"1k"` | `"1k"` or `"2k"`. Together with `aspect_ratio` it must name a warmed preset. |
 | `seed` | integer or null | no | server-drawn | Noise seed in `0`–`2147483647`. When omitted or null the server draws a fresh random seed for this request (the config's `seed` is never used) and echoes it in the response. |
 | `response_format` | string or null | no | `"avif"` | `"avif"`, `"webp"`, `"jpeg"` or `"png"`; must be enabled in `KREA2_FORMATS`. When `avif` is disabled the default is the first enabled format. |
+| `hybrid_steps` | integer | no | `0` | Hybrid sampling ("diversity"): the number of the 8 Turbo steps, from the first, that run the hybrid tree with classifier-free guidance; `0` is the plain fast path. `0`–`7` by the schema, and at most `hybrid.max_steps` of `GET /v1/presets` (`422` above it, and for any value > 0 when `hybrid.available` is false). |
 
-Unknown fields (for example the old `lora` field) are rejected with `422`.
+Unknown fields (for example the old `lora` field) are rejected with `422`. A server from before hybrid sampling
+rejects `hybrid_steps` itself as unknown; clients should send it only when `GET /v1/presets` has a `hybrid` block.
 
 ```json
 {
@@ -114,7 +122,8 @@ Unknown fields (for example the old `lora` field) are rejected with `422`.
   "aspect_ratio": "16:9",
   "image_size": "1k",
   "seed": 42,
-  "response_format": "webp"
+  "response_format": "webp",
+  "hybrid_steps": 2
 }
 ```
 
@@ -145,7 +154,8 @@ Status `200 OK`:
     "denoise_ms": 940,
     "vae_decode_ms": 120,
     "encode_ms": 38,
-    "total_ms": 1149
+    "total_ms": 1149,
+    "hybrid_steps": 2
   }
 }
 ```
@@ -174,6 +184,13 @@ Status `200 OK`:
 | `vae_decode_ms` | VAE decode and transfer to the host. |
 | `encode_ms` | Image encoding and base64, on the encode pool after the generation slot was released. |
 | `total_ms` | From arrival to the finished response body. |
+| `hybrid_steps` | The request's `hybrid_steps` (always present; `0` for the fast path). |
+| `text_encoder_swap_ms` | Only when present: host-to-device copy of the text encoder for this request (a request whose `width * height` reaches `krea2_text_encoder_offload_min_pixels`, or `text_encoder` in `krea2_offload_components`). |
+| `text_encoder_replace_ms` | Only when present: re-placing the text encoder on the device for a small request after a large one had offloaded it. |
+| `hybrid_replace_ms` | Only when present: re-placing the hybrid tree on the device after a request that evicted it (`krea2_hybrid_evict_min_pixels`). |
+
+The three swap fields are left out (not `null`) when the runtime moved no weights for the request. They are not part
+of the other stages; `total_ms` includes them.
 
 ### Image formats
 
@@ -202,11 +219,28 @@ Lists the warmed serving set (`503` before the server is ready):
   "formats": ["avif", "webp", "jpeg", "png"],
   "default_format": "avif",
   "max_queue": 4,
-  "request_timeout_s": 60.0
+  "request_timeout_s": 60.0,
+  "hybrid": {"available": true, "max_steps": 3, "guidance": 1.5}
 }
 ```
 
 `text_tokens` lists the warmed text buckets of each preset; a prompt longer than the largest one is rejected.
+`hybrid` describes hybrid sampling on this server: `available` is true when the hybrid tree is loaded,
+`max_steps` is the largest `hybrid_steps` a request may send (`0` when unavailable) and `guidance` the CFG scale of
+the hybrid steps (`krea2_hybrid_guidance`).
+
+## Hybrid sampling
+
+A hybrid request runs its first `hybrid_steps` denoising steps on a second W8A8 transformer tree (loaded from
+`krea2_hybrid_weight_cache_dir`, identity `krea2_hybrid_model_id`) with classifier-free guidance
+(`krea2_hybrid_guidance`, default 1.5, against `krea2_hybrid_negative_prompt`, default empty), and the remaining
+steps on the main model without guidance, on the same Turbo sigma schedule. The first steps decide the composition,
+so this gives more varied images for a few extra transformer passes per hybrid step (two per step instead of
+one). `hybrid_steps: 0` is exactly the fast path. Both trees stay on the device; the config keys
+`krea2_text_encoder_offload_min_pixels` and `krea2_hybrid_evict_min_pixels` trade swap time for device memory at
+large sizes (the swaps are reported in `timing`). All of these are config keys (`KREA2_CONFIG_OVERRIDES`); none
+changes the AOT cache, and the hybrid tree reuses the main model's executables. The first hybrid request of each
+resolution is slower than later ones.
 
 ## Concurrency, queueing and timeouts
 
@@ -248,7 +282,7 @@ FastAPI validation errors use its standard `detail` array; the others carry a st
 | Status | Meaning | Typical cause |
 |---:|---|---|
 | `401` | Unauthorized | Missing or invalid bearer token. |
-| `422` | Unprocessable Entity | Invalid or unknown field, prompt blank or over 4000 characters, seed out of range, unknown ratio/size, a preset that is not warmed (the detail lists the warmed ones), a prompt with too many tokens for the warmed text buckets, a `response_format` that is not enabled. |
+| `422` | Unprocessable Entity | Invalid or unknown field, prompt blank or over 4000 characters, seed out of range, unknown ratio/size, a preset that is not warmed (the detail lists the warmed ones), a prompt with too many tokens for the warmed text buckets, a `response_format` that is not enabled, `hybrid_steps` above the server's `hybrid.max_steps` (or any `hybrid_steps` > 0 without hybrid sampling). |
 | `429` | Too Many Requests | `KREA2_MAX_QUEUE` generations already in flight. Honour `Retry-After`. |
 | `500` | Internal Server Error | `{"detail": "Image generation failed"}`: the runtime or the encoder raised; the server log has the exception type and traceback. |
 | `503` | Service Unavailable | The runtime is still loading or warming up. |
@@ -256,7 +290,9 @@ FastAPI validation errors use its standard `detail` array; the others carry a st
 
 Every response carries `X-Request-ID`: the client's value when it sends a safe one (1–128 characters from
 `A-Z a-z 0-9 . _ : -`), otherwise a fresh id. The server logs one line per generation request with this id, the
-preset, format, seed, text bucket, timings and status.
+preset, format, seed, `hybrid_steps`, text bucket, timings (including the swap timings when present), status and the
+device memory right after the generation (`hbm_in_use_gib`, `hbm_peak_gib`: bytes in use and the process's peak,
+GiB; `-` when the backend reports none). The ready line logs the hybrid state and the same two memory values.
 
 ## CORS
 
@@ -326,7 +362,7 @@ complete client.
 | `KREA2_ALLOWED_ORIGINS` | `http://localhost:3000,http://localhost:5173` | CORS origin allowlist. |
 | `KREA2_DISABLE_DOCS` | off | `1`, `true` or `yes` disables the `/docs` page. |
 | `KREA2_CONFIG` | bundled `configs/base_krea2_turbo.yml` | Krea 2 YAML config (`configs/base_krea2_turbo_v6e1.yml` on a v6e-1). |
-| `KREA2_CONFIG_OVERRIDES` | empty | Shell-quoted `key=value` config overrides, passed through verbatim, e.g. `aot_cache_dir=/cache/aot aot_cache_lazy_load=True aot_cache_gcs=gs://bucket/aot krea2_weight_cache_dir=/cache/weights`. Setting `krea2_precompile`, `krea2_weight_cache_build_only` or a `batch_size` other than 1 refuses to start. |
+| `KREA2_CONFIG_OVERRIDES` | empty | Shell-quoted `key=value` config overrides, passed through verbatim, e.g. `aot_cache_dir=/cache/aot aot_cache_lazy_load=True aot_cache_gcs=gs://bucket/aot krea2_weight_cache_dir=/cache/weights`. Setting `krea2_precompile`, `krea2_weight_cache_build_only` or a `batch_size` other than 1 refuses to start. Hybrid sampling is configured here too: `krea2_hybrid_weight_cache_dir=... krea2_hybrid_model_id=...` (plus the optional keys in [Hybrid sampling](#hybrid-sampling)). |
 | `KREA2_MODEL_PATH` | config's model | Sets `pretrained_model_name_or_path` (a local directory avoids a Hub lookup). |
 | `KREA2_OUTPUT_DIR` | `/tmp/krea2-api` | Run output directory; generated API images are not written there. |
 | `KREA2_SERVE_PRESETS` | `all` | Presets to warm and serve (`krea2_precompile` syntax). |

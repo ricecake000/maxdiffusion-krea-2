@@ -79,7 +79,7 @@ import math
 import os
 import threading
 from contextlib import ExitStack, nullcontext
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import Any, List, NamedTuple, Optional, Sequence, Tuple
 
 from absl import app
 import jax
@@ -696,6 +696,126 @@ def save_host_params(cache, tree, load_trace, trace_key, extras=None):
   return saved
 
 
+def hybrid_transformer_cache_meta(main_meta: dict, model_id: str) -> dict:
+  """The weight cache meta of the hybrid sampler's early tree E: the main transformer's, under E's identity.
+
+  E (e.g. Raw + the fine-tune delta) is built elsewhere with the main tree's
+  structure, quantization and RoPE layout, and saved as component
+  "transformer" with this meta; `krea2_hybrid_model_id` names it.
+  """
+  return {**main_meta, "model": model_id, "snapshot": model_id}
+
+
+class Krea2HybridConfig(NamedTuple):
+  """The resolved hybrid sampling and per-request residency keys (`resolve_hybrid_config`)."""
+
+  # krea2_hybrid_weight_cache_dir: the cache root holding E's "transformer" component; '' = no hybrid.
+  cache_dir: str
+  model_id: str
+  # Largest hybrid_steps a request may ask.
+  max_steps: int
+  guidance: float
+  negative_prompt: str
+  # 0 = never; else requests with width * height >= value run with the text encoder offloaded.
+  text_encoder_offload_min_pixels: int
+  # 0 = never; else requests with width * height >= value run without E on device (placed again after).
+  evict_min_pixels: int
+
+
+def _int_ge_zero(value) -> bool:
+  return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _unquoted(value) -> str:
+  # Strip quotes so a command-line override `key=''` means off.
+  return str(value or "").strip().strip("'\"")
+
+
+def resolve_hybrid_config(config, offload_components=(), lora_configured=False) -> Krea2HybridConfig:
+  """Validates the hybrid sampling keys before anything is loaded; returns them resolved.
+
+  The two *_min_pixels keys are always checked (the text encoder one also
+  applies without hybrid sampling); the hybrid keys only when
+  `krea2_hybrid_weight_cache_dir` is set. Hybrid sampling needs a Turbo config
+  (one loop on its schedule), a resident transformer (E reuses the main
+  tree's executables and placement) and no LoRA (E's cache has no adapters).
+  None of these keys changes an executable (no AOT meta key). Raises
+  ValueError.
+  """
+  te_min_pixels = getattr(config, "krea2_text_encoder_offload_min_pixels", 0)
+  evict_min_pixels = getattr(config, "krea2_hybrid_evict_min_pixels", 0)
+  for key, value in (
+      ("krea2_text_encoder_offload_min_pixels", te_min_pixels),
+      ("krea2_hybrid_evict_min_pixels", evict_min_pixels),
+  ):
+    if not _int_ge_zero(value):
+      raise ValueError(f"{key} must be an integer >= 0 (pixels, 0 = never), got {value!r}.")
+  cache_dir = _unquoted(getattr(config, "krea2_hybrid_weight_cache_dir", ""))
+  model_id = _unquoted(getattr(config, "krea2_hybrid_model_id", ""))
+  max_steps = getattr(config, "krea2_hybrid_max_steps", 3)
+  guidance = getattr(config, "krea2_hybrid_guidance", 1.5)
+  negative_prompt = getattr(config, "krea2_hybrid_negative_prompt", "")
+  if negative_prompt is None:
+    negative_prompt = ""
+  if cache_dir:
+    if not model_id:
+      raise ValueError("krea2_hybrid_weight_cache_dir needs krea2_hybrid_model_id (the identity E was saved under).")
+    num_steps = int(config.num_inference_steps)
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int) or not 1 <= max_steps <= min(7, num_steps - 1):
+      raise ValueError(
+          f"krea2_hybrid_max_steps must be an integer in [1, {min(7, num_steps - 1)}] (fewer than "
+          f"num_inference_steps={num_steps}), got {max_steps!r}."
+      )
+    if isinstance(guidance, bool) or not isinstance(guidance, (int, float)) or not math.isfinite(guidance) or guidance < 0:
+      raise ValueError(f"krea2_hybrid_guidance must be a finite number >= 0, got {guidance!r}.")
+    if not isinstance(negative_prompt, str):
+      raise ValueError(f"krea2_hybrid_negative_prompt must be a string, got {negative_prompt!r}.")
+    if not getattr(config, "is_distilled", False):
+      raise ValueError("krea2_hybrid_weight_cache_dir needs a Turbo config (is_distilled: True).")
+    # Mirrors the pipeline's is_classifier_free_guidance_enabled on the call's config values: a hybrid call
+    # needs the main CFG off, so every hybrid request would fail.
+    guidance_scale = float(getattr(config, "guidance_scale", 0.0) or 0.0)
+    do_cfg = getattr(config, "do_classifier_free_guidance", None)
+    if guidance_scale > 0.0 and (do_cfg is None or bool(do_cfg)):
+      raise ValueError(
+          "krea2_hybrid_weight_cache_dir needs the main classifier-free guidance off (do_classifier_free_guidance "
+          f"False or guidance_scale 0; got {do_cfg!r} / {guidance_scale})."
+      )
+    if "transformer" in tuple(offload_components or ()):
+      raise ValueError("krea2_hybrid_weight_cache_dir excludes 'transformer' in krea2_offload_components.")
+    if lora_configured:
+      raise ValueError("krea2_hybrid_weight_cache_dir excludes LoRA adapters (E's cache has none).")
+  return Krea2HybridConfig(
+      cache_dir=cache_dir,
+      model_id=model_id,
+      max_steps=int(max_steps) if cache_dir else 0,
+      guidance=float(guidance) if cache_dir else 0.0,
+      negative_prompt=negative_prompt if cache_dir else "",
+      text_encoder_offload_min_pixels=te_min_pixels,
+      evict_min_pixels=evict_min_pixels,
+  )
+
+
+def device_memory_gib(device=None) -> dict:
+  """`{"in_use", "peak", "limit"}` GiB of `device` (default the first JAX device); None where it has no stats."""
+  try:
+    stats = (device if device is not None else jax.devices()[0]).memory_stats()
+  except Exception:  # pylint: disable=broad-except
+    stats = None
+  stats = stats or {}
+
+  def gib(key):
+    value = stats.get(key)
+    return None if value is None else value / 1024**3
+
+  return {"in_use": gib("bytes_in_use"), "peak": gib("peak_bytes_in_use"), "limit": gib("bytes_limit")}
+
+
+def _any_deleted(tree) -> bool:
+  """Whether any leaf of the tree is a deleted device array."""
+  return any(leaf.is_deleted() for leaf in jax.tree_util.tree_leaves(tree) if hasattr(leaf, "is_deleted"))
+
+
 # Build-only mode's load_trace stages per component: the validity check, or the build and the write
 # (qwen_host includes the text encoder's quantization, embedding table and write).
 _WEIGHT_CACHE_CHECK_STAGES = {"transformer": "transformer_cache_check", "text_encoder": "qwen_cache_check"}
@@ -1199,6 +1319,17 @@ class Krea2Runtime:
     text_compaction_multiple: the generate-side mirror of the pipeline's compaction multiple.
     timed_phases: trace entries summed into a pass's time.
     load_trace: per-stage load seconds.
+    hybrid_params: the hybrid sampler's early tree E on device (`load_hybrid_params`), else None.
+    hybrid_host_params: E's host tree, kept only for krea2_hybrid_evict_min_pixels > 0.
+    hybrid_max_steps: largest `generate(hybrid_steps=...)`; 0 = hybrid sampling unavailable.
+    hybrid_guidance: E's CFG scale (krea2_hybrid_guidance).
+    qwen3_host_params: the text encoder's host tree, kept only for
+      krea2_text_encoder_offload_min_pixels > 0 (then `qwen3_params` is None
+      while the text encoder is off the device).
+    transformer_cache_meta: the main transformer's weight cache meta (every
+      path, cache or not): `hybrid_transformer_cache_meta` derives E's from it.
+    transformer_abstract_params: the runtime transformer's abstract param tree (E is checked against it).
+    transformer_shardings: the transformer's param shardings (E is placed with them).
   """
 
   config: Any
@@ -1216,6 +1347,14 @@ class Krea2Runtime:
   text_compaction_multiple: int
   timed_phases: tuple = KREA2_TIMED_PHASES
   load_trace: dict = dataclasses.field(default_factory=dict)
+  hybrid_params: Any = dataclasses.field(default=None, repr=False)
+  hybrid_host_params: Any = dataclasses.field(default=None, repr=False)
+  hybrid_max_steps: int = 0
+  hybrid_guidance: float = 1.5
+  qwen3_host_params: Any = dataclasses.field(default=None, repr=False)
+  transformer_cache_meta: Optional[dict] = None
+  transformer_abstract_params: Any = dataclasses.field(default=None, repr=False)
+  transformer_shardings: Any = dataclasses.field(default=None, repr=False)
   _bucket_tokenizer: Any = dataclasses.field(default=None, init=False, repr=False, compare=False)
   _bucket_lock: Any = dataclasses.field(default_factory=threading.Lock, init=False, repr=False, compare=False)
 
@@ -1259,6 +1398,7 @@ class Krea2Runtime:
     threads; flax keeps the LoRA interceptors per thread, so each threaded
     pipeline call enters them again.
     """
+    self._place_text_encoder()
     call_kwargs = self.call_kwargs(height=self.default_height, width=self.default_width, latents=None)
     workers = resolve_precompile_workers(self.config)
     # One worker: the call (and the code path) of before the key existed.
@@ -1291,6 +1431,7 @@ class Krea2Runtime:
   def warmup_default(self) -> dict:
     """The CLI's warmup pass at the default prompts, size and latents, then a synchronous AOT save; returns its trace."""
     max_logging.log("Running compile warmup (zero-execution when AOT cache is enabled)...")
+    self._place_text_encoder()
     call_kwargs = self.call_kwargs(
         height=self.default_height, width=self.default_width, output_type="file", latents=self.default_latents
     )
@@ -1317,6 +1458,7 @@ class Krea2Runtime:
       output_type: str = "pil",
       output_name: Optional[str] = None,
       latents=None,
+      hybrid_steps: int = 0,
   ) -> Tuple[list, dict]:
     """One pipeline call for exactly `batch_size` prompts; returns `(outputs, trace)`.
 
@@ -1325,10 +1467,177 @@ class Krea2Runtime:
     `config.output_name`). `trace` has the phase seconds (prompt_encoding,
     denoise_loop, vae_decode), the text buckets and the resolved `seed` (None
     with custom `latents`).
+
+    `hybrid_steps` (0 to `hybrid_max_steps`, else ValueError): the first that
+    many steps run E with CFG (trace "hybrid_steps", "hybrid_guidance",
+    "negative_text_tokens"). Per-request residency, by width * height:
+    krea2_text_encoder_offload_min_pixels runs a large request with the text
+    encoder offloaded (its swap-in in the trace) and places it again before
+    the next small one (trace "text_encoder_replace_s");
+    krea2_hybrid_evict_min_pixels runs a large request without E on device
+    after E's steps (trace "hybrid_evicted") and places E again after the
+    call, also when it fails (trace "hybrid_replace_s"). Neither knob set and
+    hybrid_steps 0: exactly the call of before these existed.
     """
+    hybrid_steps = self._check_hybrid_steps(hybrid_steps)
+    extra_trace = {}
+    pixels = int(height) * int(width)
+    hybrid = resolve_hybrid_config(self.config)
+    large = hybrid.evict_min_pixels > 0 and pixels >= hybrid.evict_min_pixels
+    if self.hybrid_host_params is not None and self.hybrid_params is None and (hybrid_steps or not large):
+      # An earlier placement after an evicting call failed: try again first (not for a request that runs without E).
+      extra_trace["hybrid_replace_s"] = self._replace_hybrid_params()
+    if hybrid_steps and self.hybrid_params is None:
+      # Not the request's fault (a ValueError): E is not on the device.
+      raise RuntimeError("hybrid sampling is unavailable: the hybrid tree E is not on the device.")
     call_kwargs = self.call_kwargs(height=height, width=width, seed=seed, output_type=output_type, latents=latents)
-    with self._interceptors():
-      return self.pipeline(prompt=list(prompts), output_name=output_name or self.config.output_name, **call_kwargs)
+    if self.qwen3_host_params is not None:
+      if hybrid.text_encoder_offload_min_pixels and pixels >= hybrid.text_encoder_offload_min_pixels:
+        self._free_text_encoder()
+        call_kwargs.update(qwen3_params=self.qwen3_host_params, offload_text_encoder=True)
+      else:
+        replace_s = self._place_text_encoder()
+        if replace_s is not None:
+          extra_trace["text_encoder_replace_s"] = replace_s
+        call_kwargs["qwen3_params"] = self.qwen3_params
+    evict = self.hybrid_params is not None and self.hybrid_host_params is not None and large
+    if hybrid_steps:
+      call_kwargs.update(
+          hybrid_params=self.hybrid_params,
+          hybrid_steps=hybrid_steps,
+          hybrid_guidance=self.hybrid_guidance,
+          hybrid_negative_prompt=hybrid.negative_prompt,
+      )
+      if evict:
+        call_kwargs.update(hybrid_host_params=self.hybrid_host_params, hybrid_evict=True)
+    elif evict:
+      # A fast request needs no E at all: off the device for the whole call.
+      from maxdiffusion.pipelines.krea2.krea2_pipeline import free_params
+
+      self.hybrid_params = free_params(self.hybrid_params, self.hybrid_host_params)
+      extra_trace["hybrid_evicted"] = True
+    try:
+      with self._interceptors():
+        outputs, trace = self.pipeline(
+            prompt=list(prompts), output_name=output_name or self.config.output_name, **call_kwargs
+        )
+    finally:
+      if evict:
+        replace_s = self._replace_hybrid_params()
+        if replace_s is not None:
+          extra_trace["hybrid_replace_s"] = replace_s
+    if extra_trace:
+      trace = {**trace, **extra_trace}
+    return outputs, trace
+
+  def _check_hybrid_steps(self, hybrid_steps) -> int:
+    if isinstance(hybrid_steps, bool) or not isinstance(hybrid_steps, (int, np.integer)):
+      raise ValueError(f"hybrid_steps must be an int, got {hybrid_steps!r}.")
+    hybrid_steps = int(hybrid_steps)
+    if not 0 <= hybrid_steps <= self.hybrid_max_steps:
+      available = (
+          f"0..{self.hybrid_max_steps}" if self.hybrid_max_steps else "0 (hybrid sampling is not loaded)"
+      )
+      raise ValueError(f"hybrid_steps must be in {available}, got {hybrid_steps}.")
+    return hybrid_steps
+
+  def _place_text_encoder(self) -> Optional[float]:
+    """Places the text encoder from its host copy when it is off the device; returns the seconds, else None."""
+    if self.qwen3_host_params is None or self.qwen3_params is not None:
+      return None
+    from maxdiffusion.pipelines.krea2.krea2_pipeline import place_params
+
+    t0 = time.perf_counter()
+    self.qwen3_params = place_params(self.qwen3_host_params, self.pipeline.param_shardings["text_encoder"])
+    seconds = time.perf_counter() - t0
+    max_logging.log(f"[residency] text encoder placed on device again in {seconds:.2f} s")
+    return seconds
+
+  def _free_text_encoder(self) -> None:
+    """Frees the text encoder's device copy (the host copy stays) when it is on the device."""
+    if self.qwen3_host_params is None or self.qwen3_params is None:
+      return
+    from maxdiffusion.pipelines.krea2.krea2_pipeline import free_params
+
+    self.qwen3_params = free_params(self.qwen3_params, self.qwen3_host_params)
+
+  def _replace_hybrid_params(self) -> Optional[float]:
+    """Places E again from its host copy after an evicting call; returns the seconds (None when E was still whole).
+
+    A call that failed before E's steps ended leaves E whole and resident: it is
+    kept. A partly freed tree is freed completely, then placed again.
+    """
+    from maxdiffusion.pipelines.krea2.krea2_pipeline import free_params, place_params
+
+    if self.hybrid_params is not None:
+      if not _any_deleted(self.hybrid_params):
+        return None
+      # Deleting a deleted array is a no-op: this frees whatever is left.
+      self.hybrid_params = free_params(self.hybrid_params, self.hybrid_host_params)
+    t0 = time.perf_counter()
+    self.hybrid_params = place_params(self.hybrid_host_params, self.transformer_shardings)
+    seconds = time.perf_counter() - t0
+    max_logging.log(f"[hybrid] E placed on device again in {seconds:.2f} s")
+    return seconds
+
+  def load_hybrid_params(self) -> bool:
+    """Loads the hybrid sampler's early tree E from krea2_hybrid_weight_cache_dir and places it; True when loaded.
+
+    A no-op returning False without the key; idempotent. E is the stored
+    "transformer" component of `hybrid_transformer_cache_meta(main meta,
+    krea2_hybrid_model_id)`, trusted without checkpoint files, checked
+    against the runtime transformer's tree and placed with its shardings
+    (frozen like the main tree, so every executable is shared). It waits
+    for the directory like the main cache (krea2_weight_cache_wait_s). Until
+    it returns, `hybrid_max_steps` is 0. A missing or invalid cache raises
+    RuntimeError naming the expected directory. Serving calls it after the
+    warm-up (which runs with today's residency), the CLI after its warm-up.
+    """
+    hybrid = resolve_hybrid_config(self.config, offload_components=getattr(self.pipeline, "offload_components", ()))
+    if not hybrid.cache_dir:
+      return False
+    if self.hybrid_params is not None:
+      return True
+    if self.transformer_cache_meta is None or self.transformer_abstract_params is None or self.transformer_shardings is None:
+      raise RuntimeError("load_hybrid_params needs a runtime built by create_runtime (transformer meta and shardings).")
+    from maxdiffusion.models.krea2 import weight_cache
+    from maxdiffusion.models.krea2.transformer_quant import check_transformer_param_tree
+    from maxdiffusion.pipelines.krea2.krea2_pipeline import params_device_bytes, place_params
+
+    meta = hybrid_transformer_cache_meta(self.transformer_cache_meta, hybrid.model_id)
+    directory = weight_cache.component_dir(hybrid.cache_dir, "transformer", meta)
+    t_start = time.perf_counter()
+    wait_s = resolve_weight_cache_wait_s(self.config)
+    if wait_s > 0:
+      weight_cache.wait_for_component(hybrid.cache_dir, "transformer", meta, wait_s)
+      self.load_trace["hybrid_wait"] = time.perf_counter() - t_start
+    cached = weight_cache.load_component(
+        hybrid.cache_dir, "transformer", meta, self.transformer_abstract_params, source_files=None
+    )
+    if cached is None:
+      raise RuntimeError(
+          f"[hybrid] no valid E ({hybrid.model_id}) at {directory} (see the miss reason above): build it for this "
+          "configuration (the main transformer's cache meta under krea2_hybrid_model_id) or pull it there"
+      )
+    tree, _ = cached
+    check_transformer_param_tree(tree, self.transformer_abstract_params)
+    if isinstance(self.params, flax.core.FrozenDict):
+      tree = flax.core.freeze(tree)
+    placed = place_params(tree, self.transformer_shardings)
+    self.hybrid_host_params = tree if hybrid.evict_min_pixels > 0 else None
+    del tree, cached
+    self.hybrid_params = placed
+    self.hybrid_max_steps = hybrid.max_steps
+    self.hybrid_guidance = hybrid.guidance
+    seconds = time.perf_counter() - t_start
+    self.load_trace["hybrid_load"] = seconds
+    gib = params_device_bytes(placed) / 1024**3
+    max_logging.log(f"[hybrid] E loaded {directory} {gib:.2f} GiB in {seconds:.1f} s")
+    return True
+
+  def device_memory_gib(self) -> dict:
+    """`device_memory_gib()` of the first device: {"in_use", "peak", "limit"} GiB, None where unknown."""
+    return device_memory_gib()
 
   def text_bucket_for_tokens(self, valid_tokens: int) -> int:
     """The text bucket the pipeline's compaction picks for `valid_tokens` valid text tokens."""
@@ -1487,6 +1796,16 @@ def create_runtime(argv) -> Optional["Krea2Runtime"]:
   # Offloaded components keep their host tree; the pipeline places them on
   # device only for their phase (validated by FlaxKrea2Pipeline).
   offload_components = tuple(getattr(config, "krea2_offload_components", None) or ())
+  # Hybrid sampling and the per-request residency knobs (E itself loads in load_hybrid_params).
+  hybrid_config = resolve_hybrid_config(config, offload_components)
+  # The text encoder's per-request offload keeps a host copy of a resident text encoder.
+  keep_qwen3_host = hybrid_config.text_encoder_offload_min_pixels > 0
+  if keep_qwen3_host and "text_encoder" in offload_components:
+    max_logging.log(
+        "krea2_text_encoder_offload_min_pixels ignored: 'text_encoder' is in krea2_offload_components "
+        "(offloaded for every request)."
+    )
+    keep_qwen3_host = False
 
   # A line-oriented file avoids shell quoting limits for heterogeneous
   # production batches.
@@ -1596,6 +1915,8 @@ def create_runtime(argv) -> Optional["Krea2Runtime"]:
     lora_flat_params, lora_interceptors, lora_diff_updates, lora_compile_spec = maybe_load_krea2_lora(
         config, config.weights_dtype, return_compile_spec=True
     )
+  # Hybrid sampling excludes LoRA: fails here, before the weights load.
+  resolve_hybrid_config(config, offload_components, lora_configured=bool(lora_compile_spec))
 
   # 6. Evaluate shapes & extract mesh shardings
   max_logging.log("Evaluating model shapes and shardings...")
@@ -1690,20 +2011,22 @@ def create_runtime(argv) -> Optional["Krea2Runtime"]:
   transformer_cache_dir, text_encoder_cache_dir = resolve_weight_cache_dirs(
       config, transformer_quantization, te_quantization, lora_compile_spec
   )
+  # Computed with or without a cache: the hybrid sampler's E cache meta derives from it.
+  transformer_cache_meta = transformer_weight_cache_meta(
+      config,
+      snapshot_dir,
+      transformer_quantization,
+      transformer_quant_targets,
+      transformer.rope_layout,
+      transformer.num_attention_heads,
+      transformer.num_key_value_heads,
+      transformer.attention_head_dim,
+  )
   transformer_cache = (
       WeightCacheSpec(
           transformer_cache_dir,
           "transformer",
-          transformer_weight_cache_meta(
-              config,
-              snapshot_dir,
-              transformer_quantization,
-              transformer_quant_targets,
-              transformer.rope_layout,
-              transformer.num_attention_heads,
-              transformer.num_key_value_heads,
-              transformer.attention_head_dim,
-          ),
+          transformer_cache_meta,
           list_source_files(transformer_path),
           weight_cache_wait_s,
       )
@@ -1940,6 +2263,8 @@ def create_runtime(argv) -> Optional["Krea2Runtime"]:
           # on the single-host v5e reference run.
           if "transformer" not in offload_components:
             params = jax.tree_util.tree_map(max_utils.device_put_replicated, params, transformer_shardings)
+          # The per-request text encoder offload frees and places it again from this host tree.
+          qwen3_host_params = qwen3_params if keep_qwen3_host else None
           if "text_encoder" not in offload_components:
             qwen3_params = jax.tree_util.tree_map(max_utils.device_put_replicated, qwen3_params, qwen3_shardings)
         load_trace["device_placement"] = time.perf_counter() - t0
@@ -2071,6 +2396,10 @@ def create_runtime(argv) -> Optional["Krea2Runtime"]:
       precompile_plan=list(precompile_plan),
       text_compaction_multiple=text_compaction_multiple,
       load_trace=load_trace,
+      qwen3_host_params=qwen3_host_params,
+      transformer_cache_meta=transformer_cache_meta,
+      transformer_abstract_params=abstract_transformer_vars["params"],
+      transformer_shardings=transformer_shardings,
   )
 
 
@@ -2103,6 +2432,8 @@ def main(argv):
   warmup_trace = runtime.warmup_default()
   timeline.mark("warmup_done")
   warmup_time = sum(warmup_trace.get(k, 0.0) for k in timed_phases)
+  # E of krea2_hybrid_weight_cache_dir after the warm-up (like serving); a no-op without the key.
+  runtime.load_hybrid_params()
 
   max_logging.log("Running timed pass at full device speed...")
   with max_utils.Profiler(config, session_name="krea2_timed"):

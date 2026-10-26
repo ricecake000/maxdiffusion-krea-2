@@ -364,6 +364,7 @@ class MainTest(unittest.TestCase):
     runtime.warmup_default.side_effect = warmup_default
     runtime.generate.side_effect = generate
     runtime.precompile.side_effect = precompile
+    runtime.load_hybrid_params.side_effect = lambda: events.append("load_hybrid") or False
     return runtime, events
 
   def test_main_warms_up_then_generates_a_file(self):
@@ -380,6 +381,8 @@ class MainTest(unittest.TestCase):
         events,
         [
             "warmup",
+            # E (krea2_hybrid_weight_cache_dir) loads after the warm-up, like serving; the CLI generates fast.
+            "load_hybrid",
             (
                 "generate",
                 ("p",),

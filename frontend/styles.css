@@ -607,7 +607,8 @@ textarea::placeholder, .text::placeholder { color: rgba(126, 140, 158, 0.5); }
   text-align: left;
 }
 
-.shot-preset { display: block; color: var(--cool); }
+/* keep-all: "다양성 3" wraps as a whole word, not between its syllables. */
+.shot-preset { display: block; color: var(--cool); word-break: keep-all; }
 
 /* ── settings sheet ──────────────────────────────────────── */
 

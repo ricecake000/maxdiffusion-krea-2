@@ -46,23 +46,31 @@ token, and save. Both are kept in this browser's local storage.
   bucket, the queue limit, and the timeout.
 - Offers the formats the server enabled (`avif` small, `webp` fast, `jpeg`
   compatible, `png` lossless), preselecting the server's default.
+- Shows a **다양성** (hybrid sampling) switch, 끔 / 2 / 3, only when
+  `GET /v1/presets` reports `hybrid.available`; it offers only step counts up
+  to the server's `hybrid.max_steps` and defaults to 2. The choice is
+  remembered in local storage.
 - Sends `POST /v1/images/generations` with `prompt`, `aspect_ratio`,
-  `image_size`, `response_format`, and an optional `seed`, one request at a
-  time from this page.
+  `image_size`, `response_format`, an optional `seed`, and `hybrid_steps`
+  when the 다양성 switch is shown (left out otherwise, since a server without
+  hybrid sampling rejects the field), one request at a time from this page.
 - Renders the returned image from a blob URL, shows its MIME type, and offers
   it as a download with the matching extension.
 - Draws the `timing` object as a proportional pipeline bar: queue wait (when
-  over 40 ms), text encoding, denoising, VAE decode, image encode. While a
-  request is in flight the bar animates against the previous request of the
-  same size, then snaps to the measured timings when the response lands.
+  over 40 ms), text encoding, denoising, VAE decode, image encode, and a
+  swap stage (when the server moved weights for the request: the sum of
+  `text_encoder_swap_ms`, `text_encoder_replace_ms` and `hybrid_replace_ms`).
+  While a request is in flight the bar animates against the previous request
+  of the same size and 다양성 setting, then snaps to the measured timings when
+  the response lands.
 - Polls `GET /readyz` for the status dot, including how many generations are
   in flight on the server.
 - Explains `429` (queue full, with the server's `Retry-After`) and `504`
   (timeout) answers, and reloads the preset list after a `422`.
 - Keeps up to 24 images from the session in a strip, each labelled with its
-  seed, preset, and format and carrying its own timing meter. **Use these
-  settings** restores an image's prompt, preset, format, and seed for a
-  reproducible re-run.
+  seed, preset, format, and 다양성 setting and carrying its own timing meter.
+  **Use these settings** restores an image's prompt, preset, format, seed,
+  and 다양성 setting for a reproducible re-run.
 
 `⌘`/`Ctrl` + `Return` in the prompt box generates.
 

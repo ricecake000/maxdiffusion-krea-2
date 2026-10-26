@@ -21,6 +21,7 @@ import asyncio
 import base64
 from contextlib import asynccontextmanager
 from io import BytesIO
+import sys
 import threading
 import time
 import types
@@ -52,7 +53,14 @@ class FakeRuntime:
         guidance_scale=0.0,
         do_classifier_free_guidance=False,
         negative_prompt="",
+        krea2_hybrid_weight_cache_dir="",
+        krea2_hybrid_guidance=1.5,
+        krea2_hybrid_negative_prompt="",
     )
+    self.hybrid_max_steps = 0  # 0 until load_hybrid_params() loads a hybrid tree
+    self.hybrid_load_steps = 0  # what load_hybrid_params() sets; 0 = no hybrid tree configured
+    self.hybrid_load_error = None
+    self.events = []  # ordered startup calls: "precompile", "load_hybrid_params"
     self.gate = threading.Event()  # generate() blocks until this is set
     self.gate.set()
     self.bucket_gate = threading.Event()  # text_bucket() blocks until this is set
@@ -65,6 +73,7 @@ class FakeRuntime:
     self.serving_plan_args = None
     self.precompiled = None
     self.thread_names = set()
+    self.trace_extra = {}  # merged into every generate() trace
 
   def serving_plan(self, presets_spec, text_tokens):
     self.serving_plan_args = (presets_spec, list(text_tokens))
@@ -77,8 +86,16 @@ class FakeRuntime:
 
   def precompile(self, plan):
     self.precompiled = list(plan)
+    self.events.append("precompile")
     self.thread_names.add(threading.current_thread().name)
     return [{"label": resolution.label, "text_tokens": bucket} for resolution, bucket in plan]
+
+  def load_hybrid_params(self):
+    self.events.append("load_hybrid_params")
+    self.thread_names.add(threading.current_thread().name)
+    if self.hybrid_load_error is not None:
+      raise self.hybrid_load_error
+    self.hybrid_max_steps = self.hybrid_load_steps
 
   def text_bucket(self, prompts):
     assert len(prompts) == 1
@@ -87,9 +104,16 @@ class FakeRuntime:
       raise RuntimeError("bucket gate was never released")
     return self.buckets.get(prompts[0], 128)
 
-  def generate(self, prompts, *, height, width, seed=None, output_type="pil"):
+  def generate(self, prompts, *, height, width, seed=None, output_type="pil", hybrid_steps=0):
     self.calls.append(
-        {"prompts": list(prompts), "height": height, "width": width, "seed": seed, "output_type": output_type}
+        {
+            "prompts": list(prompts),
+            "height": height,
+            "width": width,
+            "seed": seed,
+            "output_type": output_type,
+            "hybrid_steps": hybrid_steps,
+        }
     )
     self.thread_names.add(threading.current_thread().name)
     self.generate_started.set()
@@ -102,6 +126,7 @@ class FakeRuntime:
         "denoise_loop": 0.022,
         "vae_decode": 0.033,
         "seed": seed,
+        **self.trace_extra,
     }
     return [Image.new("RGB", (width, height), (200, 30, 30))], trace
 
@@ -132,10 +157,14 @@ def env(monkeypatch):
   return monkeypatch
 
 
-def _make_app(runtime=None, loader=None):
+def _make_app(runtime=None, loader=None, memory_stats=None):
   runtime = runtime or FakeRuntime()
   failures = []
-  app = serve_krea2.create_app(loader or (lambda: runtime), on_startup_failure=lambda app, exc: failures.append(exc))
+  app = serve_krea2.create_app(
+      loader or (lambda: runtime),
+      on_startup_failure=lambda app, exc: failures.append(exc),
+      memory_stats=memory_stats,
+  )
   return app, runtime, failures
 
 
@@ -273,11 +302,28 @@ def test_generate_returns_each_format(env, response_format, mime_type, pil_forma
   assert image.format == pil_format
   assert image.size == (1344, 768)
   timing = result["timing"]
-  assert set(timing) == {"queue_ms", "prompt_encoding_ms", "denoise_ms", "vae_decode_ms", "encode_ms", "total_ms"}
+  # No swap timings without weight moves (they are left out, not null).
+  assert set(timing) == {
+      "queue_ms",
+      "prompt_encoding_ms",
+      "denoise_ms",
+      "vae_decode_ms",
+      "encode_ms",
+      "total_ms",
+      "hybrid_steps",
+  }
   assert (timing["prompt_encoding_ms"], timing["denoise_ms"], timing["vae_decode_ms"]) == (11, 22, 33)
+  assert timing["hybrid_steps"] == 0
   assert timing["total_ms"] >= timing["encode_ms"]
   assert runtime.calls == [
-      {"prompts": ["a fox in the snow"], "height": 768, "width": 1344, "seed": 42, "output_type": "pil"}
+      {
+          "prompts": ["a fox in the snow"],
+          "height": 768,
+          "width": 1344,
+          "seed": 42,
+          "output_type": "pil",
+          "hybrid_steps": 0,
+      }
   ]
 
 
@@ -335,6 +381,9 @@ def test_request_validation(env):
           await _generate(client, seed=-1),
           await _generate(client, seed=2**31),
           await _generate(client, lora="s3400"),
+          await _generate(client, hybrid_steps=-1),
+          await _generate(client, hybrid_steps=8),
+          await _generate(client, hybrid_steps="two"),
       ]
 
   responses = asyncio.run(body())
@@ -711,7 +760,277 @@ def test_presets_endpoint_lists_the_warmed_set(env):
       "default_format": "avif",
       "max_queue": 3,
       "request_timeout_s": 45.0,
+      "hybrid": {"available": False, "max_steps": 0, "guidance": 1.5},
   }
+
+
+def _hybrid_runtime(max_steps=3):
+  runtime = FakeRuntime()
+  runtime.config.krea2_hybrid_weight_cache_dir = "/cache/wcache_hybrid"
+  runtime.hybrid_load_steps = max_steps
+  return runtime
+
+
+def test_hybrid_steps_are_passed_to_the_runtime(env):
+  runtime = _hybrid_runtime(3)
+  app, _, failures = _make_app(runtime)
+
+  async def body():
+    async with _client(app) as client:
+      presets = await client.get("/v1/presets", headers=AUTH)
+      results = [await _generate(client, hybrid_steps=k, response_format="png", seed=5) for k in (0, 2, 3)]
+      omitted = await _generate(client, response_format="png", seed=5)
+    return presets, results, omitted
+
+  presets, results, omitted = asyncio.run(body())
+  assert failures == []
+  assert presets.json()["hybrid"] == {"available": True, "max_steps": 3, "guidance": 1.5}
+  assert [r.status_code for r in results] == [200, 200, 200]
+  assert [r.json()["timing"]["hybrid_steps"] for r in results] == [0, 2, 3]
+  assert omitted.status_code == 200 and omitted.json()["timing"]["hybrid_steps"] == 0
+  assert [call["hybrid_steps"] for call in runtime.calls] == [0, 2, 3, 0]
+
+
+@pytest.mark.parametrize(
+    "max_steps, requested, message",
+    [
+        (0, 2, "hybrid sampling is not available on this server"),
+        (0, 1, "hybrid sampling is not available on this server"),
+        (3, 4, "exceeds this server's maximum of 3"),
+        (2, 3, "exceeds this server's maximum of 2"),
+    ],
+)
+def test_hybrid_steps_above_the_runtime_maximum_are_rejected(env, max_steps, requested, message):
+  env.setenv("KREA2_MAX_QUEUE", "1")
+  runtime = _hybrid_runtime(max_steps)
+  app, _, _ = _make_app(runtime)
+
+  async def body():
+    async with _client(app) as client:
+      rejected = await _generate(client, hybrid_steps=requested, response_format="png")
+      in_flight = app.state.server.in_flight
+      # With KREA2_MAX_QUEUE=1 a leaked slot would turn this into a 429.
+      ok = await _generate(client, hybrid_steps=max_steps, response_format="png")
+    return rejected, in_flight, ok
+
+  rejected, in_flight, ok = asyncio.run(body())
+  assert rejected.status_code == 422
+  assert message in rejected.json()["detail"]
+  assert in_flight == 0
+  assert ok.status_code == 200, ok.text
+  assert [call["hybrid_steps"] for call in runtime.calls] == [max_steps]
+  # Rejected before admission: only the startup check (hybrid negative prompt) and the accepted request tokenized.
+  assert runtime.bucket_calls == ["", "a fox in the snow"]
+
+
+def test_hybrid_params_load_after_the_warmup_and_before_ready(env):
+  runtime = _hybrid_runtime(3)
+  load_gate = threading.Event()
+  load_entered = threading.Event()
+  original_load = runtime.load_hybrid_params
+
+  def gated_load():
+    load_entered.set()
+    if not load_gate.wait(GATE_TIMEOUT_S):
+      raise RuntimeError("hybrid load gate never released")
+    original_load()
+
+  runtime.load_hybrid_params = gated_load
+  app, _, failures = _make_app(runtime)
+
+  async def body():
+    async with _client(app, wait_ready=False) as client:
+      try:
+        await _wait_until(load_entered.is_set)
+        during = await client.get("/readyz")
+        gen = await _generate(client, hybrid_steps=2)
+      finally:
+        load_gate.set()
+      await asyncio.wait_for(asyncio.shield(app.state.server.startup_task), GATE_TIMEOUT_S)
+      after = await client.get("/readyz")
+      presets = await client.get("/v1/presets", headers=AUTH)
+    return during, gen, after, presets
+
+  during, gen, after, presets = asyncio.run(body())
+  assert failures == []
+  assert runtime.events == ["precompile", "load_hybrid_params"]
+  assert during.status_code == 503 and gen.status_code == 503
+  assert after.status_code == 200
+  assert presets.json()["hybrid"]["available"] is True
+  assert all(name.startswith("krea2-generate") for name in runtime.thread_names)
+
+
+def test_a_failing_hybrid_load_fails_startup(env):
+  runtime = _hybrid_runtime(3)
+  runtime.hybrid_load_error = RuntimeError("no hybrid cache at /cache/wcache_hybrid/transformer-abc")
+  app, _, failures = _make_app(runtime)
+
+  async def body():
+    async with _client(app, wait_ready=False) as client:
+      await asyncio.wait_for(asyncio.shield(app.state.server.startup_task), GATE_TIMEOUT_S)
+      return await client.get("/readyz")
+
+  ready = asyncio.run(body())
+  assert ready.status_code == 503
+  assert ready.json() == {"detail": "Model startup failed"}
+  assert len(failures) == 1 and "transformer-abc" in str(failures[0])
+  assert runtime.events == ["precompile", "load_hybrid_params"]
+
+
+class _RuntimeWithoutHybrid(FakeRuntime):
+  """A runtime from before hybrid sampling: no load_hybrid_params, no hybrid_max_steps."""
+
+  @property
+  def load_hybrid_params(self):  # pylint: disable=invalid-overridden-method
+    raise AttributeError("load_hybrid_params")
+
+  def __init__(self):
+    super().__init__()
+    del self.hybrid_max_steps
+
+
+def test_a_runtime_without_hybrid_support_serves_with_hybrid_unavailable(env):
+  runtime = _RuntimeWithoutHybrid()
+  assert not hasattr(runtime, "load_hybrid_params") and not hasattr(runtime, "hybrid_max_steps")
+  app, _, failures = _make_app(runtime)
+
+  async def body():
+    async with _client(app) as client:
+      return (
+          await client.get("/v1/presets", headers=AUTH),
+          await _generate(client, response_format="png"),
+          await _generate(client, hybrid_steps=2, response_format="png"),
+      )
+
+  presets, ok, rejected = asyncio.run(body())
+  assert failures == []
+  assert runtime.events == ["precompile"]
+  assert presets.json()["hybrid"] == {"available": False, "max_steps": 0, "guidance": 1.5}
+  assert ok.status_code == 200
+  assert rejected.status_code == 422 and "not available" in rejected.json()["detail"]
+  assert len(runtime.calls) == 1
+
+
+def test_startup_requires_the_hybrid_negative_prompt_bucket_to_be_warmed(env):
+  runtime = _hybrid_runtime(3)
+  runtime.config.krea2_hybrid_negative_prompt = "long hybrid negative"
+  runtime.buckets = {"long hybrid negative": 384}
+  app, _, failures = _make_app(runtime)
+
+  async def body():
+    async with _client(app, wait_ready=False):
+      await asyncio.wait_for(asyncio.shield(app.state.server.startup_task), GATE_TIMEOUT_S)
+
+  asyncio.run(body())
+  assert len(failures) == 1 and isinstance(failures[0], RuntimeError)
+  message = str(failures[0])
+  assert "384-token" in message and "krea2_hybrid_negative_prompt" in message and "KREA2_SERVE_TEXT_TOKENS" in message
+  assert runtime.precompiled is None and runtime.events == []
+
+
+@pytest.mark.parametrize("hybrid_dir, expected_bucket_calls", [("/cache/wcache_hybrid", [""]), ("", [])])
+def test_startup_checks_the_hybrid_negative_prompt_only_when_hybrid_is_configured(
+    env, hybrid_dir, expected_bucket_calls
+):
+  runtime = _hybrid_runtime(3)
+  runtime.config.krea2_hybrid_weight_cache_dir = hybrid_dir
+  app, _, failures = _make_app(runtime)
+
+  async def body():
+    async with _client(app) as client:
+      return await client.get("/readyz")
+
+  ready = asyncio.run(body())
+  assert failures == []
+  assert ready.status_code == 200
+  assert runtime.bucket_calls == expected_bucket_calls
+
+
+def test_swap_timings_and_device_memory_are_reported(env, monkeypatch):
+  runtime = _hybrid_runtime(3)
+  runtime.trace_extra = {"text_encoder_swap_in": 0.14, "text_encoder_replace_s": 0.151, "hybrid_replace_s": 2.3}
+  readings = iter(
+      [
+          {"in_use": 29.5, "peak": 29.9, "limit": 31.25},  # after startup
+          {"in_use": 30.1234, "peak": 30.9, "limit": 31.25},  # after the request
+      ]
+  )
+  logged = []
+  monkeypatch.setattr(serve_krea2.max_logging, "log", logged.append)
+  app, _, failures = _make_app(runtime, memory_stats=lambda: next(readings))
+
+  async def body():
+    async with _client(app) as client:
+      return await _generate(client, hybrid_steps=2, response_format="png", seed=3)
+
+  response = asyncio.run(body())
+  assert failures == []
+  assert response.status_code == 200, response.text
+  timing = response.json()["timing"]
+  assert timing["hybrid_steps"] == 2
+  assert (timing["text_encoder_swap_ms"], timing["text_encoder_replace_ms"], timing["hybrid_replace_ms"]) == (
+      140,
+      151,
+      2300,
+  )
+  ready_lines = [line for line in logged if line.startswith("Krea 2 API is ready")]
+  assert len(ready_lines) == 1
+  assert "hybrid: max_steps=3 guidance=1.5" in ready_lines[0]
+  assert "hbm_in_use_gib=29.50 hbm_peak_gib=29.90" in ready_lines[0]
+  request_lines = [line for line in logged if line.startswith("[krea2-api] status=200")]
+  assert len(request_lines) == 1
+  line = request_lines[0]
+  for fragment in (
+      "hybrid_steps=2",
+      "text_encoder_swap_ms=140",
+      "text_encoder_replace_ms=151",
+      "hybrid_replace_ms=2300",
+      "hbm_in_use_gib=30.12",
+      "hbm_peak_gib=30.90",
+  ):
+    assert fragment in line, line
+
+
+def test_the_request_log_has_no_device_memory_without_a_probe(env, monkeypatch):
+  logged = []
+  monkeypatch.setattr(serve_krea2.max_logging, "log", logged.append)
+  app, _, _ = _make_app()
+
+  async def body():
+    async with _client(app) as client:
+      return await _generate(client, response_format="png")
+
+  assert asyncio.run(body()).status_code == 200
+  (line,) = [line for line in logged if line.startswith("[krea2-api] status=200")]
+  assert "hybrid_steps=0" in line and "hbm_in_use_gib=- hbm_peak_gib=-" in line
+  assert "swap_ms" not in line and "replace_ms" not in line
+
+
+def test_hbm_fields_never_raise():
+  hbm_fields = serve_krea2._hbm_fields  # pylint: disable=protected-access
+  unknown = {"hbm_in_use_gib": "-", "hbm_peak_gib": "-"}
+
+  def broken():
+    raise RuntimeError("no memory stats on this backend")
+
+  assert hbm_fields(None) == unknown
+  assert hbm_fields(lambda: None) == unknown
+  assert hbm_fields(lambda: {"in_use": None, "peak": None, "limit": None}) == unknown
+  assert hbm_fields(broken) == unknown
+  assert hbm_fields(lambda: {"in_use": 1, "peak": 2.345}) == {"hbm_in_use_gib": "1.00", "hbm_peak_gib": "2.35"}
+
+
+def test_default_memory_stats_uses_generate_krea2_device_memory_gib(monkeypatch):
+  import maxdiffusion  # pylint: disable=import-outside-toplevel
+
+  fake = types.ModuleType("maxdiffusion.generate_krea2")
+  fake.device_memory_gib = lambda: {"in_use": 1.5, "peak": 2.5, "limit": 31.25}
+  monkeypatch.setitem(sys.modules, "maxdiffusion.generate_krea2", fake)
+  monkeypatch.setattr(maxdiffusion, "generate_krea2", fake, raising=False)
+  default_memory_stats = serve_krea2._default_memory_stats  # pylint: disable=protected-access
+  assert default_memory_stats() == {"in_use": 1.5, "peak": 2.5, "limit": 31.25}
+  del fake.device_memory_gib  # a runtime module from before the helper
+  assert default_memory_stats() is None
 
 
 def test_runtime_exception_answers_500_and_frees_the_slot(env):

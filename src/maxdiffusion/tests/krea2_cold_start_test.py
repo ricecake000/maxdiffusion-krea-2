@@ -82,6 +82,57 @@ class Krea2ColdStartConfigTest(unittest.TestCase):
       self.assertIs(type(config["krea2_model_wait_s"]), int, name)
       self.assertEqual(config["krea2_model_wait_s"], 0, name)
 
+  def test_configs_define_the_hybrid_keys_off(self):
+    # Hybrid sampling and the per-request residency knobs: off, and typed so command-line overrides parse.
+    expected = {
+        "krea2_hybrid_weight_cache_dir": ("", str),
+        "krea2_hybrid_model_id": ("", str),
+        "krea2_hybrid_max_steps": (3, int),
+        "krea2_hybrid_guidance": (1.5, float),
+        "krea2_hybrid_negative_prompt": ("", str),
+        "krea2_text_encoder_offload_min_pixels": (0, int),
+        "krea2_hybrid_evict_min_pixels": (0, int),
+    }
+    for name in _CONFIGS:
+      with open(os.path.join(_CONFIG_DIR, name), encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+      for key, (value, value_type) in expected.items():
+        with self.subTest(config=name, key=key):
+          self.assertIs(type(config[key]), value_type)
+          self.assertEqual(config[key], value)
+      hybrid = generate_krea2.resolve_hybrid_config(types.SimpleNamespace(**config))
+      self.assertEqual((hybrid.cache_dir, hybrid.max_steps), ("", 0), name)
+
+  def test_preset_hybrid_overrides(self):
+    config = self._load_preset(
+        "krea2_hybrid_weight_cache_dir=/w/hybrid",
+        "krea2_hybrid_model_id=krea2-rawft3513-b0",
+        "krea2_hybrid_guidance=2.5",
+        "krea2_hybrid_max_steps=2",
+        "krea2_text_encoder_offload_min_pixels=2000000",
+        "krea2_hybrid_evict_min_pixels=4000000",
+    )
+    hybrid = generate_krea2.resolve_hybrid_config(config)
+    self.assertEqual(
+        hybrid,
+        generate_krea2.Krea2HybridConfig(
+            cache_dir="/w/hybrid",
+            model_id="krea2-rawft3513-b0",
+            max_steps=2,
+            guidance=2.5,
+            negative_prompt="",
+            text_encoder_offload_min_pixels=2000000,
+            evict_min_pixels=4000000,
+        ),
+    )
+    self.assertEqual(generate_krea2.resolve_hybrid_config(self._load_preset("krea2_hybrid_weight_cache_dir=''")).cache_dir, "")
+    with self.assertRaisesRegex(ValueError, "krea2_hybrid_model_id"):
+      generate_krea2.resolve_hybrid_config(self._load_preset("krea2_hybrid_weight_cache_dir=/w"))
+    with self.assertRaisesRegex(ValueError, "krea2_offload_components"):
+      generate_krea2.resolve_hybrid_config(
+          self._load_preset("krea2_hybrid_weight_cache_dir=/w", "krea2_hybrid_model_id=e"), ("transformer",)
+      )
+
   def test_preset_unset_and_valid_values(self):
     config = self._load_preset()
     self.assertEqual(config.aot_cache_gcs, "")
@@ -197,6 +248,43 @@ class Krea2ColdStartConfigTest(unittest.TestCase):
         generate_krea2.main(argv)
       build.assert_not_called()
       mesh.assert_not_called()
+
+  def test_bad_hybrid_keys_fail_before_model_load(self):
+    from maxdiffusion import pyconfig  # pylint: disable=import-outside-toplevel
+
+    prev = (pyconfig._config, pyconfig.config)  # pylint: disable=protected-access
+    self.addCleanup(lambda: setattr(pyconfig, "_config", prev[0]) or setattr(pyconfig, "config", prev[1]))
+    for overrides, pattern in (
+        (("krea2_hybrid_weight_cache_dir=/w",), "krea2_hybrid_model_id"),
+        (
+            ("krea2_hybrid_weight_cache_dir=/w", "krea2_hybrid_model_id=e", "krea2_offload_components=['transformer']"),
+            "krea2_offload_components",
+        ),
+        (("krea2_text_encoder_offload_min_pixels=-1",), "krea2_text_encoder_offload_min_pixels"),
+        (
+            ("krea2_hybrid_weight_cache_dir=/w", "krea2_hybrid_model_id=e", "do_classifier_free_guidance=True",
+             "guidance_scale=3.5"),
+            "classifier-free guidance",
+        ),
+        (("krea2_hybrid_weight_cache_dir=/w", "krea2_hybrid_model_id=e", "is_distilled=False"), "is_distilled"),
+    ):
+      with self.subTest(overrides=overrides), tempfile.TemporaryDirectory() as out:
+        argv = [
+            None,
+            os.path.join(_CONFIG_DIR, "base_krea2_turbo_v6e1.yml"),
+            f"output_dir={out}/",
+            "skip_jax_distributed_system=True",
+            *overrides,
+        ]
+        with (
+            mock.patch.object(generate_krea2, "build_krea2_transformer") as build,
+            mock.patch.object(generate_krea2, "create_device_mesh") as mesh,
+            mock.patch.object(generate_krea2, "register_exit_timing"),
+            self.assertRaisesRegex(ValueError, pattern),
+        ):
+          generate_krea2.main(argv)
+        build.assert_not_called()
+        mesh.assert_not_called()
 
 
 class Krea2StartupTimelineTest(unittest.TestCase):

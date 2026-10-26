@@ -70,6 +70,10 @@ from maxdiffusion.models.krea2.resolution_presets import (
 MODEL_NAME = "krea-2-turbo"
 MAX_SEED = 2**31 - 1
 MAX_PROMPT_CHARS = 4000
+# Request-side bound of hybrid_steps (one less than the 8 Turbo steps); the runtime's hybrid_max_steps is the real
+# per-server limit.
+MAX_HYBRID_STEPS = 7
+DEFAULT_HYBRID_GUIDANCE = 1.5
 RETRY_AFTER_S = 5
 # Literal status code: starlette renamed the 422 constant (HTTP_422_UNPROCESSABLE_CONTENT) and deprecated the old one.
 _HTTP_422 = 422
@@ -296,6 +300,7 @@ class GenerationRequest(BaseModel):
   image_size: Literal[KREA2_IMAGE_SIZES] = KREA2_DEFAULT_IMAGE_SIZE  # type: ignore[valid-type]
   seed: Optional[int] = Field(default=None, ge=0, le=MAX_SEED)
   response_format: Optional[ResponseFormat] = None
+  hybrid_steps: int = Field(default=0, ge=0, le=MAX_HYBRID_STEPS)
 
   @field_validator("prompt", mode="before")
   @classmethod
@@ -316,6 +321,11 @@ class TimingData(BaseModel):
   vae_decode_ms: int
   encode_ms: int
   total_ms: int
+  hybrid_steps: int = 0
+  # Present only when the runtime moved weights for this request (TE per-request offload, hybrid evict).
+  text_encoder_swap_ms: Optional[int] = None
+  text_encoder_replace_ms: Optional[int] = None
+  hybrid_replace_ms: Optional[int] = None
 
 
 class GenerationResponse(BaseModel):
@@ -340,12 +350,19 @@ class PresetInfo(BaseModel):
   text_tokens: List[int]
 
 
+class HybridInfo(BaseModel):
+  available: bool
+  max_steps: int
+  guidance: float
+
+
 class PresetsResponse(BaseModel):
   presets: List[PresetInfo]
   formats: List[str]
   default_format: str
   max_queue: int
   request_timeout_s: float
+  hybrid: HybridInfo
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -461,10 +478,78 @@ def _check_negative_prompt_bucket(runtime, plan) -> None:
     )
 
 
+def _hybrid_configured(config) -> bool:
+  return bool(str(getattr(config, "krea2_hybrid_weight_cache_dir", "") or "").strip())
+
+
+def _check_hybrid_negative_prompt_bucket(runtime, plan) -> None:
+  """A hybrid request also encodes krea2_hybrid_negative_prompt (CFG on its first steps); like the config's
+  negative prompt, its text bucket must be warmed for every preset or the request would compile."""
+  config = runtime.config
+  if not _hybrid_configured(config):
+    return
+  negative_prompts = _serving_negative_prompts(getattr(config, "krea2_hybrid_negative_prompt", ""))
+  neg_bucket = int(runtime.text_bucket(negative_prompts))
+  missing = [p.label for p in build_warmed_presets(plan).values() if neg_bucket not in p.buckets]
+  if missing:
+    warmed = sorted({int(bucket) for _, bucket in plan})
+    raise RuntimeError(
+        f"Hybrid sampling is configured and krea2_hybrid_negative_prompt needs the {neg_bucket}-token text bucket, "
+        f"which is not in KREA2_SERVE_TEXT_TOKENS for {', '.join(missing)} (warmed buckets: "
+        f"{', '.join(str(b) for b in warmed)}); an unwarmed bucket would compile at request time. Add "
+        f"{neg_bucket} to KREA2_SERVE_TEXT_TOKENS or shorten the hybrid negative prompt."
+    )
+
+
+def hybrid_max_steps(runtime) -> int:
+  """The largest hybrid_steps the runtime serves; 0 = hybrid unavailable (also for runtimes without the field)."""
+  if runtime is None:
+    return 0
+  return int(getattr(runtime, "hybrid_max_steps", 0) or 0)
+
+
+def hybrid_info(runtime) -> HybridInfo:
+  max_steps = hybrid_max_steps(runtime)
+  config = getattr(runtime, "config", None)
+  return HybridInfo(
+      available=max_steps > 0,
+      max_steps=max_steps,
+      guidance=float(getattr(config, "krea2_hybrid_guidance", DEFAULT_HYBRID_GUIDANCE)),
+  )
+
+
+def _default_memory_stats() -> Optional[Mapping[str, Any]]:
+  """generate_krea2.device_memory_gib() (lazy import: the runtime module is loaded by then)."""
+  from maxdiffusion import generate_krea2  # pylint: disable=import-outside-toplevel
+
+  probe = getattr(generate_krea2, "device_memory_gib", None)
+  return probe() if probe is not None else None
+
+
+def _hbm_fields(memory_stats: Optional[Callable[[], Any]]) -> Dict[str, str]:
+  """{"hbm_in_use_gib", "hbm_peak_gib"} for the log line; "-" when unknown. Never raises."""
+  stats = None
+  if memory_stats is not None:
+    try:
+      stats = memory_stats()
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+      max_logging.log(f"Krea 2 API: device memory stats failed: {type(exc).__name__}: {exc}")
+  fields = {}
+  for key in ("in_use", "peak"):
+    value = stats.get(key) if isinstance(stats, Mapping) else None
+    try:
+      fields[f"hbm_{key}_gib"] = f"{float(value):.2f}"
+    except (TypeError, ValueError):
+      fields[f"hbm_{key}_gib"] = "-"
+  return fields
+
+
 def prepare_runtime(loader: Callable[[], Any], settings: ServerSettings):
   """Loads the runtime and warms the serving set (blocking; runs on the generation thread).
 
-  Returns (runtime, warmed presets).
+  After the warm-up it loads the hybrid tree (runtime.load_hybrid_params, a no-op without
+  krea2_hybrid_weight_cache_dir; skipped for runtimes without the method), so warm-up runs with the plain
+  residency. Returns (runtime, warmed presets).
   """
   runtime = loader()
   _check_runtime_config(runtime.config)
@@ -472,12 +557,21 @@ def prepare_runtime(loader: Callable[[], Any], settings: ServerSettings):
   if not plan:
     raise RuntimeError(f"KREA2_SERVE_PRESETS={settings.presets_spec!r} selects no preset.")
   _check_negative_prompt_bucket(runtime, plan)
+  _check_hybrid_negative_prompt_bucket(runtime, plan)
   max_logging.log(f"Krea 2 API: warming {len(plan)} (resolution, text bucket) executables")
   runtime.precompile(plan)
+  if hasattr(runtime, "load_hybrid_params"):
+    runtime.load_hybrid_params()
   return runtime, build_warmed_presets(plan)
 
 
-async def _startup(app: FastAPI, server: ServerState, loader: Callable[[], Any], on_failure) -> None:
+async def _startup(
+    app: FastAPI,
+    server: ServerState,
+    loader: Callable[[], Any],
+    on_failure,
+    memory_stats: Optional[Callable[[], Any]] = None,
+) -> None:
   loop = asyncio.get_running_loop()
   started = time.perf_counter()
   max_logging.log("Krea 2 API: loading the long-lived runtime ...")
@@ -496,7 +590,13 @@ async def _startup(app: FastAPI, server: ServerState, loader: Callable[[], Any],
   server.ready = True
   server.startup_finished = True
   labels = ", ".join(f"{p.label}:{'/'.join(str(b) for b in sorted(p.buckets))}" for p in warmed.values())
-  max_logging.log(f"Krea 2 API is ready after {time.perf_counter() - started:.1f} s; warmed presets: {labels}")
+  hybrid = hybrid_info(runtime)
+  hybrid_label = f"max_steps={hybrid.max_steps} guidance={hybrid.guidance:g}" if hybrid.available else "off"
+  hbm = " ".join(f"{k}={v}" for k, v in _hbm_fields(memory_stats).items())
+  max_logging.log(
+      f"Krea 2 API is ready after {time.perf_counter() - started:.1f} s; warmed presets: {labels}; "
+      f"hybrid: {hybrid_label}; {hbm}"
+  )
 
 
 def _exit_on_startup_failure(app: FastAPI, exc: BaseException) -> None:
@@ -585,6 +685,14 @@ def _ms(seconds) -> int:
     return 0
 
 
+# TimingData field -> runtime trace key (seconds), reported only when the trace has it.
+_SWAP_TIMINGS = (
+    ("text_encoder_swap_ms", "text_encoder_swap_in"),
+    ("text_encoder_replace_ms", "text_encoder_replace_s"),
+    ("hybrid_replace_ms", "hybrid_replace_s"),
+)
+
+
 def _track_pool_future(
     server: ServerState,
     loop: asyncio.AbstractEventLoop,
@@ -610,23 +718,38 @@ def _track_pool_future(
   return future
 
 
-def _run_generation(server: ServerState, prompt: str, preset: WarmedPreset, seed: int):
-  """Generation-thread body: one runtime.generate call. Returns (start time, images, trace)."""
+def _run_generation(
+    server: ServerState,
+    prompt: str,
+    preset: WarmedPreset,
+    seed: int,
+    *,
+    hybrid_steps: int = 0,
+    memory_stats: Optional[Callable[[], Any]] = None,
+):
+  """Generation-thread body: one runtime.generate call, then the device memory reading (still on this thread, so
+  it belongs to this generation). Returns (start time, images, trace, hbm log fields)."""
   started = time.perf_counter()
   server.running = True
   try:
     images, trace = server.runtime.generate(
-        [prompt], height=preset.height, width=preset.width, seed=seed, output_type="pil"
+        [prompt],
+        height=preset.height,
+        width=preset.width,
+        seed=seed,
+        output_type="pil",
+        hybrid_steps=hybrid_steps,
     )
   finally:
     server.running = False
-  return started, images, trace
+  return started, images, trace, _hbm_fields(memory_stats)
 
 
 def create_app(
     runtime_loader: Optional[Callable[[], Any]] = None,
     *,
     on_startup_failure: Optional[Callable[[FastAPI, BaseException], None]] = None,
+    memory_stats: Optional[Callable[[], Any]] = None,
 ) -> FastAPI:
   """Builds the FastAPI app.
 
@@ -636,8 +759,12 @@ def create_app(
       load_serving_runtime.
     on_startup_failure: called as f(app, exc) when loading or warming the runtime fails; the default stops the
       server with exit code 1.
+    memory_stats: zero-argument callable returning {"in_use", "peak", ...} device memory in GiB for the log lines;
+      None uses generate_krea2.device_memory_gib with the default loader and logs "-" with a custom one.
   """
   failure_policy = on_startup_failure or _exit_on_startup_failure
+  if memory_stats is None and runtime_loader is None:
+    memory_stats = _default_memory_stats
 
   @asynccontextmanager
   async def lifespan(app: FastAPI):
@@ -657,7 +784,7 @@ def create_app(
     app.state.api_token = settings.api_token
     app.state.server = server
     # Load and warm in the background: /livez answers and /readyz says 503 while this runs.
-    server.startup_task = asyncio.create_task(_startup(app, server, loader, failure_policy))
+    server.startup_task = asyncio.create_task(_startup(app, server, loader, failure_policy, memory_stats))
     try:
       yield
     finally:
@@ -714,9 +841,16 @@ def create_app(
         default_format=settings.default_format,
         max_queue=settings.max_queue,
         request_timeout_s=settings.request_timeout_s,
+        hybrid=hybrid_info(server.runtime),
     )
 
-  @app.post("/v1/images/generations", response_model=GenerationResponse, dependencies=[Depends(require_api_token)])
+  # exclude_none: the optional swap timings appear only for requests that moved weights.
+  @app.post(
+      "/v1/images/generations",
+      response_model=GenerationResponse,
+      response_model_exclude_none=True,
+      dependencies=[Depends(require_api_token)],
+  )
   async def generate_image(payload: GenerationRequest, request: Request):
     arrived = time.perf_counter()
     log = {
@@ -724,6 +858,7 @@ def create_app(
         "preset": f"{payload.image_size}@{payload.aspect_ratio}",
         "format": payload.response_format or "-",
         "seed": payload.seed,
+        "hybrid_steps": payload.hybrid_steps,
     }
     status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
     try:
@@ -758,6 +893,20 @@ def create_app(
           detail=f"Preset {payload.image_size}@{payload.aspect_ratio} is not warmed on this server; "
           f"warmed presets: {', '.join(p.label for p in server.warmed.values())}.",
       )
+    # Read per request: the runtime owns the limit (0 until its hybrid tree is loaded).
+    max_hybrid_steps = hybrid_max_steps(server.runtime)
+    if payload.hybrid_steps > max_hybrid_steps:
+      if max_hybrid_steps == 0:
+        detail = (
+            f"hybrid_steps {payload.hybrid_steps} was requested, but hybrid sampling is not available on this "
+            "server (no hybrid model loaded); send 0 or omit the field."
+        )
+      else:
+        detail = (
+            f"hybrid_steps {payload.hybrid_steps} exceeds this server's maximum of {max_hybrid_steps} "
+            f"(allowed: 0..{max_hybrid_steps})."
+        )
+      raise HTTPException(status_code=_HTTP_422, detail=detail)
 
     # An omitted seed means a fresh one per request (the config's seed is never used by the API); it is echoed so
     # the image can be reproduced. Drawn before admission, so a failure here cannot leak a slot.
@@ -815,7 +964,15 @@ def create_app(
         raise HTTPException(status_code=_HTTP_422, detail=detail)
       if deadline - time.perf_counter() <= 0:
         raise HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail=timeout_detail)
-      future = server.gen_pool.submit(_run_generation, server, payload.prompt, preset, seed)
+      future = server.gen_pool.submit(
+          _run_generation,
+          server,
+          payload.prompt,
+          preset,
+          seed,
+          hybrid_steps=payload.hybrid_steps,
+          memory_stats=memory_stats,
+      )
     finally:
       if future is None:
         server.release_slot()
@@ -825,7 +982,7 @@ def create_app(
     try:
       # On timeout wait_for cancels the wrapper, which cancels a still-queued generation; a running one finishes in
       # the background and keeps its slot until then.
-      started, images, trace = await asyncio.wait_for(asyncio.wrap_future(future), remaining_s())
+      started, images, trace, hbm = await asyncio.wait_for(asyncio.wrap_future(future), remaining_s())
     except asyncio.TimeoutError as exc:
       raise HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail=timeout_detail) from exc
     except Exception as exc:  # pylint: disable=broad-exception-caught
@@ -845,6 +1002,12 @@ def create_app(
         "vae_decode_ms": _ms(trace.get("vae_decode", 0.0)),
     }
     log.update({k: v for k, v in timing.items() if k != "queue_ms"})
+    swaps = {}
+    for field, trace_key in _SWAP_TIMINGS:
+      if trace.get(trace_key) is not None:
+        swaps[field] = _ms(trace[trace_key])
+    log.update(swaps)
+    log.update(hbm)
 
     encode_started = time.perf_counter()
     try:
@@ -863,6 +1026,8 @@ def create_app(
       raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Image generation failed") from exc
     timing["encode_ms"] = _ms(time.perf_counter() - encode_started)
     timing["total_ms"] = _ms(time.perf_counter() - arrived)
+    timing["hybrid_steps"] = payload.hybrid_steps
+    timing.update(swaps)
     log["encode_ms"] = timing["encode_ms"]
 
     response_id = "img_" + uuid.uuid4().hex
