@@ -87,6 +87,19 @@ def krea2_rotary_tables(ids, axes_dim, theta, layout="interleaved"):
   return jnp.concatenate(cos_out, axis=-1), jnp.concatenate(sin_out, axis=-1)
 
 
+def _apply_rope_rotate_half_seq_major(x, cos, sin):
+  """`apply_rope_rotate_half` for `x` of shape `(B, L, H, D)` (the projections' own layout, no transpose)."""
+  half = x.shape[-1] // 2
+  x_f32 = x.astype(jnp.float32)
+  x1 = x_f32[..., :half]
+  x2 = x_f32[..., half:]
+  # (L, D/2) -> (L, 1, D/2); a batched (B, L, D/2) table -> (B, L, 1, D/2)
+  cos = jnp.expand_dims(cos.astype(jnp.float32), -2)
+  sin = jnp.expand_dims(sin.astype(jnp.float32), -2)
+  out = jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1)
+  return out.astype(x.dtype)
+
+
 def apply_rope_rotate_half(x, cos, sin):
   """Rotate-half RoPE on `x` of shape `(B, H, L, D)` with `(L, D/2)` cos/sin tables.
 
@@ -291,7 +304,7 @@ class Krea2Attention(nn.Module):
     self.norm_q = Krea2RMSNorm(self.head_dim, eps=self.eps)
     self.norm_k = Krea2RMSNorm(self.head_dim, eps=self.eps)
 
-    if self.attention_kernel != "dot_product":
+    if self.attention_kernel not in ("dot_product", "cudnn"):
       self.attention_op = AttentionOp(
           mesh=self.mesh,
           attention_kernel=self.attention_kernel,
@@ -316,6 +329,37 @@ class Krea2Attention(nn.Module):
     probs = jax.nn.softmax(scores, axis=-1)
     out = jnp.einsum("bhqk,bhkd->bhqd", probs, value.astype(jnp.float32))
     return out.astype(self.dtype)
+
+  def _cudnn_attention(self, query, key, value, mask, image_rotary_emb, gate, lora_params):
+    """attention 'cudnn' (GPU): `jax.nn.dot_product_attention` on the (B, L, H, D) / (B, L, Hkv, D) projections.
+
+    q/k RMSNorm and RoPE run in jnp in the projections' layout; GQA without a K/V repeat; the key mask must be a
+    prefix mask ([image | compacted text], tail-padded: the pipeline always compacts for this kernel) and becomes
+    `key_value_seq_lengths`. On a GPU the implementation is cuDNN flash attention, explicitly (jax's default is XLA,
+    which materializes the scores); elsewhere XLA (only for CPU checks).
+    """
+    batch_size, seq_len = query.shape[:2]
+    query = self.norm_q(query)
+    key = self.norm_k(key)
+    if self.use_rope and image_rotary_emb is not None:
+      if self.rope_layout == "rotate_half":
+        cos, sin = image_rotary_emb
+        query = _apply_rope_rotate_half_seq_major(query, cos, sin)
+        key = _apply_rope_rotate_half_seq_major(key, cos, sin)
+      else:
+        query, key = apply_rope(jnp.transpose(query, (0, 2, 1, 3)), jnp.transpose(key, (0, 2, 1, 3)), image_rotary_emb)
+        query, key = jnp.transpose(query, (0, 2, 1, 3)), jnp.transpose(key, (0, 2, 1, 3))
+    lengths = None if mask is None else jnp.sum(mask != 0, axis=-1, dtype=jnp.int32)
+    attn_output = jax.nn.dot_product_attention(
+        query.astype(self.dtype),
+        key.astype(self.dtype),
+        value.astype(self.dtype),
+        scale=1.0 / math.sqrt(self.head_dim),
+        key_value_seq_lengths=lengths,
+        implementation="cudnn" if jax.default_backend() == "gpu" else "xla",
+    )
+    attn_output = attn_output.reshape(batch_size, seq_len, self.num_heads * self.head_dim)
+    return self._gated_output_projection(attn_output, gate, lora_params)
 
   def _gated_output_projection(self, attn_output, gate, lora_params):
     """`to_out(attn_output * sigmoid(gate))` plus its explicit LoRA updates."""
@@ -352,6 +396,9 @@ class Krea2Attention(nn.Module):
     mask = None
     if attention_mask is not None:
       mask = attention_mask.astype(jnp.int32)
+
+    if self.attention_kernel == "cudnn":
+      return self._cudnn_attention(query, key, value, mask, image_rotary_emb, gate, lora_params)
 
     use_rope = self.use_rope and image_rotary_emb is not None
     use_custom_kernel = self.attention_kernel == "flash_custom"

@@ -643,13 +643,13 @@ class FlaxKrea2Pipeline:
     self.vae_logical_axis_rules = (
         vae_logical_axis_rules if vae_logical_axis_rules is not None else config.logical_axis_rules
     )
-    # flash_custom reduces the key mask to a per-row valid count, so it needs a
-    # prefix mask; the Krea 2 template pads mid-sequence, so always compact.
+    # flash_custom and cudnn reduce the key mask to a per-row valid count, so they
+    # need a prefix mask; the Krea 2 template pads mid-sequence, so always compact.
     self.text_compaction_multiple = int(getattr(config, "krea2_text_compaction_multiple", 0) or 0)
-    if transformer.attention_kernel == "flash_custom" and self.text_compaction_multiple <= 0:
+    if transformer.attention_kernel in ("flash_custom", "cudnn") and self.text_compaction_multiple <= 0:
       self.text_compaction_multiple = int(config.max_sequence_length)
       max_logging.log(
-          "attention=flash_custom needs a prefix text mask: compacting prompt tokens with "
+          f"attention={transformer.attention_kernel} needs a prefix text mask: compacting prompt tokens with "
           f"multiple=max_sequence_length={self.text_compaction_multiple} (valid tokens first, no length change)."
       )
     self._staged_block_lora_specs = (

@@ -594,6 +594,16 @@ def seq_len_tuning_aot_meta(tuning) -> dict:
   return {"krea2_seq_len_tuning": seq_len_tuning_json(tuning)}
 
 
+def gpu_attention_aot_meta(attention, device_kind) -> dict:
+  """AOT cache meta entry for attention 'cudnn': the GPU model (executables are per device kind); empty otherwise.
+
+  TPU setups keep their fingerprint; flash_custom records its chip through flash_custom_block_selection_aot_meta.
+  """
+  if attention != "cudnn":
+    return {}
+  return {"krea2_gpu_device_kind": str(device_kind)}
+
+
 def krea2_mesh_device_kind(mesh):
   """`device_kind` the flash_custom wrapper sees for `mesh` (None when unknown); same helper as the wrapper."""
   from maxdiffusion.models.attention_flax import _mesh_device_kind  # pylint: disable=import-outside-toplevel
@@ -1778,10 +1788,10 @@ def create_runtime(argv) -> Optional["Krea2Runtime"]:
     max_logging.log(
         f"flash_custom kernel choice: {attention_kernel_choice} ('auto' = hybrid on TPU v6e, flash elsewhere)"
     )
-  # Mirrors FlaxKrea2Pipeline: flash_custom always compacts, with the full text
-  # length as the bucket when krea2_text_compaction_multiple is off.
+  # Mirrors FlaxKrea2Pipeline: flash_custom and cudnn always compact, with the full
+  # text length as the bucket when krea2_text_compaction_multiple is off.
   text_compaction_multiple = int(getattr(config, "krea2_text_compaction_multiple", 0) or 0)
-  if config.attention == "flash_custom" and text_compaction_multiple <= 0:
+  if config.attention in ("flash_custom", "cudnn") and text_compaction_multiple <= 0:
     text_compaction_multiple = int(config.max_sequence_length)
   # Before the precompile plan: its aot_cache_dir error would hide that the two modes exclude each other.
   build_only = resolve_weight_cache_build_only(config)
@@ -2359,6 +2369,8 @@ def create_runtime(argv) -> Optional["Krea2Runtime"]:
           **flash_custom_block_selection_aot_meta(
               config.attention, attention_kernel_choice, krea2_mesh_device_kind(transformer.mesh)
           ),
+          # Conditional key: only attention 'cudnn' (GPU) records the device kind.
+          **gpu_attention_aot_meta(config.attention, krea2_mesh_device_kind(transformer.mesh)),
           # Conditional key: only a non-default scoped-VMEM limit of the DiT programs misses older caches.
           **transformer_scoped_vmem_aot_meta(transformer_scoped_vmem_limit_kib),
           # Conditional key: only a non-empty krea2_seq_len_tuning misses older caches.
