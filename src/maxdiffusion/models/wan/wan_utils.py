@@ -651,13 +651,37 @@ def _read_safetensors_as_jax(ckpt_path: str, framework: str) -> dict:
   return tensors
 
 
+def _read_safetensors_as_numpy(ckpt_path: str):
+  """Every tensor of `ckpt_path` as a numpy array, or None unless all of them are float32.
+
+  Only float32 is known to convert like the jax path: jax would canonicalize a
+  64-bit tensor first (x64 off), and numpy cannot read bf16 / float8 at all.
+  """
+  with safe_open(ckpt_path, framework="np") as f:
+    keys = list(f.keys())
+    if any(f.get_slice(k).get_dtype() != "F32" for k in keys):
+      return None
+    return {k: f.get_tensor(k) for k in keys}
+
+
 def load_wan_vae(
-    pretrained_model_name_or_path: str, eval_shapes: dict, device: str, hf_download: bool = True, framework: str = "pt"
+    pretrained_model_name_or_path: str,
+    eval_shapes: dict,
+    device: str,
+    hf_download: bool = True,
+    framework: str = "pt",
+    as_numpy: bool = False,
 ):
   """Loads the Wan VAE safetensors into `eval_shapes`' structure.
 
   `framework` "np" reads the file without torch (see `_read_safetensors_as_jax`);
   the default "pt" keeps the torch read.
+
+  `as_numpy` converts with numpy only and returns numpy leaves: the same values,
+  shapes and dtypes as the default path, without the small XLA program jax
+  compiles for every distinct transpose and without `jax.clear_caches()` (which
+  would drop what other threads of a loading process have compiled). A file
+  with any tensor that is not float32 takes the default path (jax leaves).
   """
   device = jax.devices(device)[0]
   subfolder = "vae"
@@ -671,7 +695,10 @@ def load_wan_vae(
   max_logging.log(f"Load and port {pretrained_model_name_or_path} VAE on {device}")
   with jax.default_device(device):
     if ckpt_path is not None:
-      tensors = _read_safetensors_as_jax(ckpt_path, framework)
+      tensors = _read_safetensors_as_numpy(ckpt_path) if as_numpy else None
+      as_numpy = tensors is not None
+      if not as_numpy:
+        tensors = _read_safetensors_as_jax(ckpt_path, framework)
       flax_state_dict = {}
       cpu = jax.local_devices(backend="cpu")[0]
       for pt_key, tensor in tensors.items():
@@ -705,11 +732,15 @@ def load_wan_vae(
         pt_tuple_key = tuple(renamed_pt_key.split("."))
         flax_key, flax_tensor = rename_key_and_reshape_tensor(pt_tuple_key, tensor, eval_shapes)
         flax_key = _tuple_str_to_int(flax_key)
-        flax_state_dict[flax_key] = jax.device_put(jnp.asarray(flax_tensor), device=cpu)
+        if as_numpy:
+          flax_state_dict[flax_key] = np.ascontiguousarray(flax_tensor)
+        else:
+          flax_state_dict[flax_key] = jax.device_put(jnp.asarray(flax_tensor), device=cpu)
       validate_flax_state_dict(eval_shapes, flax_state_dict)
       flax_state_dict = unflatten_dict(flax_state_dict)
       del tensors
-      jax.clear_caches()
+      if not as_numpy:
+        jax.clear_caches()
     else:
       raise FileNotFoundError(f"Path {ckpt_path} was not found")
 

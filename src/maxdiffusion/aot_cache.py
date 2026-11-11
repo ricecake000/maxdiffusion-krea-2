@@ -88,6 +88,7 @@ import pickle
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 
 import jax
@@ -268,6 +269,10 @@ def _outer_trace_active() -> bool:
 _NESTED_OPTIONS_ERROR = "can only be passed to top-level"
 
 
+class AotCacheMiss(RuntimeError):
+  """A wrapped call that would have compiled a signature of the strict set (see ``set_strict``)."""
+
+
 def _dynamic_signature(args: tuple, kwargs: dict) -> str:
   """Deterministic digest of everything that selects an executable.
 
@@ -359,6 +364,9 @@ class _AotEntry:
     self._lock = threading.Lock()
     # Serializes lazy loads of this fn; never taken on the fast path.
     self._lazy_lock = threading.Lock()
+    # With install(parallel_lazy_load=True): one lock per signature instead, so
+    # distinct signatures of this fn deserialize at once. Never cleared.
+    self._signature_locks: dict[str, threading.Lock] = {}
 
   def _zeros_output(self, signature: str):
     """Builds all-zero outputs matching a compiled signature's out specs.
@@ -594,6 +602,11 @@ class _AotEntry:
           max_logging.log(f"[aot] {self.name}: compiled call failed ({e}); donated inputs, not retrying via jit")
           raise
         max_logging.log(f"[aot] {self.name}: compiled call failed ({e}); using jit")
+    if (self.name, signature) in _STATE.strict:
+      raise AotCacheMiss(
+          f"{self.name}: the executable of signature {signature} is in the strict set but cannot be used from "
+          f"{_STATE.cache_dir}; not compiling it in this call"
+      )
     with self._lock:
       if signature not in self._pending and signature not in self._compiled:
         self._pending[signature] = (arg_lists, treedefs, static)
@@ -657,6 +670,11 @@ class _AotEntry:
     calls of a signature wait for the one load instead of falling back to
     jit (or compiling in warmup mode). It is always taken before ``_lock``;
     install() takes only ``_lock``, so the two cannot deadlock.
+
+    With ``install(parallel_lazy_load=True)`` the lock held is the
+    signature's own (created under ``_lock``, which is released before the
+    signature lock is taken): first calls of one signature still wait for its
+    one load, while other signatures of this fn load at the same time.
     """
     # Generation first: if install() runs between these reads, the stale
     # generation makes the load drop its result instead of registering an
@@ -665,7 +683,11 @@ class _AotEntry:
     mesh = _STATE.mesh
     gcs_prefix = _STATE.gcs_prefix
     path = self._path_for(signature)
-    with self._lazy_lock:
+    lock = self._lazy_lock
+    if _STATE.parallel_lazy_load:
+      with self._lock:
+        lock = self._signature_locks.setdefault(signature, threading.Lock())
+    with lock:
       with self._lock:
         if generation != _STATE.generation or signature in self._compiled or signature in self._lazy_tried:
           return
@@ -683,6 +705,7 @@ class _AotEntry:
     install is still the current one.
     """
     try:
+      started = time.perf_counter()
       with open(path, "rb") as f:
         blob = pickle.load(f)
       if blob["format_version"] != _FORMAT_VERSION:
@@ -725,7 +748,10 @@ class _AotEntry:
       if stale:
         max_logging.log(f"[aot] {self.name}: dropped {os.path.basename(path)}; it belongs to a previous install")
         return False
-      max_logging.log(f"[aot] {self.name}: loaded {os.path.basename(path)} ({len(blob['payload']) / 1e6:.1f}MB)")
+      max_logging.log(
+          f"[aot] {self.name}: loaded {os.path.basename(path)} ({len(blob['payload']) / 1e6:.1f}MB) "
+          f"in {time.perf_counter() - started:.2f} s"
+      )
       return True
     except Exception as e:  # noqa: BLE001 - fall back to jit for this shape
       max_logging.log(f"[aot] {self.name}: load failed for {os.path.basename(path)} ({e}); will re-jit")
@@ -799,6 +825,10 @@ class _State:
     self.gcs_prefix = ""
     # Bumped by every install(); loads started under an older one drop their results.
     self.generation = 0
+    # Lazy loads lock per signature instead of per wrapped fn (install(parallel_lazy_load=True)).
+    self.parallel_lazy_load = False
+    # set_strict(pairs): a call of one of these (name, signature) that would compile raises AotCacheMiss instead.
+    self.strict = frozenset()
 
 
 _STATE = _State()
@@ -862,7 +892,14 @@ def cached_jit(
   return entry
 
 
-def install(cache_dir: str, meta: dict[str, Any], mesh: Any, lazy_load: bool = False, gcs_prefix: str = "") -> None:
+def install(
+    cache_dir: str,
+    meta: dict[str, Any],
+    mesh: Any,
+    lazy_load: bool = False,
+    gcs_prefix: str = "",
+    parallel_lazy_load: bool = False,
+) -> None:
   """Enables the AOT cache and starts background deserialization.
 
   With ``lazy_load`` nothing is deserialized here; each signature's file
@@ -889,6 +926,12 @@ def install(cache_dir: str, meta: dict[str, Any], mesh: Any, lazy_load: bool = F
     lazy_load: Load executables on first use instead of all at install.
     gcs_prefix: Where lazy loads fetch missing files from ('' = nowhere).
       Validated with ``normalize_gcs_prefix`` (ValueError when invalid).
+    parallel_lazy_load: Lazy loads of one wrapped fn lock per signature
+      instead of per fn, so threads that first call different signatures
+      (parallel precompile, ``load_signatures``) deserialize at once. The
+      executables and their file names are the same.
+
+  Every install empties the strict set (``set_strict``).
   """
   if not cache_dir:
     return
@@ -902,6 +945,8 @@ def install(cache_dir: str, meta: dict[str, Any], mesh: Any, lazy_load: bool = F
   _STATE.mesh = mesh
   _STATE.lazy_load = bool(lazy_load)
   _STATE.gcs_prefix = gcs_prefix
+  _STATE.parallel_lazy_load = bool(parallel_lazy_load)
+  _STATE.strict = frozenset()
   _STATE.enabled = True
   # Bumped after the fields above and before the entries are cleared: a load
   # that sees the new generation also sees the new dir/mesh, and a load that
@@ -926,6 +971,80 @@ def install(cache_dir: str, meta: dict[str, Any], mesh: Any, lazy_load: bool = F
 def is_enabled() -> bool:
   """Whether ``install()`` enabled the cache (so ``warmup_mode()`` compiles without executing)."""
   return _STATE.enabled
+
+
+def install_state() -> tuple[str, str, bool]:
+  """``(cache_dir, fingerprint, lazy_load)`` of the current install; ``("", "", False)`` while the cache is off."""
+  if not _STATE.enabled:
+    return "", "", False
+  return _STATE.cache_dir, _STATE.fingerprint, _STATE.lazy_load
+
+
+def signature_path(name: str, signature: str) -> str:
+  """The file of wrapped fn ``name``'s executable for ``signature`` under the current install."""
+  return os.path.join(_STATE.cache_dir, f"{name}-{_STATE.fingerprint}-{signature}.aotx")
+
+
+def on_disk_signatures() -> tuple[list[tuple[str, str]], int]:
+  """What this process holds of the current install: ``(pairs, unsaved)``.
+
+  ``pairs`` are the sorted ``(wrapped fn name, signature)`` of every executable
+  loaded from or saved to the cache dir; ``unsaved`` counts the signatures that
+  were compiled here and have no file (a failed save, or ``save_pending`` not
+  yet called), which a later process could only get by compiling again.
+  """
+  pairs, unsaved = set(), 0
+  for entry in _REGISTRY:
+    with entry._lock:
+      pairs.update((entry.name, signature) for signature in entry._on_disk)
+      unsaved += len(set(entry._compiled) - entry._on_disk)
+  return sorted(pairs), unsaved
+
+
+def load_signatures(pairs, workers: int = 1) -> tuple[int, list[tuple[str, str]]]:
+  """Loads executables by ``(wrapped fn name, signature)`` from the cache dir, without calling the fns.
+
+  Each pair goes through the wrapped fn's lazy-load path (meant for a lazy
+  install; after an eager one has finished loading it finds the executable), so a call of that signature on
+  another thread waits for this load instead of starting its own, and a pair
+  already loaded costs nothing. Nothing is compiled and warmup mode is not
+  touched, so other threads may execute meanwhile. ``workers`` > 1 loads on
+  that many threads (useful with ``install(parallel_lazy_load=True)``).
+  Returns ``(loaded, failed)``: how many pairs have an executable now, and the
+  pairs that have none (no wrapped fn of that name, a missing or unreadable
+  file). Never raises for a bad file.
+  """
+  pairs = list(dict.fromkeys((str(name), str(signature)) for name, signature in pairs))
+
+  def load(pair) -> bool:
+    name, signature = pair
+    entries = [entry for entry in _REGISTRY if entry.name == name]
+    for entry in entries:
+      entry._lazy_load(signature)
+    return bool(entries) and all(signature in entry._compiled for entry in entries)
+
+  if workers > 1 and len(pairs) > 1:
+    with ThreadPoolExecutor(max_workers=min(workers, len(pairs)), thread_name_prefix="aot-load-signature") as pool:
+      results = list(pool.map(load, pairs))
+  else:
+    results = [load(pair) for pair in pairs]
+  failed = [pair for pair, ok in zip(pairs, results) if not ok]
+  return len(pairs) - len(failed), failed
+
+
+def set_strict(pairs) -> None:
+  """The strict set: a call of one of these ``(wrapped fn name, signature)`` raises ``AotCacheMiss`` instead of
+  compiling.
+
+  For a server that reported ready before every executable was loaded: an
+  executable it counted on (``pairs``) that turns out unusable (a file that is
+  gone or fails to deserialize, a loaded executable that rejects the call) must
+  not compile for minutes inside a request. Signatures outside the set compile
+  as always, and so do warmup mode and calls under an outer trace.
+  Process-global; ``set_strict(())`` and every ``install()`` empty it, and it
+  does nothing while the cache is off.
+  """
+  _STATE.strict = frozenset((str(name), str(signature)) for name, signature in pairs)
 
 
 def wait_for_loads() -> None:

@@ -91,7 +91,7 @@ from flax import nnx
 from flax.linen import partitioning as nn_partitioning
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from maxdiffusion import aot_cache, max_logging, max_utils, pyconfig
+from maxdiffusion import aot_cache, krea2_startup, max_logging, max_utils, pyconfig
 from maxdiffusion.max_utils import create_device_mesh
 from maxdiffusion.models.krea2.resolution_presets import (
     KREA2_DEFAULT_ASPECT_RATIO,
@@ -340,8 +340,12 @@ def resolve_prompts(prompt_str: str, batch_size: int, prompt_file: str = "") -> 
   return prompts
 
 
-def load_qwen_image_vae(snapshot_dir, config, vae_mesh, rngs):
-  """Loads the Qwen-Image VAE (Wan 2.1 architecture) from the Krea 2 snapshot."""
+def load_qwen_image_vae(snapshot_dir, config, vae_mesh, rngs, numpy_weights=False):
+  """Loads the Qwen-Image VAE (Wan 2.1 architecture) from the Krea 2 snapshot.
+
+  `numpy_weights` (KREA2_STARTUP_OPTS np_vae) converts and casts the weights with
+  numpy instead of jax ops on the CPU device: the same arrays reach the device.
+  """
   from maxdiffusion.models.wan.autoencoder_kl_wan import AutoencoderKLWan, AutoencoderKLWanCache
   from maxdiffusion.models.wan.wan_utils import load_wan_vae
   from functools import partial
@@ -365,10 +369,14 @@ def load_qwen_image_vae(snapshot_dir, config, vae_mesh, rngs):
 
   # Every tensor of the Krea 2 VAE is float32 (checked in the Krea-2-Turbo safetensors header), so numpy reads it
   # with the same values as the torch path, and the generate process never imports torch.
-  params = load_wan_vae(snapshot_dir, params, "cpu", framework="np")
+  # The keyword is passed only when set: the default call is the one of before the option existed.
+  params = load_wan_vae(snapshot_dir, params, "cpu", framework="np", **({"as_numpy": True} if numpy_weights else {}))
   target_dtype = np.dtype(config.weights_dtype)
   params = jax.tree_util.tree_map(
-      lambda x: x if np.dtype(x.dtype) == target_dtype else x.astype(config.weights_dtype),
+      # A numpy leaf (numpy_weights) is cast by numpy, a jax leaf by jax as before.
+      lambda x: x
+      if np.dtype(x.dtype) == target_dtype
+      else x.astype(target_dtype if isinstance(x, np.ndarray) else config.weights_dtype),
       params,
   )
   # The VAE is small; replicate it across the VAE mesh.
@@ -1340,6 +1348,7 @@ class Krea2Runtime:
       path, cache or not): `hybrid_transformer_cache_meta` derives E's from it.
     transformer_abstract_params: the runtime transformer's abstract param tree (E is checked against it).
     transformer_shardings: the transformer's param shardings (E is placed with them).
+    startup_opts: the resolved KREA2_STARTUP_OPTS (krea2_startup.py); the server reads defer_warmup from it.
   """
 
   config: Any
@@ -1365,6 +1374,7 @@ class Krea2Runtime:
   transformer_cache_meta: Optional[dict] = None
   transformer_abstract_params: Any = dataclasses.field(default=None, repr=False)
   transformer_shardings: Any = dataclasses.field(default=None, repr=False)
+  startup_opts: frozenset = frozenset()
   _bucket_tokenizer: Any = dataclasses.field(default=None, init=False, repr=False, compare=False)
   _bucket_lock: Any = dataclasses.field(default_factory=threading.Lock, init=False, repr=False, compare=False)
 
@@ -1691,6 +1701,8 @@ def create_runtime(argv) -> Optional["Krea2Runtime"]:
   mode, which ends before any device placement.
   """
   process_t0, process_t0_origin = resolve_process_t0(os.environ.get("KREA2_PROCESS_T0"), _PROCESS_T0)
+  # Opt-in cold-start shortcuts (krea2_startup.py); a bad name fails before anything loads.
+  startup_opts = krea2_startup.resolve_startup_opts(os.environ.get("KREA2_STARTUP_OPTS"))
   timeline = StartupTimeline(process_t0)
   timeline.mark("imports")
   register_exit_timing(process_t0)
@@ -1719,6 +1731,8 @@ def create_runtime(argv) -> Optional["Krea2Runtime"]:
   default_args.extend(custom_overrides)
   pyconfig.initialize(default_args)
   timeline.mark("config")
+  if startup_opts:
+    max_logging.log(krea2_startup.describe_startup_opts(startup_opts))
 
   # Import modules after jax.distributed.initialize() has run via pyconfig.initialize()
   from maxdiffusion.models.krea2.util import (
@@ -1977,30 +1991,70 @@ def create_runtime(argv) -> Optional["Krea2Runtime"]:
       return model.init(qwen_key, None, qwen_mask_dummy, inputs_embeds=qwen_embeds_dummy)
     return model.init(qwen_key, qwen_ids_dummy, qwen_mask_dummy)
 
-  with ExitStack() as stack:
-    for interceptor in lora_interceptors:
-      stack.enter_context(nn.intercept_methods(interceptor))
-    with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
-      abstract_transformer_vars = jax.eval_shape(lambda: transformer_init_fn(transformer))
-      # The loader fills the float structure; int8 block kernels are derived from it.
-      abstract_transformer_load_vars = (
-          jax.eval_shape(lambda: transformer_init_fn(transformer_load_model))
-          if transformer_load_model is not transformer
-          else abstract_transformer_vars
-      )
-      abstract_qwen3_vars = jax.eval_shape(lambda: qwen3_init_fn(qwen3_runtime_model))
-      # The loader fills the unquantized structure; int8 params are derived from it.
-      abstract_qwen3_load_vars = (
-          jax.eval_shape(lambda: qwen3_init_fn(qwen3_model))
-          if qwen3_runtime_model is not qwen3_model
-          else abstract_qwen3_vars
+  def abstract_vars(init_fn, model):
+    """`jax.eval_shape` of a model's init under the LoRA interceptors, the mesh and the axis rules.
+
+    All three are thread-local, so a call from a loader thread enters them again.
+    """
+    with ExitStack() as stack:
+      for interceptor in lora_interceptors:
+        stack.enter_context(nn.intercept_methods(interceptor))
+      with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
+        return jax.eval_shape(lambda: init_fn(model))
+
+  # KREA2_STARTUP_OPTS shape_cache: the two runtime trees come from a file keyed by everything they can depend
+  # on. Not with LoRA (its interceptors add subtrees the key does not cover) and not without an AOT cache dir.
+  shape_cache_file = ""
+  runtime_shapes = None
+  if "shape_cache" in startup_opts and getattr(config, "aot_cache_dir", "") and not lora_compile_spec:
+    shape_cache_file = krea2_startup.shape_cache_path(
+        config.aot_cache_dir,
+        krea2_startup.shape_cache_key(
+            dict(config.get_keys()), {"transformer": transformer_cfg, "text_encoder": te_config}
+        ),
+    )
+    runtime_shapes = krea2_startup.load_shape_cache(shape_cache_file, ("transformer", "text_encoder"))
+  if runtime_shapes is not None:
+    abstract_transformer_vars, abstract_qwen3_vars = runtime_shapes
+  else:
+    abstract_transformer_vars = abstract_vars(transformer_init_fn, transformer)
+    abstract_qwen3_vars = abstract_vars(qwen3_init_fn, qwen3_runtime_model)
+    if shape_cache_file:
+      krea2_startup.save_shape_cache(
+          shape_cache_file, ("transformer", "text_encoder"), (abstract_transformer_vars, abstract_qwen3_vars)
       )
 
-      logical_transformer_specs = nn.get_partition_spec(abstract_transformer_vars)
-      logical_qwen3_specs = nn.get_partition_spec(abstract_qwen3_vars)
+  # The loaders fill the float / unquantized structures (the int8 trees are derived from them). Only a component
+  # built from its checkpoint needs its load structure: with KREA2_STARTUP_OPTS lazy_load_shapes it is evaluated
+  # inside that build, otherwise here as always.
+  load_shapes = {}
 
-      transformer_mesh_shardings = nn.logical_to_mesh_sharding(logical_transformer_specs, mesh, config.logical_axis_rules)
-      qwen3_mesh_shardings = nn.logical_to_mesh_sharding(logical_qwen3_specs, mesh, config.logical_axis_rules)
+  def transformer_load_vars():
+    if "transformer" not in load_shapes:
+      load_shapes["transformer"] = (
+          abstract_transformer_vars
+          if transformer_load_model is transformer
+          else abstract_vars(transformer_init_fn, transformer_load_model)
+      )
+    return load_shapes["transformer"]
+
+  def qwen3_load_vars():
+    if "text_encoder" not in load_shapes:
+      load_shapes["text_encoder"] = (
+          abstract_qwen3_vars if qwen3_runtime_model is qwen3_model else abstract_vars(qwen3_init_fn, qwen3_model)
+      )
+    return load_shapes["text_encoder"]
+
+  if "lazy_load_shapes" not in startup_opts:
+    transformer_load_vars()
+    qwen3_load_vars()
+
+  with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
+    logical_transformer_specs = nn.get_partition_spec(abstract_transformer_vars)
+    logical_qwen3_specs = nn.get_partition_spec(abstract_qwen3_vars)
+
+    transformer_mesh_shardings = nn.logical_to_mesh_sharding(logical_transformer_specs, mesh, config.logical_axis_rules)
+    qwen3_mesh_shardings = nn.logical_to_mesh_sharding(logical_qwen3_specs, mesh, config.logical_axis_rules)
 
   transformer_shardings = flax.core.freeze(transformer_mesh_shardings["params"])
   qwen3_shardings = flax.core.freeze(qwen3_mesh_shardings["params"])
@@ -2083,7 +2137,7 @@ def create_runtime(argv) -> Optional["Krea2Runtime"]:
 
   def load_vae_timed():
     t0 = time.perf_counter()
-    result = load_qwen_image_vae(snapshot_dir, config, vae_mesh, rngs)
+    result = load_qwen_image_vae(snapshot_dir, config, vae_mesh, rngs, numpy_weights="np_vae" in startup_opts)
     return result, time.perf_counter() - t0
 
   # VAE is small and independent. Hide it behind the much larger Transformer
@@ -2111,19 +2165,17 @@ def create_runtime(argv) -> Optional["Krea2Runtime"]:
         def unbox_fn(x):
           return x.unbox() if isinstance(x, flax_spmd.LogicallyPartitioned) else x
 
-        params = jax.tree_util.tree_map(
-            unbox_fn,
-            abstract_transformer_load_vars["params"],
-            is_leaf=lambda k: isinstance(k, flax_spmd.LogicallyPartitioned),
-        )
-        params = flax.core.unfreeze(params)
+        def load_template(load_vars):
+          """The unboxed, mutable load structure a checkpoint loader fills (built when a component is built)."""
+          template = jax.tree_util.tree_map(
+              unbox_fn,
+              load_vars()["params"],
+              is_leaf=lambda k: isinstance(k, flax_spmd.LogicallyPartitioned),
+          )
+          return flax.core.unfreeze(template)
 
-        qwen3_params = jax.tree_util.tree_map(
-            unbox_fn,
-            abstract_qwen3_load_vars["params"],
-            is_leaf=lambda k: isinstance(k, flax_spmd.LogicallyPartitioned),
-        )
-        qwen3_params = flax.core.unfreeze(qwen3_params)
+        # Bound by the loads below (build-only mode may load neither).
+        params = qwen3_params = None
 
         # Components read from the weight cache; their trees are final (permuted, quantized).
         weight_cache_hits = set()
@@ -2134,7 +2186,10 @@ def create_runtime(argv) -> Optional["Krea2Runtime"]:
           result, _, hit = load_or_build_host_params(
               None if build_only else transformer_cache,
               abstract_transformer_vars["params"],
-              lambda: (load_and_convert_krea2_weights(transformer_path, params, num_layers), None),
+              lambda: (
+                  load_and_convert_krea2_weights(transformer_path, load_template(transformer_load_vars), num_layers),
+                  None,
+              ),
               load_trace,
               "transformer_cache_read",
           )
@@ -2147,7 +2202,7 @@ def create_runtime(argv) -> Optional["Krea2Runtime"]:
 
         def build_qwen_host_params():
           result = load_and_convert_qwen3_weights(
-              text_encoder_path, qwen3_params, qwen3_config, key_prefix="model.language_model."
+              text_encoder_path, load_template(qwen3_load_vars), qwen3_config, key_prefix="model.language_model."
           )
           # Bump KREA2_TEXT_ENCODER_WEIGHT_BUILD_REVISION (weight_cache.py) when this changes the values.
           if config.weights_dtype == jnp.bfloat16:
@@ -2383,6 +2438,8 @@ def create_runtime(argv) -> Optional["Krea2Runtime"]:
       lazy_load=bool(getattr(config, "aot_cache_lazy_load", False)),
       # Lazy loads fetch missing executables from there; not part of the meta (same executables).
       gcs_prefix=aot_cache_gcs,
+      # KREA2_STARTUP_OPTS aot_parallel_load: the same files, deserialized by several warm-up workers at once.
+      parallel_lazy_load="aot_parallel_load" in startup_opts,
   )
   aot_cache.wait_for_loads()
   timeline.mark("pipeline")
@@ -2412,6 +2469,7 @@ def create_runtime(argv) -> Optional["Krea2Runtime"]:
       transformer_cache_meta=transformer_cache_meta,
       transformer_abstract_params=abstract_transformer_vars["params"],
       transformer_shardings=transformer_shardings,
+      startup_opts=startup_opts,
   )
 
 

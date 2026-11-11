@@ -550,6 +550,15 @@ def prepare_runtime(loader: Callable[[], Any], settings: ServerSettings):
   After the warm-up it loads the hybrid tree (runtime.load_hybrid_params, a no-op without
   krea2_hybrid_weight_cache_dir; skipped for runtimes without the method), so warm-up runs with the plain
   residency. Returns (runtime, warmed presets).
+
+  With defer_warmup in the runtime's startup_opts (KREA2_STARTUP_OPTS, krea2_startup.py) and a manifest proving
+  that an earlier full warm-up of this plan left every executable in the AOT cache, only the first preset's
+  entries are warmed here; the other executables load on background threads after the hybrid tree, and a request
+  that needs one earlier loads it itself. The first request of a resolution other than the first preset's also
+  compiles the small non-AOT programs of that shape (krea2_startup.py), which a full warm-up does before ready:
+  that is the option's price. The warmed presets are still the whole plan. If the first preset's
+  warm-up had to compile, the manifest was wrong: the rest is warmed here too (today's start), and every full
+  warm-up in this mode writes the manifest again.
   """
   runtime = loader()
   _check_runtime_config(runtime.config)
@@ -558,11 +567,41 @@ def prepare_runtime(loader: Callable[[], Any], settings: ServerSettings):
     raise RuntimeError(f"KREA2_SERVE_PRESETS={settings.presets_spec!r} selects no preset.")
   _check_negative_prompt_bucket(runtime, plan)
   _check_hybrid_negative_prompt_bucket(runtime, plan)
-  max_logging.log(f"Krea 2 API: warming {len(plan)} (resolution, text bucket) executables")
-  runtime.precompile(plan)
+  defer = "defer_warmup" in getattr(runtime, "startup_opts", ())
+  if not defer:
+    max_logging.log(f"Krea 2 API: warming {len(plan)} (resolution, text bucket) executables")
+    runtime.precompile(plan)
+    if hasattr(runtime, "load_hybrid_params"):
+      runtime.load_hybrid_params()
+    return runtime, build_warmed_presets(plan)
+
+  from maxdiffusion import krea2_startup  # pylint: disable=import-outside-toplevel
+
+  deferred = krea2_startup.deferred_executables(plan)
+  first = [entry for entry in plan if entry[0] == plan[0][0]] if deferred is not None else list(plan)
+  max_logging.log(f"Krea 2 API: warming {len(first)} of {len(plan)} (resolution, text bucket) executables")
+  records = runtime.precompile(first)
+  if deferred is not None and krea2_startup.warmup_compiled(records):
+    max_logging.log("[deferred] off: the first preset's warm-up compiled, so the manifest does not match this cache")
+    krea2_startup.drop_serving_manifest("the first preset's warm-up compiled")
+    runtime.precompile([entry for entry in plan if entry not in first])
+    deferred = None
   if hasattr(runtime, "load_hybrid_params"):
     runtime.load_hybrid_params()
+  if deferred is None:
+    krea2_startup.write_serving_manifest(plan)
+  else:
+    max_logging.log(f"Krea 2 API: {len(deferred)} executables of the manifest load in the background")
+    krea2_startup.start_deferred_load(
+        deferred, getattr(runtime, "timeline", None), _deferred_load_workers(runtime.config)
+    )
   return runtime, build_warmed_presets(plan)
+
+
+def _deferred_load_workers(config) -> int:
+  """Loader threads of a deferred warm-up: krea2_precompile_workers (the warm-up's own count), 1 when unset."""
+  workers = getattr(config, "krea2_precompile_workers", 1)
+  return workers if isinstance(workers, int) and not isinstance(workers, bool) and workers >= 1 else 1
 
 
 async def _startup(
@@ -716,6 +755,21 @@ def _track_pool_future(
 
   future.add_done_callback(_on_done)
   return future
+
+
+def _is_aot_cache_miss(exc: BaseException) -> bool:
+  """Whether a generation failed with aot_cache.AotCacheMiss (strict mode after a deferred warm-up).
+
+  Then the manifest that allowed the deferral is removed, so the next start warms (and compiles) everything. The
+  module is looked up, not imported: a server whose runtime never loaded it cannot have raised the error.
+  """
+  aot_cache = sys.modules.get("maxdiffusion.aot_cache")
+  if aot_cache is None or not isinstance(exc, aot_cache.AotCacheMiss):
+    return False
+  startup = sys.modules.get("maxdiffusion.krea2_startup")
+  if startup is not None:
+    startup.drop_serving_manifest(str(exc))
+  return True
 
 
 def _run_generation(
@@ -987,6 +1041,12 @@ def create_app(
       raise HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail=timeout_detail) from exc
     except Exception as exc:  # pylint: disable=broad-exception-caught
       max_logging.log(f"Krea 2 generation failed: {type(exc).__name__}: {exc}\n{traceback.format_exc()}")
+      if _is_aot_cache_miss(exc):
+        # A deferred warm-up (defer_warmup) never compiles inside a request: this preset's executable did not load.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"The executable of {preset.label} is not loaded on this server; retry on another backend.",
+        ) from exc
       raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Image generation failed") from exc
 
     queue_ms = _ms(started - arrived)
