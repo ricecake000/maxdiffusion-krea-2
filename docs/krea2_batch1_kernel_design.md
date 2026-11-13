@@ -388,3 +388,38 @@ Colab v6e-1(같은 JAX 0.12.0.1 / libtpu 0.0.50, 같은 병합 모델, 6.10과 �
 표에 없는 모양의 디노이즈는 이전 커밋과 0.998~1.000배였다(1024² 128 버킷 0.924 vs 0.925 s, 2688×1536 5.856 vs 5.857 s 등). 따라서 6.10의 2K 정사각 이득은 그대로 얻고 다른 모양은 바뀌지 않는다.
 
 비용: Colab v6e-1 한 세션(사용자가 만든 런타임, 16:57~17:28 UTC, 작업 자체 12.6분), 잔액 기준 3.01 CU. 그 전 v6e-1 생성 시도 세 번은 할당되지 않아 0 CU.
+
+## 7. AMD gfx950 GPU: attention `aiter`와 변환기 양자화 `mxfp6` (2026-11-13)
+
+TPU 설정은 바뀌지 않는다. 아래는 AMD Instinct MI350X(gfx950, JAX의 ROCm 백엔드) 한 장에서 배치 1로 서빙하기 위한 두 설정 값이고, TPU와 다른 GPU의 W8A8 설정은 캐시 키(가중치 캐시 디렉터리, AOT 메타), 파라미터 트리, 낮춘 HLO가 이 변경 전과 같다(작은 모델로 변경 전후를 비교해 확인).
+
+### 7.1 설정
+
+- `attention: 'aiter'`: AMD의 flash attention 커널(AITER, JAX-AITER의 `mha_fwd_unified`). `cudnn`처럼 q/k RMSNorm과 RoPE를 `(B, L, H, D)` 배치에서 jnp로 하고, K/V 반복 없이 GQA를 그대로 넘기며, 키 마스크는 행별 유효 길이가 된다(그래서 텍스트 compaction이 항상 켜진다). `flash_min_seq_length` 미만(텍스트 융합 블록)은 flash_custom처럼 모듈의 마스크 내적 어텐션을 쓴다.
+- `krea2_aiter_attention_precision: 'fp8'`: q/k/v를 e4m3fn으로 넘긴다(텐서마다 스케일 하나, `max|x| / 448`). 기본 `''`은 bfloat16. `aiter`가 아닌 어텐션에 `fp8`을 주면 오류다.
+- `krea2_transformer_quantization: 'mxfp6'`: `krea2_transformer_quant_targets`의 블록 프로젝션을 MXFP6 행렬곱으로 돌린다. 두 피연산자 모두 6비트 E2M3 값에 K 방향 32개마다 2의 거듭제곱 스케일 하나이고, 32점 Hadamard 회전을 양쪽에 적용해 곱에서 상쇄된다. 곱은 AMD의 f6gemm 커널(fp32 누산, bf16 출력)이다.
+  - 가중치: 로드 때 float 체크포인트에서 한 번 양자화·패킹한다(`quantize_transformer_params_mxfp6`, 순수 JAX). 패킹된 1-D uint8 `kernel` / `kernel_scale`이 그대로 파라미터이고 가중치 캐시에도 그 형태로 들어간다(`quantization: mxfp6`, 자체 리비전 `KREA2_MXFP6_WEIGHT_QUANT_REVISION`: W8A8 캐시와 다른 디렉터리). 하이브리드 샘플링의 E 트리도 같은 메타에서 파생되므로 패킹된 형태로 저장돼 있어야 한다.
+  - 활성값: 스텝 안에서 AMD의 HIP 양자화기로 양자화·패킹한다. W8A8처럼 한 입력을 쓰는 프로젝션들이 양자화 결과를 공유한다.
+  - 구현 선택은 환경 변수가 아니라 백엔드다: ROCm GPU에서는 커널, CPU에서는 같은 패킹 피연산자를 풀어 fp32 XLA 행렬곱으로 계산하는 참조 구현(확인용, 느림), 그 밖의 백엔드는 오류. AOT 메타에 리비전과 구현이 들어간다.
+  - 제약: K는 128의 배수, 행(배치 × 시퀀스)은 256으로 패딩 후 잘라 낸다. 커널의 버퍼는 2 GiB까지라 `(행, 16384)` bf16 출력 기준 2048²(L=16512)는 배치 3까지다(초과는 추적 시점 ValueError).
+
+### 7.2 필요한 것
+
+`aiter`와 `mxfp6`의 커널 구현은 JAX-AITER 트리(https://github.com/ROCm/jax-aiter)가 PYTHONPATH에 있고 `JA_ROOT_DIR`, `GPU_ARCHS=gfx950`이 설정돼 있어야 한다. `mxfp6`은 추가로 XLA FFI shim 두 개가 필요하다: `kernels/krea2_mxfp6_shims/build.sh JA_ROOT VENV [OUT]`이 `gemm_a6w6_ja.so`(GemmA6W6JA)와 `quant_mxfp6_ja.so`(QuantMxfp6JA)를 만들고, `kernels/krea2_mxfp6.py`가 `$KREA2_MXFP6_LIB_DIR`(기본 `$JA_ROOT_DIR/build/krea2_mxfp6`)에서 읽는다. 런타임은 AOT 캐시의 실행 파일을 읽기 전에 FFI 대상을 등록한다(캐시 적중 때는 등록을 일으킬 추적이 없다). shim과 양자화기·패커 포트는 AITER(MIT, Advanced Micro Devices)에서 온 것이고 고지는 `kernels/krea2_mxfp6_shims/LICENSE.aiter`에 있다.
+
+가중치 캐시 빌드(`krea2_weight_cache_build_only=True`)는 커널 없이 된다. 그 GPU가 없으면 CPU에서 양자화한다(실제 크기 16384×6144 커널 하나에 노트북 코어 4개로 약 1 s).
+
+### 7.3 실측 (MI350X VF 한 장, 한 스트림, 같은 요청의 두 번째 호출, 서버 전체 시간)
+
+실험 패치(환경 변수 스위치, int8 트리에서 파생한 가중치)로 2026-11-13에 잰 값이다. 이 절의 설정 값 구현 자체는 아직 GPU에서 돌리지 않았다.
+
+| 설정 | 1024² | 2048² |
+|---|---|---|
+| W8A8 + `aiter` bf16 | 0.97 s | 4.57 s |
+| W8A8 + `aiter` fp8 | 0.96 s | 3.98 s |
+| MXFP6 + `aiter` bf16 | 0.72 s | 3.54 s |
+| MXFP6 + `aiter` fp8 | 0.71 s | 2.95 s |
+
+프로젝션 하나의 bf16 대비 상대 RMS 오차는 MXFP6 4.0 %(무작위 정규 입력; W8A8은 같은 입력에서 1.1 %, 이상값이 있는 합성 입력에서는 2.9~4.5 %)다. 따로 컴파일한 두 W8A8 서버도 같은 시드에서 다른 그림을 내므로(PSNR 13.5~18 dB) 픽셀 비교로는 순위를 매길 수 없고, MXFP6와 fp8 어텐션의 그림은 그 범위 안에 있다. 같은 실행 파일 집합 안에서는 반복 요청이 바이트 동일하다.
+
+로컬 확인(CPU, 참조 구현): 패킹/언패킹 왕복, 작은 모델의 float 대비 출력 오차(상대 L2 0.09, W8A8 0.035), eager와 jit 일치, 가중치 캐시 왕복과 W8A8 구조로의 오적중 거부, 하이브리드 단계가 있는 파이프라인 호출, `create_runtime`의 빌드 전용 모드, `aiter`의 bf16 / fp8 추적(배치 1, 2).

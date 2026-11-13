@@ -50,7 +50,7 @@ from flax import linen as nn
 
 from maxdiffusion import max_logging
 from .text_encoder_quant import KREA2_TEXT_ENCODER_WEIGHT_QUANT_REVISION
-from .transformer_quant import KREA2_TRANSFORMER_WEIGHT_QUANT_REVISION
+from .transformer_quant import weight_quant_revision
 from .util import KREA2_ROPE_PERMUTATION_REVISION
 
 # Bump when the on-disk layout changes; directories of another format then miss.
@@ -182,7 +182,8 @@ def transformer_weight_cache_meta(
     num_key_value_heads,
     attention_head_dim,
 ) -> dict:
-  """Fingerprint inputs of the cached transformer tree (after the permutation and the W8A8 quantization).
+  """Fingerprint inputs of the cached transformer tree (after the permutation and the quantization: the int8 tree
+  of 'w8a8' or the packed one of 'mxfp6', each with its own weight revision).
 
   The head geometry is part of it because the rotate-half permutation depends
   on it, while another geometry can give the same flattened projection shapes.
@@ -193,7 +194,7 @@ def transformer_weight_cache_meta(
       "weights_dtype": str(jnp.dtype(config.weights_dtype)),
       "quantization": quantization,
       "quant_targets": list(quant_targets),
-      "weight_quant_revision": KREA2_TRANSFORMER_WEIGHT_QUANT_REVISION,
+      "weight_quant_revision": weight_quant_revision(quantization),
       "rope_layout": rope_layout,
       "rope_permutation_revision": KREA2_ROPE_PERMUTATION_REVISION,
       "num_attention_heads": int(num_attention_heads),

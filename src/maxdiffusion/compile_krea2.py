@@ -88,6 +88,7 @@ THRESHOLD_GATED_KERNELS = (
     "flash",
     "flash_custom",
     "tokamax_flash",
+    "aiter",
     "ulysses",
     "ulysses_custom",
     "ulysses_custom_fixed_m",
@@ -637,6 +638,13 @@ def main(argv):
   max_logging.log(te_residency)
   # int8 block kernels come straight out of the runtime model's abstract tree.
   transformer_quantization, transformer_quant_targets = resolve_transformer_quantization(config)
+  # This tool compiles for a TPU topology from another host. The AMD GPU settings have no TPU program: 'mxfp6'
+  # would pick its CPU reference from the host backend and be estimated as if it were the TPU's.
+  if transformer_quantization == "mxfp6" or config.attention == "aiter":
+    raise ValueError(
+        "compile_krea2 compiles for TPU topologies: krea2_transformer_quantization=mxfp6 and attention=aiter "
+        "are AMD GPU settings and have no TPU program."
+    )
   transformer = build_krea2_transformer(transformer_cfg, config, mesh, quant_targets=transformer_quant_targets)
   max_logging.log(describe_transformer_quantization(transformer_quantization, transformer_quant_targets))
 

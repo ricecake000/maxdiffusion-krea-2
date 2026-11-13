@@ -452,18 +452,24 @@ def krea2_flash_block_sizes(config):
   return dataclasses.replace(carrier, kernel=kernel, block_q_by_seq_len=block_q_by_seq_len)
 
 
-def build_krea2_transformer(transformer_cfg, config, mesh, quant_targets=None):
+def build_krea2_transformer(transformer_cfg, config, mesh, quant_targets=None, attention_kernel=None):
   """Builds the Krea 2 transformer module from a `transformer/config.json` dict (defaults if empty).
 
-  `quant_targets` selects the W8A8 block projections; None takes them from the
+  `quant_targets` selects the quantized block projections; None takes them from the
   config (`krea2_transformer_quantization` / `krea2_transformer_quant_targets`),
-  `()` builds the unquantized model.
+  `()` builds the unquantized model. The quantization mode ('w8a8' or 'mxfp6') and
+  the precision of attention 'aiter' always come from the config. `attention_kernel`
+  replaces `config.attention` (the parameter tree does not depend on it).
   """
-  from maxdiffusion.models.krea2.transformer_krea2_flax import Krea2Transformer2DModel
+  from maxdiffusion.models.krea2.transformer_krea2_flax import (
+      Krea2Transformer2DModel,
+      resolve_aiter_attention_precision,
+  )
   from maxdiffusion.models.krea2.transformer_quant import normalize_quant_targets, resolve_transformer_quantization
 
+  quant_mode, config_quant_targets = resolve_transformer_quantization(config)
   if quant_targets is None:
-    _, quant_targets = resolve_transformer_quantization(config)
+    quant_targets = config_quant_targets
 
   return Krea2Transformer2DModel(
       in_channels=transformer_cfg.get("in_channels", 64),
@@ -483,7 +489,7 @@ def build_krea2_transformer(transformer_cfg, config, mesh, quant_targets=None):
       axes_dims_rope=tuple(transformer_cfg.get("axes_dims_rope", (32, 48, 48))),
       rope_theta=transformer_cfg.get("rope_theta", 1000.0),
       norm_eps=transformer_cfg.get("norm_eps", 1e-5),
-      attention_kernel=config.attention,
+      attention_kernel=attention_kernel or config.attention,
       flash_block_sizes=krea2_flash_block_sizes(config),
       mask_padding_tokens=config.mask_padding_tokens,
       rope_layout=getattr(config, "krea2_rope_layout", "interleaved"),
@@ -491,22 +497,36 @@ def build_krea2_transformer(transformer_cfg, config, mesh, quant_targets=None):
       dtype=config.activations_dtype,
       weights_dtype=config.weights_dtype,
       quant_targets=normalize_quant_targets(quant_targets),
+      # Only read where a projection is quantized; "w8a8" is the modules' default.
+      quant_mode=quant_mode or "w8a8",
+      aiter_precision=resolve_aiter_attention_precision(config),
   )
 
 
-def transformer_quantization_aot_meta(mode, targets) -> dict:
+def transformer_quantization_aot_meta(mode, targets, device_kind=None) -> dict:
   """AOT cache meta entry for transformer quantization; empty when it is off.
 
   The key is present only when quantization is on, so the fingerprint of an
   unquantized setup (and its existing cached executables) stays unchanged.
   The value carries `KREA2_TRANSFORMER_QUANT_REVISION`, so a changed W8A8 graph
-  misses executables cached for the previous one.
+  misses executables cached for the previous one. Mode 'mxfp6' carries its own
+  revision, the implementation the trace picks for this backend
+  (`krea2_mxfp6.default_impl()`: the AMD kernels or the CPU reference) and, for
+  the kernels, `device_kind` (the executables hold the GPU's own code, whatever
+  the attention is).
   """
-  from maxdiffusion.models.krea2.transformer_quant import KREA2_TRANSFORMER_QUANT_REVISION
+  from maxdiffusion.models.krea2.transformer_quant import KREA2_MXFP6_QUANT_REVISION, KREA2_TRANSFORMER_QUANT_REVISION
 
   if not mode:
     return {}
-  return {"krea2_transformer_quantization": f"{mode}:{','.join(targets)}:r{KREA2_TRANSFORMER_QUANT_REVISION}"}
+  if mode == "mxfp6":
+    from maxdiffusion.kernels import krea2_mxfp6  # pylint: disable=import-outside-toplevel
+
+    impl = krea2_mxfp6.default_impl()
+    revision = f"r{KREA2_MXFP6_QUANT_REVISION}:{impl}" + (f":{device_kind}" if impl == "kernel" else "")
+  else:
+    revision = f"r{KREA2_TRANSFORMER_QUANT_REVISION}"
+  return {"krea2_transformer_quantization": f"{mode}:{','.join(targets)}:{revision}"}
 
 
 def attention_glue_aot_meta(attention, rope_layout, transformer_quantization, quant_targets) -> dict:
@@ -517,8 +537,8 @@ def attention_glue_aot_meta(attention, rope_layout, transformer_quantization, qu
   part of the traced glue for every RoPE layout, with or without W8A8: revision
   2 changed the hybrid kernel's, so e.g. an unquantized interleaved-RoPE hybrid
   setup on v6e must not reuse a pre-revision-2 executable; rotate_half adds the
-  fused q/k prep kernel) or W8A8 on any of to_q/to_k/to_v/to_gate (the shared
-  attention-input quantization). Other setups keep their fingerprint (and
+  fused q/k prep kernel) or a quantization mode on any of to_q/to_k/to_v/to_gate
+  (the shared attention-input quantization). Other setups keep their fingerprint (and
   cached executables). `rope_layout` no longer changes the result.
   """
   from maxdiffusion.models.krea2.transformer_krea2_flax import KREA2_ATTENTION_GLUE_REVISION
@@ -602,14 +622,19 @@ def seq_len_tuning_aot_meta(tuning) -> dict:
   return {"krea2_seq_len_tuning": seq_len_tuning_json(tuning)}
 
 
-def gpu_attention_aot_meta(attention, device_kind) -> dict:
-  """AOT cache meta entry for attention 'cudnn': the GPU model (executables are per device kind); empty otherwise.
+def gpu_attention_aot_meta(attention, device_kind, aiter_precision="") -> dict:
+  """AOT cache meta entries for the GPU attentions 'cudnn' and 'aiter': the GPU model (executables are per device
+  kind), and for 'aiter' with a non-default `aiter_precision` (krea2_aiter_attention_precision) that precision;
+  empty otherwise.
 
   TPU setups keep their fingerprint; flash_custom records its chip through flash_custom_block_selection_aot_meta.
   """
-  if attention != "cudnn":
+  if attention not in ("cudnn", "aiter"):
     return {}
-  return {"krea2_gpu_device_kind": str(device_kind)}
+  meta = {"krea2_gpu_device_kind": str(device_kind)}
+  if attention == "aiter" and aiter_precision:
+    meta["krea2_aiter_attention_precision"] = aiter_precision
+  return meta
 
 
 def krea2_mesh_device_kind(mesh):
@@ -1753,10 +1778,12 @@ def create_runtime(argv) -> Optional["Krea2Runtime"]:
       resolve_text_encoder_quantization,
       safe_param_shardings,
   )
+  from maxdiffusion.models.krea2.transformer_krea2_flax import register_aiter_ffi, resolve_aiter_attention_precision
   from maxdiffusion.models.krea2.transformer_quant import (
       check_transformer_param_tree,
       describe_transformer_quantization,
       quantize_transformer_params,
+      quantize_transformer_params_mxfp6,
       resolve_transformer_quantization,
   )
   from maxdiffusion.models.krea2.weight_cache import (
@@ -1802,13 +1829,17 @@ def create_runtime(argv) -> Optional["Krea2Runtime"]:
     max_logging.log(
         f"flash_custom kernel choice: {attention_kernel_choice} ('auto' = hybrid on TPU v6e, flash elsewhere)"
     )
-  # Mirrors FlaxKrea2Pipeline: flash_custom and cudnn always compact, with the full
+  # The q / k / v precision of attention 'aiter'; a bad value, or one without that attention, fails here.
+  aiter_attention_precision = resolve_aiter_attention_precision(config)
+  # Mirrors FlaxKrea2Pipeline: flash_custom, cudnn and aiter always compact, with the full
   # text length as the bucket when krea2_text_compaction_multiple is off.
   text_compaction_multiple = int(getattr(config, "krea2_text_compaction_multiple", 0) or 0)
-  if config.attention in ("flash_custom", "cudnn") and text_compaction_multiple <= 0:
+  if config.attention in ("flash_custom", "cudnn", "aiter") and text_compaction_multiple <= 0:
     text_compaction_multiple = int(config.max_sequence_length)
   # Before the precompile plan: its aot_cache_dir error would hide that the two modes exclude each other.
   build_only = resolve_weight_cache_build_only(config)
+  # A bad mode or target name fails here, too.
+  transformer_quantization, transformer_quant_targets = resolve_transformer_quantization(config)
   precompile_plan = resolve_precompile_plan(config, text_compaction_multiple)
   # Read again by Krea2Runtime.precompile (CLI precompile mode and serving warm-up); a bad value fails here.
   resolve_precompile_workers(config)
@@ -1843,6 +1874,18 @@ def create_runtime(argv) -> Optional["Krea2Runtime"]:
   # (see max_utils.create_device_mesh), not the global device count.
   all_devices = jax.devices()
   timeline.mark("tpu_init")
+  # The AMD kernels' XLA FFI targets, before any executable of the AOT cache runs: a cache hit never traces the
+  # calls that would register them. Build-only mode runs no kernel (the MXFP6 weight quantizer is pure JAX) and
+  # needs none of the libraries.
+  if not build_only:
+    if config.attention == "aiter":
+      register_aiter_ffi()
+    if transformer_quantization == "mxfp6":
+      from maxdiffusion.kernels import krea2_mxfp6  # pylint: disable=import-outside-toplevel
+
+      # default_impl raises on a backend that has neither the kernels nor the CPU reference.
+      if krea2_mxfp6.default_impl() == "kernel":
+        krea2_mxfp6.register()
   try:
     num_slices = 1 + max(d.slice_index for d in all_devices)
   except Exception:
@@ -1918,11 +1961,17 @@ def create_runtime(argv) -> Optional["Krea2Runtime"]:
 
   num_layers = transformer_cfg.get("num_layers", 28)
   # `transformer_load_model` is the float structure the checkpoint loader fills;
-  # `transformer` is what the pipeline applies (int8 block projections for w8a8).
-  transformer_quantization, transformer_quant_targets = resolve_transformer_quantization(config)
-  transformer = build_krea2_transformer(transformer_cfg, config, mesh, quant_targets=transformer_quant_targets)
+  # `transformer` is what the pipeline applies (int8 block projections for w8a8, packed MXFP6 ones for mxfp6).
+  # Build-only mode only evaluates the parameter shapes, which no attention kernel changes: 'aiter' is traced as
+  # dot_product there, so a cache build needs no jax_aiter.
+  shape_attention = "dot_product" if build_only and config.attention == "aiter" else None
+  transformer = build_krea2_transformer(
+      transformer_cfg, config, mesh, quant_targets=transformer_quant_targets, attention_kernel=shape_attention
+  )
   if transformer_quantization:
-    transformer_load_model = build_krea2_transformer(transformer_cfg, config, mesh, quant_targets=())
+    transformer_load_model = build_krea2_transformer(
+        transformer_cfg, config, mesh, quant_targets=(), attention_kernel=shape_attention
+    )
   else:
     transformer_load_model = transformer
   max_logging.log(describe_transformer_quantization(transformer_quantization, transformer_quant_targets))
@@ -2286,11 +2335,16 @@ def create_runtime(argv) -> Optional["Krea2Runtime"]:
             )
             load_trace["rope_permute"] = time.perf_counter() - t0
 
-          # W8A8: quantize the final float kernels (LoRA subtrees and the rotate-half
+          # W8A8 / MXFP6: quantize the final float kernels (LoRA subtrees and the rotate-half
           # permutation included), then check the tree against the runtime model's.
           if transformer_quantization:
             t0 = time.perf_counter()
-            params = quantize_transformer_params(params, transformer_quant_targets, scale_dtype=config.weights_dtype)
+            if transformer_quantization == "mxfp6":
+              params = quantize_transformer_params_mxfp6(params, transformer_quant_targets)
+            else:
+              params = quantize_transformer_params(
+                  params, transformer_quant_targets, scale_dtype=config.weights_dtype
+              )
             check_transformer_param_tree(params, abstract_transformer_vars["params"])
             load_trace["transformer_quantize"] = time.perf_counter() - t0
 
@@ -2415,7 +2469,9 @@ def create_runtime(argv) -> Optional["Krea2Runtime"]:
           "krea2_text_embed_on_host": str(te_embed_on_host),
           "krea2_rope_layout": transformer.rope_layout,
           # Conditional key: with quantization off the meta (and fingerprint) matches older caches.
-          **transformer_quantization_aot_meta(transformer_quantization, transformer_quant_targets),
+          **transformer_quantization_aot_meta(
+              transformer_quantization, transformer_quant_targets, krea2_mesh_device_kind(transformer.mesh)
+          ),
           # Conditional key: only setups whose traced attention glue changed miss older caches.
           **attention_glue_aot_meta(
               config.attention, transformer.rope_layout, transformer_quantization, transformer_quant_targets
@@ -2424,8 +2480,11 @@ def create_runtime(argv) -> Optional["Krea2Runtime"]:
           **flash_custom_block_selection_aot_meta(
               config.attention, attention_kernel_choice, krea2_mesh_device_kind(transformer.mesh)
           ),
-          # Conditional key: only attention 'cudnn' (GPU) records the device kind.
-          **gpu_attention_aot_meta(config.attention, krea2_mesh_device_kind(transformer.mesh)),
+          # Conditional keys: only the GPU attentions 'cudnn' and 'aiter' record the device kind, only 'aiter'
+          # with a non-default precision that precision.
+          **gpu_attention_aot_meta(
+              config.attention, krea2_mesh_device_kind(transformer.mesh), aiter_attention_precision
+          ),
           # Conditional key: only a non-default scoped-VMEM limit of the DiT programs misses older caches.
           **transformer_scoped_vmem_aot_meta(transformer_scoped_vmem_limit_kib),
           # Conditional key: only a non-empty krea2_seq_len_tuning misses older caches.

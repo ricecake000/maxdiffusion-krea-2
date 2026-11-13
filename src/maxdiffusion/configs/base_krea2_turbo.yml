@@ -368,6 +368,12 @@ krea2_hybrid_evict_min_pixels: 0
 # 'flash' / 'hybrid' force a variant (hybrid needs more VMEM: on v5e its
 # automatic block_q is capped lower). '' means 'auto'; other values fail at startup.
 krea2_attention_kernel: 'auto'
+# attention 'aiter' (AMD GPUs): AMD's flash attention kernel through JAX-AITER (jax_aiter on PYTHONPATH with
+# JA_ROOT_DIR and GPU_ARCHS set); below flash_min_seq_length the masked dot-product path, as flash_custom.
+# krea2_aiter_attention_precision is the precision of its q / k / v: '' (bfloat16) or 'fp8' (e4m3fn with one
+# scale per tensor; on an MI350X 2048^2 4.57 -> 3.98 s, 1024^2 unchanged). Only read for attention 'aiter'
+# ('fp8' with another attention is an error).
+krea2_aiter_attention_precision: ''
 # Scoped-VMEM limit (KiB) of the executables that run the DiT blocks (the
 # monolithic transformer_step or the staged transformer_block; not the text
 # encoder, text context or VAE), passed to XLA as the per-program compile option
@@ -410,10 +416,19 @@ krea2_text_encoder_quant_tile_size: 128
 # as inputs_embeds, so the 151936x2560 embedding table (0.72 GiB bf16) never
 # occupies HBM. Exact.
 krea2_text_embed_on_host: False
-# Transformer block matmul quantization: '' (off) or 'w8a8' (int8 weights, quantized on the host at
+# Transformer block matmul quantization: '' (off), 'mxfp6' (below) or 'w8a8' (int8 weights, quantized on the host at
 # load time with one scale per output column, and int8 activations, quantized per token inside the
 # step; int8 x int8 matmuls run ~2x faster than bf16 on TPU v6e and halve the transformer's HBM).
 # Image quality with quantized activations must be checked against the unquantized output.
+# 'mxfp6' (AMD gfx950 GPUs such as the MI350X, through JAX's ROCm backend): the same projections with both
+# operands in MXFP6 (6-bit values, one power-of-two scale per 32 along the contraction), multiplied by AMD's
+# f6gemm kernel (kernels/krea2_mxfp6.py; needs a JAX-AITER tree and the two shims of
+# kernels/krea2_mxfp6_shims/build.sh). The weights are packed once from the float checkpoint and kept packed in
+# krea2_weight_cache_dir (its own cache entry; on a machine without that GPU the build runs on CPU, minutes).
+# Measured on an MI350X (2026-11-13, with attention 'aiter' + fp8): 1024^2 0.71 s and 2048^2 2.95 s per image
+# against 0.97 / 4.57 s for w8a8 with bf16 attention; adopted for that GPU after a look at same-seed image
+# sheets (separately compiled programs give different pictures, so no pixel comparison). On CPU the mode
+# runs a slow float reference of the same operands (checks only).
 krea2_transformer_quantization: ''
 # DiT block projections that run as W8A8. Allowed: to_q, to_k, to_v, to_gate, to_out, gate_proj,
 # up_proj, down_proj. to_k/to_v are small (6144 -> 1536) and stay float by default.

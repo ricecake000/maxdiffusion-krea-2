@@ -14,12 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-# int8 W8A8 matmuls for the Krea 2 transformer's DiT block projections.
+# Quantized matmuls for the Krea 2 transformer's DiT block projections: int8 W8A8, or MXFP6 on AMD gfx950 GPUs.
 #
-# Weights are quantized once on the host at load time (symmetric absmax, one
+# W8A8: weights are quantized once on the host at load time (symmetric absmax, one
 # scale per output column of the flax `(in, out)` kernel); activations are
 # quantized inside the jitted step (symmetric absmax, one scale per token).
 # The matmul runs as int8 x int8 -> int32 and is rescaled by both scales.
+# MXFP6 (`Krea2Mxfp6Dense`, kernels/krea2_mxfp6.py): both operands as 6-bit values with a power-of-two scale per
+# 32 along the contraction, multiplied by AMD's f6gemm kernel; the weights are packed once on the host.
 # Only `blocks_*` projections are ever quantized; everything else stays float.
 # This module must not import `transformer_krea2_flax` (which imports it).
 
@@ -39,7 +41,7 @@ from flax import linen as nn
 from maxdiffusion import max_logging
 from .text_encoder_quant import tree_nbytes
 
-KREA2_TRANSFORMER_QUANTIZATION_MODES = ("", "w8a8")
+KREA2_TRANSFORMER_QUANTIZATION_MODES = ("", "w8a8", "mxfp6")
 KREA2_QUANT_ATTN_TARGETS = ("to_q", "to_k", "to_v", "to_gate", "to_out")
 KREA2_QUANT_FF_TARGETS = ("gate_proj", "up_proj", "down_proj")
 KREA2_QUANT_TARGETS = KREA2_QUANT_ATTN_TARGETS + KREA2_QUANT_FF_TARGETS
@@ -57,6 +59,11 @@ KREA2_TRANSFORMER_QUANT_REVISION = 3
 # weight cache key (krea2_weight_cache_dir), so this invalidates cached quantized trees.
 # 2: to_q / to_k int8 kernels stored as `(features, in)` (KREA2_TRANSPOSED_KERNEL_TARGETS).
 KREA2_TRANSFORMER_WEIGHT_QUANT_REVISION = 2
+# The same two revisions for mode 'mxfp6': the traced graph (`Krea2Mxfp6Dense`, the shared activation
+# quantization, kernels/krea2_mxfp6.py's `quantize_activation` / `linear`; AOT cache key) and the stored packed
+# weights (`quantize_transformer_params_mxfp6`, krea2_mxfp6's `convert_kernel`; weight cache key).
+KREA2_MXFP6_QUANT_REVISION = 1
+KREA2_MXFP6_WEIGHT_QUANT_REVISION = 1
 
 _BLOCK_KEY = re.compile(r"blocks_\d+")
 _GIB = 1024**3
@@ -113,7 +120,14 @@ def resolve_transformer_quantization(config):
 def describe_transformer_quantization(mode, targets) -> str:
   if mode == "w8a8" and targets:
     return f"transformer: int8 W8A8 matmuls ({', '.join(targets)}); other projections unquantized"
+  if mode == "mxfp6" and targets:
+    return f"transformer: MXFP6 matmuls, AMD gfx950 ({', '.join(targets)}); other projections unquantized"
   return "transformer: unquantized"
+
+
+def weight_quant_revision(mode) -> int:
+  """The stored-weights revision of a quantization mode (part of the weight cache key)."""
+  return KREA2_MXFP6_WEIGHT_QUANT_REVISION if mode == "mxfp6" else KREA2_TRANSFORMER_WEIGHT_QUANT_REVISION
 
 
 def quantize_activation(x, scale_dtype):
@@ -130,6 +144,42 @@ def quantize_activation(x, scale_dtype):
   scale = jnp.where(scale == 0, jnp.ones_like(scale), scale)
   x_q = jnp.clip(jnp.round(x_f32 / scale.astype(jnp.float32)), -127, 127).astype(jnp.int8)
   return x_q, scale
+
+
+class Krea2Mxfp6Dense(nn.Module):
+  """Bias-free MXFP6 linear projection (mode 'mxfp6', AMD gfx950: kernels/krea2_mxfp6.py).
+
+  The parameters keep the names of `Krea2QuantDense`: `kernel` is the packed weight and `kernel_scale` its packed
+  scales, both 1-D uint8 of `krea2_mxfp6.kernel_param_shapes(in, features)` and both unboxed (replicated). The
+  attributes mirror `Krea2QuantDense` (the Krea 2 LoRA interceptor builds its layer from them); `unflatten` and
+  `transposed_kernel` are accepted and unused: the kernel returns the flat `(..., features)` projection and the
+  packed weight has one layout.
+  """
+
+  features: int
+  kernel_axes: Tuple[str, str]
+  dtype: jnp.dtype = jnp.float32
+  param_dtype: jnp.dtype = jnp.float32
+  precision: Optional[jax.lax.Precision] = None
+  unflatten: Optional[Tuple[int, ...]] = None
+  transposed_kernel: bool = False
+
+  @nn.compact
+  def __call__(self, inputs, quantized_inputs=None):
+    """`quantized_inputs` is `krea2_mxfp6.quantize_activation(inputs)`, passed in when several
+    projections share one activation; None quantizes `inputs` here."""
+    from maxdiffusion.kernels import krea2_mxfp6  # pylint: disable=import-outside-toplevel
+
+    in_features = inputs.shape[-1]
+    (kernel_shape, kernel_dtype), (scale_shape, scale_dtype) = krea2_mxfp6.kernel_param_shapes(
+        in_features, self.features
+    )
+    kernel = self.param("kernel", nn.initializers.zeros_init(), kernel_shape, kernel_dtype)
+    kernel_scale = self.param("kernel_scale", nn.initializers.zeros_init(), scale_shape, scale_dtype)
+    if quantized_inputs is None:
+      quantized_inputs = krea2_mxfp6.quantize_activation(inputs)
+    out = krea2_mxfp6.linear(quantized_inputs, kernel, kernel_scale, inputs.shape[:-1], in_features, self.features)
+    return out.astype(self.dtype)
 
 
 class Krea2QuantDense(nn.Module):
@@ -233,6 +283,27 @@ def _plain_dict(tree):
   return tree
 
 
+def _float_target_projections(result, targets):
+  """The `(name, projection dict)` of every target in every `blocks_*` group of the plain tree `result`, in block
+  order. Raises ValueError for no group, a missing projection / kernel, or a kernel that is not float."""
+  block_keys = sorted((key for key in result if _BLOCK_KEY.fullmatch(str(key))), key=lambda k: int(k.split("_")[1]))
+  if not block_keys:
+    raise ValueError("Transformer params have no blocks_* groups to quantize.")
+
+  projections = []
+  for block_key in block_keys:
+    for name in targets:
+      group = "attn" if name in KREA2_QUANT_ATTN_TARGETS else "ff"
+      path = f"{block_key}/{group}/{name}"
+      proj = result[block_key].get(group, {}).get(name)
+      if not isinstance(proj, dict) or "kernel" not in proj:
+        raise ValueError(f"Transformer params have no kernel at {path}/kernel to quantize.")
+      if not jnp.issubdtype(proj["kernel"].dtype, jnp.floating):
+        raise ValueError(f"{path}/kernel has dtype {proj['kernel'].dtype}; it is already quantized or not a float.")
+      projections.append((name, proj))
+  return projections
+
+
 def quantize_transformer_params(host_params, targets, scale_dtype, num_workers=None):
   """Quantizes the target projection kernels of every `blocks_*` group to int8.
 
@@ -261,21 +332,7 @@ def quantize_transformer_params(host_params, targets, scale_dtype, num_workers=N
   result = _plain_dict(host_params)
   if not targets:
     return result
-  block_keys = sorted((key for key in result if _BLOCK_KEY.fullmatch(str(key))), key=lambda k: int(k.split("_")[1]))
-  if not block_keys:
-    raise ValueError("Transformer params have no blocks_* groups to quantize.")
-
-  projections = []
-  for block_key in block_keys:
-    for name in targets:
-      group = "attn" if name in KREA2_QUANT_ATTN_TARGETS else "ff"
-      path = f"{block_key}/{group}/{name}"
-      proj = result[block_key].get(group, {}).get(name)
-      if not isinstance(proj, dict) or "kernel" not in proj:
-        raise ValueError(f"Transformer params have no kernel at {path}/kernel to quantize.")
-      if not jnp.issubdtype(proj["kernel"].dtype, jnp.floating):
-        raise ValueError(f"{path}/kernel has dtype {proj['kernel'].dtype}; it is already quantized or not a float.")
-      projections.append((name, proj))
+  projections = _float_target_projections(result, targets)
 
   bytes_before = tree_nbytes(host_params)
   start = time.time()
@@ -298,6 +355,46 @@ def quantize_transformer_params(host_params, targets, scale_dtype, num_workers=N
   max_logging.log(
       f"Quantized {len(projections)} transformer projection kernels to int8 ({', '.join(targets)}): "
       f"{bytes_before / _GIB:.2f} GiB -> {bytes_after / _GIB:.2f} GiB in {time.time() - start:.1f} s"
+  )
+  return result
+
+
+def quantize_transformer_params_mxfp6(host_params, targets):
+  """Packs the target projection kernels of every `blocks_*` group as MXFP6 weights (mode 'mxfp6').
+
+  The counterpart of `quantize_transformer_params`: the same input tree (the loaded float tree with any `lora-*`
+  subtrees and the rotate-half permutation), the same targets and errors. Each target's float `(in, out)` kernel
+  becomes `krea2_mxfp6.convert_kernel` of its `(out, in)` transpose in float32: `kernel` the packed 1-D uint8
+  weight, `kernel_scale` its packed 1-D uint8 scales (numpy, on the host). Every other leaf is shared with the
+  input, which is not modified.
+
+  The conversion runs on `jax.devices()[0]` whatever `jax.default_device` says (create_runtime loads under the
+  CPU device): the accelerator when there is one (seconds for the real model), else the CPU (minutes; a weight
+  cache build). The quantizer is pure JAX, so the values do not depend on the kernel libraries; a different
+  backend may round a few codes differently.
+  """
+  from maxdiffusion.kernels import krea2_mxfp6  # pylint: disable=import-outside-toplevel
+
+  targets = normalize_quant_targets(targets)
+  result = _plain_dict(host_params)
+  if not targets:
+    return result
+  projections = _float_target_projections(result, targets)
+
+  bytes_before = tree_nbytes(host_params)
+  start = time.time()
+  device = jax.devices()[0]
+  for _, proj in projections:
+    kernel = np.asarray(proj["kernel"])
+    if kernel.ndim != 2:
+      raise ValueError(f"Expected a 2-D float kernel, got shape {kernel.shape} and dtype {kernel.dtype}.")
+    with jax.default_device(device):
+      # A committed input: the conversion and every array it creates run on `device`.
+      packed, packed_scale = krea2_mxfp6.convert_kernel(jax.device_put(kernel, device).T)
+    proj["kernel"], proj["kernel_scale"] = np.asarray(packed), np.asarray(packed_scale)
+  max_logging.log(
+      f"Packed {len(projections)} transformer projection kernels as MXFP6 ({', '.join(targets)}) on {device}: "
+      f"{bytes_before / _GIB:.2f} GiB -> {tree_nbytes(result) / _GIB:.2f} GiB in {time.time() - start:.1f} s"
   )
   return result
 

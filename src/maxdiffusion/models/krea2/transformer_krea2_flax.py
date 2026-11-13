@@ -36,6 +36,7 @@ from ..modeling_flax_utils import FlaxModelMixin
 from ..attention_flax import AttentionOp, apply_rope, krea2_flash_custom_io_layout
 from .transformer_quant import (
     KREA2_TRANSPOSED_KERNEL_TARGETS,
+    Krea2Mxfp6Dense,
     Krea2QuantDense,
     normalize_quant_targets,
     quantize_activation,
@@ -85,6 +86,78 @@ def krea2_rotary_tables(ids, axes_dim, theta, layout="interleaved"):
     cos_out.append(jnp.cos(freqs))
     sin_out.append(jnp.sin(freqs))
   return jnp.concatenate(cos_out, axis=-1), jnp.concatenate(sin_out, axis=-1)
+
+
+KREA2_AITER_ATTENTION_PRECISIONS = ("", "fp8")
+
+
+def resolve_aiter_attention_precision(config) -> str:
+  """`krea2_aiter_attention_precision` parsed: '' (bfloat16 q / k / v) or 'fp8'. Raises ValueError on anything
+  else, and on 'fp8' with another attention than 'aiter' (it would be ignored without a word)."""
+  value = str(getattr(config, "krea2_aiter_attention_precision", "") or "").strip().strip("'\"").lower()
+  if value in ("bf16", "bfloat16"):
+    value = ""
+  if value not in KREA2_AITER_ATTENTION_PRECISIONS:
+    raise ValueError(
+        f"krea2_aiter_attention_precision={value!r} is not supported; allowed: "
+        f"{list(KREA2_AITER_ATTENTION_PRECISIONS)}."
+    )
+  if value and getattr(config, "attention", "") != "aiter":
+    raise ValueError(f"krea2_aiter_attention_precision={value!r} needs attention=aiter, got {config.attention!r}.")
+  return value
+
+
+def register_aiter_ffi():
+  """Registers jax_aiter's flash attention FFI target (attention 'aiter', AMD GPUs).
+
+  jax_aiter registers it on the first traced call; a process that only runs executables loaded from the AOT cache
+  makes no such call, so the runtime calls this once before it loads any. Needs the jax_aiter tree on PYTHONPATH with
+  JA_ROOT_DIR and GPU_ARCHS set; a missing library raises here instead of at the first image.
+  """
+  from jax_aiter.ffi.registry import register_ffi_target  # pylint: disable=import-outside-toplevel,import-error
+
+  register_ffi_target("MhaFwdUnifiedJA", "ROCM")
+
+
+def _aiter_flash_attention(q, k, v, lengths, precision=""):
+  """AMD's flash attention kernel (AITER through jax_aiter): (B, L, H, D) queries, (B, L, Hkv, D) keys / values and
+  valid key counts (B,) -> (B, L, H, D) in the queries' dtype. GQA without a K/V repeat, softmax scale 1/sqrt(D).
+
+  `precision` '' passes bfloat16 q / k / v; 'fp8' passes them as e4m3fn, each with one descale for the whole
+  tensor (aiter's per_tensor_quant: scale = max |x| / 448), which the kernel multiplies back; the output is
+  bfloat16 either way.
+
+  `mha_fwd_unified` is jax_aiter's forward without custom_vjp (its public functions take the length arrays as
+  non-differentiable arguments, which cannot be tracers). The key mask goes in as the packed ("group") form with
+  physical offsets = full rows and logical lengths = the valid counts: the batch-mode length arguments ignore a
+  padded key tail (measured on an MI350X).
+  """
+  from jax_aiter.mha.mha import mha_fwd_unified  # pylint: disable=import-outside-toplevel,import-error
+
+  dtype = q.dtype
+  b, l = q.shape[:2]
+  cu_full = jnp.arange(b + 1, dtype=jnp.int32) * l
+  cu_valid = jnp.concatenate([jnp.zeros((1,), jnp.int32), jnp.cumsum(lengths.astype(jnp.int32))])
+  descales = {}
+  if precision == "fp8":
+
+    def to_fp8(x):
+      x = x.astype(jnp.float32)
+      scale = jnp.max(jnp.abs(x)) / 448.0
+      scale = jnp.where(scale == 0, 1.0, scale)
+      return (x / scale).astype(jnp.float8_e4m3fn), scale.reshape(1)
+
+    (q, q_descale), (k, k_descale), (v, v_descale) = to_fp8(q), to_fp8(k), to_fp8(v)
+    descales = dict(q_descale=q_descale, k_descale=k_descale, v_descale=v_descale)
+    packed = [x.reshape((b * l,) + x.shape[2:]) for x in (q, k, v)]
+  else:
+    packed = [x.astype(jnp.bfloat16).reshape((b * l,) + x.shape[2:]) for x in (q, k, v)]
+  out = mha_fwd_unified(
+      *packed, 0.0, q.shape[-1] ** -0.5, False, -1, -1, False, False,
+      cu_seqlens_q=cu_full, cu_seqlens_kv=cu_full, max_seqlen_q=l, max_seqlen_k=l,
+      cu_seqlens_q_logical=cu_full, cu_seqlens_kv_logical=cu_valid, **descales,
+  )[0]
+  return out.reshape((b, l) + out.shape[1:]).astype(dtype)
 
 
 def _apply_rope_rotate_half_seq_major(x, cos, sin):
@@ -165,15 +238,25 @@ def apply_explicit_lora(output, inputs, adapters=(), dtype=jnp.float32, precisio
 
 
 def _projection(
-    features, kernel_axes, quantized, dtype, weights_dtype, precision, unflatten=None, transposed_kernel=False
+    features,
+    kernel_axes,
+    quantized,
+    dtype,
+    weights_dtype,
+    precision,
+    unflatten=None,
+    transposed_kernel=False,
+    quant_mode="w8a8",
 ):
-  """A bias-free block projection: `Krea2QuantDense` (W8A8) when `quantized`, else `nn.Dense`.
+  """A bias-free block projection: when `quantized`, `Krea2QuantDense` (`quant_mode` 'w8a8') or
+  `Krea2Mxfp6Dense` ('mxfp6'), else `nn.Dense`.
 
   `unflatten` is the caller's output layout and `transposed_kernel` the int8
-  kernel's stored layout (see `Krea2QuantDense`); `nn.Dense` ignores both.
+  kernel's stored layout (see `Krea2QuantDense`); the other two ignore both.
   """
   if quantized:
-    return Krea2QuantDense(
+    quant_dense = Krea2Mxfp6Dense if quant_mode == "mxfp6" else Krea2QuantDense
+    return quant_dense(
         features,
         kernel_axes=kernel_axes,
         dtype=dtype,
@@ -192,9 +275,20 @@ def _projection(
   )
 
 
+def _shared_quantization(x, dtype, quant_mode):
+  """The quantized activation the projections of one input share, a tuple of arrays for either mode: W8A8's
+  `(x_q, x_scale)`, or the packed MXFP6 operand pair."""
+  if quant_mode == "mxfp6":
+    from maxdiffusion.kernels import krea2_mxfp6  # pylint: disable=import-outside-toplevel
+
+    return krea2_mxfp6.quantize_activation(x)
+  return quantize_activation(x, dtype)
+
+
 def _apply_projection(proj, x, quantized_x):
-  """Calls a W8A8 projection with the shared `(x_q, x_scale)` pair, a float one with `x` only."""
-  if isinstance(proj, Krea2QuantDense):
+  """Calls a quantized projection with the shared quantized activation (`_shared_quantization`), a float one
+  with `x` only."""
+  if isinstance(proj, (Krea2QuantDense, Krea2Mxfp6Dense)):
     return proj(x, quantized_x)
   return proj(x)
 
@@ -202,8 +296,9 @@ def _apply_projection(proj, x, quantized_x):
 class Krea2SwiGLU(nn.Module):
   """SwiGLU feed-forward with separate gate/up/down projections (no bias).
 
-  Projections named in `quant_targets` run as W8A8 (`Krea2QuantDense`);
-  `gate_proj` and `up_proj` share one quantization of `x`.
+  Projections named in `quant_targets` run quantized in `quant_mode` ('w8a8':
+  `Krea2QuantDense`, 'mxfp6': `Krea2Mxfp6Dense`); `gate_proj` and `up_proj`
+  share one quantization of `x`.
   """
 
   dim: int
@@ -212,10 +307,13 @@ class Krea2SwiGLU(nn.Module):
   weights_dtype: jnp.dtype = jnp.float32
   precision: Optional[jax.lax.Precision] = None
   quant_targets: Tuple[str, ...] = ()
+  quant_mode: str = "w8a8"
 
   def setup(self):
     normalize_quant_targets(self.quant_targets)  # rejects unknown names
-    proj_kwargs = dict(dtype=self.dtype, weights_dtype=self.weights_dtype, precision=self.precision)
+    proj_kwargs = dict(
+        dtype=self.dtype, weights_dtype=self.weights_dtype, precision=self.precision, quant_mode=self.quant_mode
+    )
     self.gate_proj = _projection(self.hidden_dim, ("embed", "mlp"), "gate_proj" in self.quant_targets, **proj_kwargs)
     self.up_proj = _projection(self.hidden_dim, ("embed", "mlp"), "up_proj" in self.quant_targets, **proj_kwargs)
     self.down_proj = _projection(self.dim, ("mlp", "embed"), "down_proj" in self.quant_targets, **proj_kwargs)
@@ -224,7 +322,7 @@ class Krea2SwiGLU(nn.Module):
     lora_params = lora_params or {}
     quantized_x = None
     if "gate_proj" in self.quant_targets or "up_proj" in self.quant_targets:
-      quantized_x = quantize_activation(x, self.dtype)
+      quantized_x = _shared_quantization(x, self.dtype, self.quant_mode)
     gate = apply_explicit_lora(
         _apply_projection(self.gate_proj, x, quantized_x), x, lora_params.get("gate_proj", ()), self.dtype, self.precision
     )
@@ -232,7 +330,9 @@ class Krea2SwiGLU(nn.Module):
         _apply_projection(self.up_proj, x, quantized_x), x, lora_params.get("up_proj", ()), self.dtype, self.precision
     )
     down_input = nn.silu(gate) * up
-    quantized_down = quantize_activation(down_input, self.dtype) if "down_proj" in self.quant_targets else None
+    quantized_down = None
+    if "down_proj" in self.quant_targets:
+      quantized_down = _shared_quantization(down_input, self.dtype, self.quant_mode)
     return apply_explicit_lora(
         _apply_projection(self.down_proj, down_input, quantized_down),
         down_input,
@@ -247,8 +347,10 @@ class Krea2Attention(nn.Module):
   RMSNorm, optional rotary embeddings, and a sigmoid output gate applied to the
   attention output before the output projection.
 
-  Projections named in `quant_targets` run as W8A8 (`Krea2QuantDense`);
-  `to_q/to_k/to_v/to_gate` share one quantization of `hidden_states`.
+  Projections named in `quant_targets` run quantized in `quant_mode` ('w8a8':
+  `Krea2QuantDense`, 'mxfp6': `Krea2Mxfp6Dense`); `to_q/to_k/to_v/to_gate`
+  share one quantization of `hidden_states`. `aiter_precision` is the q / k / v
+  precision of attention 'aiter' ('' bfloat16, 'fp8').
   """
 
   dim: int
@@ -267,11 +369,15 @@ class Krea2Attention(nn.Module):
   mask_padding_tokens: bool = True
   rope_layout: str = "interleaved"
   quant_targets: Tuple[str, ...] = ()
+  quant_mode: str = "w8a8"
+  aiter_precision: str = ""
 
   def setup(self):
     _validate_rope_layout(self.rope_layout)
     normalize_quant_targets(self.quant_targets)  # rejects unknown names
-    proj_kwargs = dict(dtype=self.dtype, weights_dtype=self.weights_dtype, precision=self.precision)
+    proj_kwargs = dict(
+        dtype=self.dtype, weights_dtype=self.weights_dtype, precision=self.precision, quant_mode=self.quant_mode
+    )
     q_features = self.num_heads * self.head_dim
     kv_features = self.num_kv_heads * self.head_dim
     # q/k/v are reshaped to heads right after the projection; W8A8 rescales in that layout.
@@ -304,7 +410,7 @@ class Krea2Attention(nn.Module):
     self.norm_q = Krea2RMSNorm(self.head_dim, eps=self.eps)
     self.norm_k = Krea2RMSNorm(self.head_dim, eps=self.eps)
 
-    if self.attention_kernel not in ("dot_product", "cudnn"):
+    if self.attention_kernel not in ("dot_product", "cudnn", "aiter"):
       self.attention_op = AttentionOp(
           mesh=self.mesh,
           attention_kernel=self.attention_kernel,
@@ -339,16 +445,7 @@ class Krea2Attention(nn.Module):
     which materializes the scores); elsewhere XLA (only for CPU checks).
     """
     batch_size, seq_len = query.shape[:2]
-    query = self.norm_q(query)
-    key = self.norm_k(key)
-    if self.use_rope and image_rotary_emb is not None:
-      if self.rope_layout == "rotate_half":
-        cos, sin = image_rotary_emb
-        query = _apply_rope_rotate_half_seq_major(query, cos, sin)
-        key = _apply_rope_rotate_half_seq_major(key, cos, sin)
-      else:
-        query, key = apply_rope(jnp.transpose(query, (0, 2, 1, 3)), jnp.transpose(key, (0, 2, 1, 3)), image_rotary_emb)
-        query, key = jnp.transpose(query, (0, 2, 1, 3)), jnp.transpose(key, (0, 2, 1, 3))
+    query, key = self._norm_rope_seq_major(query, key, image_rotary_emb)
     lengths = None if mask is None else jnp.sum(mask != 0, axis=-1, dtype=jnp.int32)
     attn_output = jax.nn.dot_product_attention(
         query.astype(self.dtype),
@@ -361,10 +458,45 @@ class Krea2Attention(nn.Module):
     attn_output = attn_output.reshape(batch_size, seq_len, self.num_heads * self.head_dim)
     return self._gated_output_projection(attn_output, gate, lora_params)
 
+  def _norm_rope_seq_major(self, query, key, image_rotary_emb):
+    """q/k RMSNorm and RoPE in the projections' (B, L, H, D) / (B, L, Hkv, D) layout."""
+    query = self.norm_q(query)
+    key = self.norm_k(key)
+    if self.use_rope and image_rotary_emb is not None:
+      if self.rope_layout == "rotate_half":
+        cos, sin = image_rotary_emb
+        query = _apply_rope_rotate_half_seq_major(query, cos, sin)
+        key = _apply_rope_rotate_half_seq_major(key, cos, sin)
+      else:
+        query, key = apply_rope(jnp.transpose(query, (0, 2, 1, 3)), jnp.transpose(key, (0, 2, 1, 3)), image_rotary_emb)
+        query, key = jnp.transpose(query, (0, 2, 1, 3)), jnp.transpose(key, (0, 2, 1, 3))
+    return query, key
+
+  def _aiter_attention(self, query, key, value, mask, image_rotary_emb, gate, lora_params):
+    """attention 'aiter' (AMD GPUs): AITER's flash attention on the (B, L, H, D) / (B, L, Hkv, D) projections.
+
+    As 'cudnn': q/k RMSNorm and RoPE in jnp in the projections' layout, GQA without a K/V repeat, and the key mask
+    must be a prefix mask ([image | compacted text], tail-padded: the pipeline always compacts for this kernel),
+    which becomes the valid key count per row.
+    """
+    batch_size, seq_len = query.shape[:2]
+    query, key = self._norm_rope_seq_major(query, key, image_rotary_emb)
+    if mask is None:
+      lengths = jnp.full((batch_size,), seq_len, jnp.int32)
+    else:
+      lengths = jnp.sum(mask != 0, axis=-1, dtype=jnp.int32)
+    attn_output = _aiter_flash_attention(
+        query.astype(self.dtype), key.astype(self.dtype), value.astype(self.dtype), lengths, self.aiter_precision
+    )
+    attn_output = attn_output.reshape(batch_size, seq_len, self.num_heads * self.head_dim)
+    return self._gated_output_projection(attn_output, gate, lora_params)
+
   def _gated_output_projection(self, attn_output, gate, lora_params):
     """`to_out(attn_output * sigmoid(gate))` plus its explicit LoRA updates."""
     attn_output = attn_output * jax.nn.sigmoid(gate)
-    quantized = quantize_activation(attn_output, self.dtype) if "to_out" in self.quant_targets else None
+    quantized = None
+    if "to_out" in self.quant_targets:
+      quantized = _shared_quantization(attn_output, self.dtype, self.quant_mode)
     return apply_explicit_lora(
         _apply_projection(self.to_out, attn_output, quantized),
         attn_output,
@@ -382,7 +514,9 @@ class Krea2Attention(nn.Module):
       # The barrier makes the projections share one materialized (x_q, scale):
       # without it XLA fuses the quantization into a separate producer per
       # operand form (to_q/to_gate vs to_k/to_v), quantizing the input twice.
-      quantized_hidden = jax.lax.optimization_barrier(quantize_activation(hidden_states, self.dtype))
+      quantized_hidden = jax.lax.optimization_barrier(
+          _shared_quantization(hidden_states, self.dtype, self.quant_mode)
+      )
 
     def project(name):
       out = _apply_projection(getattr(self, name), hidden_states, quantized_hidden)
@@ -399,6 +533,10 @@ class Krea2Attention(nn.Module):
 
     if self.attention_kernel == "cudnn":
       return self._cudnn_attention(query, key, value, mask, image_rotary_emb, gate, lora_params)
+    # Below flash_min_seq_length (the text-fusion sequences) 'aiter' uses this module's masked attention, as
+    # flash_custom does.
+    if self.attention_kernel == "aiter" and seq_len >= self.flash_min_seq_length:
+      return self._aiter_attention(query, key, value, mask, image_rotary_emb, gate, lora_params)
 
     use_rope = self.use_rope and image_rotary_emb is not None
     use_custom_kernel = self.attention_kernel == "flash_custom"
@@ -457,7 +595,7 @@ class Krea2Attention(nn.Module):
 
     # Below flash_min_seq_length flash_custom uses this module's masked
     # attention: the shared dispatcher's dot_product fallback ignores the mask.
-    if self.attention_kernel == "dot_product" or use_custom_kernel:
+    if self.attention_kernel in ("dot_product", "aiter") or use_custom_kernel:
       attn_output = self._masked_dot_product_attention(query, key, value, attention_mask)
       attn_output = jnp.transpose(attn_output, (0, 2, 1, 3)).reshape(batch_size, seq_len, -1)
     else:
@@ -659,6 +797,8 @@ class Krea2TransformerBlock(nn.Module):
   mask_padding_tokens: bool = True
   rope_layout: str = "interleaved"
   quant_targets: Tuple[str, ...] = ()
+  quant_mode: str = "w8a8"
+  aiter_precision: str = ""
 
   def setup(self):
     self.scale_shift_table = self.param("scale_shift_table", nn.initializers.zeros, (6, self.hidden_size), jnp.float32)
@@ -681,6 +821,8 @@ class Krea2TransformerBlock(nn.Module):
         weights_dtype=self.weights_dtype,
         precision=self.precision,
         quant_targets=self.quant_targets,
+        quant_mode=self.quant_mode,
+        aiter_precision=self.aiter_precision,
     )
     self.ff = Krea2SwiGLU(
         dim=self.hidden_size,
@@ -689,6 +831,7 @@ class Krea2TransformerBlock(nn.Module):
         weights_dtype=self.weights_dtype,
         precision=self.precision,
         quant_targets=self.quant_targets,
+        quant_mode=self.quant_mode,
     )
 
   def __call__(self, hidden_states, temb_mod, image_rotary_emb=None, attention_mask=None, lora_params=None):
@@ -798,11 +941,20 @@ class Krea2Transformer2DModel(nn.Module, FlaxModelMixin, ConfigMixin):
   mask_padding_tokens: bool = True
   rope_layout: str = "interleaved"
   quant_targets: Tuple[str, ...] = ()
+  quant_mode: str = "w8a8"
+  aiter_precision: str = ""
 
   def setup(self):
     _validate_rope_layout(self.rope_layout)
     # Raises on unknown names; order and duplicates are normalized away.
     quant_targets = normalize_quant_targets(self.quant_targets)
+    if self.quant_mode not in ("w8a8", "mxfp6"):
+      raise ValueError(f"quant_mode={self.quant_mode!r} is not supported; allowed: 'w8a8', 'mxfp6'.")
+    if self.aiter_precision not in KREA2_AITER_ATTENTION_PRECISIONS:
+      raise ValueError(
+          f"aiter_precision={self.aiter_precision!r} is not supported; allowed: "
+          f"{list(KREA2_AITER_ATTENTION_PRECISIONS)}."
+      )
     if sum(self.axes_dims_rope) != self.attention_head_dim:
       raise ValueError(
           f"sum(axes_dims_rope)={sum(self.axes_dims_rope)} must equal attention_head_dim={self.attention_head_dim}"
@@ -869,6 +1021,8 @@ class Krea2Transformer2DModel(nn.Module, FlaxModelMixin, ConfigMixin):
             weights_dtype=self.weights_dtype,
             precision=self.precision,
             quant_targets=quant_targets,
+            quant_mode=self.quant_mode,
+            aiter_precision=self.aiter_precision,
         )
         for _ in range(self.num_layers)
     ]
